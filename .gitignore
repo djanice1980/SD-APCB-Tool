@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# BIOS files (don't commit firmware)
+*.fd
+*.bin
+*.rom
+*.spi
+
+# Keys and certificates
+*.pem
+*.key
+*.cert
+*.crt
+*.der
+*.pfx
+*.p12
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
