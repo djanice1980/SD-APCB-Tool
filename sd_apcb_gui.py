@@ -365,7 +365,8 @@ class APCBToolGUI:
         ttk.Checkbutton(of, text="Modify APCB magic byte (cosmetic, not required)", variable=self.magic_var).pack(side='left')
         sf = tk.Frame(tc, bg=C_BGL); sf.pack(fill='x', pady=(4,0))
         self.sign_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(sf, text="Sign firmware for h2offt software flash (PE Authenticode)", variable=self.sign_var).pack(side='left')
+        self.sign_chk = ttk.Checkbutton(sf, text="Sign firmware for h2offt software flash (PE Authenticode)", variable=self.sign_var)
+        self.sign_chk.pack(side='left')
         st = "✓ cryptography installed" if self.signing_available else "⚠ pip install cryptography"
         ttk.Label(sf, text=st, style='Status.TLabel').pack(side='left', padx=(12,0))
         if not self.signing_available: self.sign_var.set(False)
@@ -420,7 +421,10 @@ class APCBToolGUI:
         # Handle signing availability per device
         if self.device_profile and not self.device_profile['supports_signing']:
             self.sign_var.set(False)
-            self._log(f"Signing: Not supported for {device_name} (SPI flash only)", 'dim')
+            self.sign_chk.configure(state='disabled')
+            self._log(f"Signing: Not applicable — {device_name} requires SPI flash", 'dim')
+        else:
+            self.sign_chk.configure(state='normal')
         self._log(f"Format: {'PE firmware (.fd)' if data[:2]==b'MZ' else 'Raw SPI dump'}", 'dim')
         self._log("Scanning...", 'dim')
         self.blocks = find_apcb_blocks(data)
