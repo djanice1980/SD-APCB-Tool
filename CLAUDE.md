@@ -43,15 +43,18 @@ CHANGELOG.md       # Version history
 - PE Authenticode signing is a pure-Python implementation (DER/PKCS#7/RSA-2048/SHA-256)
 - Input files are never modified — output always written to a separate file
 - **Device auto-detection** from firmware contents via `detect_device()`
-- Device profiles in `DEVICE_PROFILES` dict control per-device behavior
+  - Steam Deck: MEMG at offset 0x80
+  - ROG Ally: PSPG at 0x80, MEMG at 0xC0
+  - ROG Ally X: PSPG at 0x80, MEMG at 0xC8
+- Device profiles in `DEVICE_PROFILES` dict control per-device behavior (`steam_deck`, `rog_ally`, `rog_ally_x`)
 
 ## Device-Specific Notes
 
-| Device | MEMG Offset | Signing | Memory Targets | SPD Types | Notes |
-|--------|-------------|---------|----------------|-----------|-------|
-| Steam Deck | 0x80 | Supported (h2offt) | 16/32GB | LPDDR5 | MEMG directly at offset 0x80 |
-| ROG Ally | 0xC0 | Not supported | 16/32/64GB | LPDDR5 + LPDDR5X | PSPG at 0x80, MEMG at 0xC0 |
-| ROG Ally X | 0xC8 | Not supported | 16/32/64GB | LPDDR5 + LPDDR5X | PSPG at 0x80, MEMG at 0xC8; 24GB stock |
+| Device | Device Key | MEMG Offset | Signing | Stock RAM | Memory Targets | SPD Types | Notes |
+|--------|-----------|-------------|---------|-----------|----------------|-----------|-------|
+| Steam Deck | `steam_deck` | 0x80 | Supported (h2offt) | 16GB | 16/32GB | LPDDR5 | MEMG directly at offset 0x80 |
+| ROG Ally | `rog_ally` | 0xC0 | Not supported | 16GB | 16/32/64GB | LPDDR5 + LPDDR5X | PSPG at 0x80, MEMG at 0xC0 |
+| ROG Ally X | `rog_ally_x` | 0xC8 | Not supported | 24GB | 16/32/64GB | LPDDR5 + LPDDR5X | PSPG at 0x80, MEMG at 0xC8 |
 
 ## Safety Rules
 

@@ -128,7 +128,9 @@ MANUFACTURER_IDS = {
 
 # Known MEMG content type offsets within APCB blocks (device-dependent)
 MEMG_OFFSET_STANDARD = 0x80    # Steam Deck: MEMG directly at 0x80
-MEMG_OFFSET_PSPG = [0xC0, 0xC8]  # ROG Ally/Ally X: PSPG at 0x80, MEMG at 0xC0 or 0xC8
+MEMG_OFFSET_ALLY = [0xC0]      # ROG Ally: PSPG at 0x80, MEMG at 0xC0
+MEMG_OFFSET_ALLY_X = [0xC8]    # ROG Ally X: PSPG at 0x80, MEMG at 0xC8
+MEMG_OFFSET_PSPG = [0xC0, 0xC8]  # All ROG Ally series offsets (for scanning)
 PSPG_MAGIC = b'PSPG'           # PSP Group marker (ROG Ally series)
 
 # Device profiles for supported handhelds
@@ -142,7 +144,14 @@ DEVICE_PROFILES = {
     },
     'rog_ally': {
         'name': 'ROG Ally',
-        'memg_offsets': MEMG_OFFSET_PSPG,
+        'memg_offsets': MEMG_OFFSET_ALLY,
+        'supports_signing': False,
+        'memory_targets': [16, 32, 64],
+        'flash_instructions': 'Flash via SPI programmer (CH341A + SOIC8 clip)',
+    },
+    'rog_ally_x': {
+        'name': 'ROG Ally X',
+        'memg_offsets': MEMG_OFFSET_ALLY_X,
         'supports_signing': False,
         'memory_targets': [16, 32, 64],
         'flash_instructions': 'Flash via SPI programmer (CH341A + SOIC8 clip)',
@@ -223,12 +232,14 @@ def detect_device(data: bytes) -> str:
     Scans APCB blocks and checks content type marker locations:
       - MEMG at offset 0x80 → Steam Deck
       - PSPG at offset 0x80 + MEMG at offset 0xC0 → ROG Ally
+      - PSPG at offset 0x80 + MEMG at offset 0xC8 → ROG Ally X
 
     Returns:
-        Device key ('steam_deck', 'rog_ally') or 'unknown'
+        Device key ('steam_deck', 'rog_ally', 'rog_ally_x') or 'unknown'
     """
     has_memg_at_80 = False
-    has_pspg_at_80_memg_at_c0 = False
+    has_pspg_memg_at_c0 = False
+    has_pspg_memg_at_c8 = False
 
     for magic in [APCB_MAGIC, APCB_MAGIC_MOD]:
         pos = 0
@@ -243,21 +254,24 @@ def detect_device(data: bytes) -> str:
                 pos = idx + 1
                 continue
 
-            # Check what's at offset 0x80 and fallback offsets (0xC0, 0xC8)
+            # Check what's at offset 0x80 and fallback offsets
             if idx + 0x84 <= len(data):
                 if data[idx+0x80:idx+0x84] == MEMG_MAGIC:
                     has_memg_at_80 = True
                 elif data[idx+0x80:idx+0x84] == PSPG_MAGIC:
-                    for alt_off in MEMG_OFFSET_PSPG:
-                        if idx + alt_off + 4 <= len(data) and data[idx+alt_off:idx+alt_off+4] == MEMG_MAGIC:
-                            has_pspg_at_80_memg_at_c0 = True
-                            break
+                    # Distinguish ROG Ally (MEMG at 0xC0) from Ally X (MEMG at 0xC8)
+                    if idx + 0xC4 <= len(data) and data[idx+0xC0:idx+0xC4] == MEMG_MAGIC:
+                        has_pspg_memg_at_c0 = True
+                    if idx + 0xCC <= len(data) and data[idx+0xC8:idx+0xCC] == MEMG_MAGIC:
+                        has_pspg_memg_at_c8 = True
 
             pos = idx + 1
 
     if has_memg_at_80:
         return 'steam_deck'
-    elif has_pspg_at_80_memg_at_c0:
+    elif has_pspg_memg_at_c8:
+        return 'rog_ally_x'
+    elif has_pspg_memg_at_c0:
         return 'rog_ally'
     return 'unknown'
 
@@ -423,7 +437,7 @@ def analyze_bios(filepath: str, device: str = 'auto') -> List[APCBBlock]:
 
     Args:
         filepath: Path to the BIOS file to analyze
-        device: Device type ('auto', 'steam_deck', 'rog_ally')
+        device: Device type ('auto', 'steam_deck', 'rog_ally', 'rog_ally_x')
     """
 
     if not os.path.exists(filepath):
@@ -810,7 +824,7 @@ def modify_bios(input_path: str, output_path: str, target_gb: int,
         modify_magic_byte: If True, change APCB byte[0] from 0x41 to 0x51 (cosmetic only)
         entry_indices: Which SPD entries to modify (0-based). None = first entry only.
         sign_output: If True, re-sign the firmware with PE Authenticode for h2offt
-        device: Device type ('auto', 'steam_deck', 'rog_ally')
+        device: Device type ('auto', 'steam_deck', 'rog_ally', 'rog_ally_x')
     """
 
     if target_gb not in MEMORY_CONFIGS:
@@ -1083,7 +1097,7 @@ Supported devices:
     # Analyze command
     analyze_parser = subparsers.add_parser('analyze', help='Analyze BIOS file')
     analyze_parser.add_argument('bios_file', help='BIOS file to analyze')
-    analyze_parser.add_argument('--device', choices=['auto', 'steam_deck', 'rog_ally'],
+    analyze_parser.add_argument('--device', choices=['auto', 'steam_deck', 'rog_ally', 'rog_ally_x'],
                                 default='auto', help='Device type (default: auto-detect)')
     
     # Modify command
@@ -1102,7 +1116,7 @@ Supported devices:
                               help='Modify ALL SPD entries, not just the first')
     modify_parser.add_argument('--entry', type=int, action='append',
                               help='Specific entry index to modify (0-based, can repeat)')
-    modify_parser.add_argument('--device', choices=['auto', 'steam_deck', 'rog_ally'],
+    modify_parser.add_argument('--device', choices=['auto', 'steam_deck', 'rog_ally', 'rog_ally_x'],
                               default='auto', help='Device type (default: auto-detect)')
     
     args = parser.parse_args()
