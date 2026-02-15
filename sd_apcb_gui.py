@@ -62,11 +62,12 @@ MANUFACTURER_IDS = {0x2C: 'Micron', 0xCE: 'Samsung', 0xAD: 'SK Hynix', 0x01: 'Sa
 DEVICE_PROFILES = {
     'steam_deck': {'name': 'Steam Deck', 'supports_signing': True, 'memory_targets': [16, 32]},
     'rog_ally': {'name': 'ROG Ally', 'supports_signing': False, 'memory_targets': [16, 32, 64]},
+    'rog_ally_x': {'name': 'ROG Ally X', 'supports_signing': False, 'memory_targets': [16, 32, 64]},
 }
 
 def detect_device(data):
     """Auto-detect device type from firmware contents."""
-    has_memg_80, has_pspg_memg_c0 = False, False
+    has_memg_80, has_pspg_memg_c0, has_pspg_memg_c8 = False, False, False
     for magic in [APCB_MAGIC, APCB_MAGIC_MOD]:
         pos = 0
         while pos < len(data) - 32:
@@ -78,11 +79,13 @@ def detect_device(data):
             if idx + 0x84 <= len(data):
                 if data[idx+0x80:idx+0x84] == MEMG_MAGIC: has_memg_80 = True
                 elif data[idx+0x80:idx+0x84] == PSPG_MAGIC:
-                    for alt_off in [0xC0, 0xC8]:
-                        if idx + alt_off + 4 <= len(data) and data[idx+alt_off:idx+alt_off+4] == MEMG_MAGIC:
-                            has_pspg_memg_c0 = True; break
+                    if idx + 0xC4 <= len(data) and data[idx+0xC0:idx+0xC4] == MEMG_MAGIC:
+                        has_pspg_memg_c0 = True
+                    if idx + 0xCC <= len(data) and data[idx+0xC8:idx+0xCC] == MEMG_MAGIC:
+                        has_pspg_memg_c8 = True
             pos = idx + 1
     if has_memg_80: return 'steam_deck'
+    elif has_pspg_memg_c8: return 'rog_ally_x'
     elif has_pspg_memg_c0: return 'rog_ally'
     return 'unknown'
 
@@ -351,9 +354,11 @@ class APCBToolGUI:
         ttk.Label(m, text="Target Configuration", style='Section.TLabel').pack(anchor='w', pady=(4,4))
         tc = tk.Frame(m, bg=C_BGL, padx=16, pady=12, highlightbackground=C_BDR, highlightthickness=1); tc.pack(fill='x', pady=(0,10))
         self.target_var = tk.IntVar(value=32)
-        for val, txt, desc in [(32,"32GB Upgrade","Patches SPD for 32GB"),(64,"64GB Upgrade","Patches SPD for 64GB (ROG Ally X)"),(16,"16GB Restore","Restores stock configuration")]:
+        self.target_radios = {}
+        for val, txt, desc in [(32,"32GB Upgrade","Patches SPD for 32GB"),(64,"64GB Upgrade","Patches SPD for 64GB (ROG Ally series)"),(16,"16GB Restore","Restores stock configuration")]:
             rf = tk.Frame(tc, bg=C_BGL); rf.pack(fill='x', pady=(0,4))
-            ttk.Radiobutton(rf, text=txt, variable=self.target_var, value=val).pack(side='left')
+            rb = ttk.Radiobutton(rf, text=txt, variable=self.target_var, value=val); rb.pack(side='left')
+            self.target_radios[val] = rb
             ttk.Label(rf, text=f"— {desc}", style='Status.TLabel').pack(side='left', padx=(8,0))
         of = tk.Frame(tc, bg=C_BGL); of.pack(fill='x', pady=(6,0))
         self.magic_var = tk.BooleanVar(value=False)
@@ -367,7 +372,10 @@ class APCBToolGUI:
         br = ttk.Frame(m); br.pack(fill='x', pady=(0,8))
         self.btn_mod = ttk.Button(br, text="Apply Modification", style='Action.TButton', command=self._do_modify, state='disabled'); self.btn_mod.pack(side='left')
         self.btn_ana = ttk.Button(br, text="Analyze Only", command=self._do_analyze, state='disabled'); self.btn_ana.pack(side='left', padx=(8,0))
-        ttk.Label(m, text="Log Output", style='Section.TLabel').pack(anchor='w', pady=(4,4))
+        lh = ttk.Frame(m); lh.pack(fill='x', pady=(4,4))
+        ttk.Label(lh, text="Log Output", style='Section.TLabel').pack(side='left')
+        ttk.Button(lh, text="Copy Log", command=self._copy_log).pack(side='right', padx=(4,0))
+        ttk.Button(lh, text="Clear Log", command=self._log_clear).pack(side='right')
         lf = tk.Frame(m, bg=C_BDR, padx=1, pady=1); lf.pack(fill='both', expand=True)
         self.log = scrolledtext.ScrolledText(lf, wrap='word', font=('Consolas',9), bg=C_BGE, fg=C_FG, insertbackground=C_FG,
             selectbackground=C_ACC, selectforeground=C_BG, relief='flat', borderwidth=0, padx=8, pady=8, state='disabled')
@@ -382,9 +390,12 @@ class APCBToolGUI:
         self.log.configure(state='normal'); self.log.insert('end', text+'\n', tag); self.log.see('end'); self.log.configure(state='disabled')
     def _log_clear(self):
         self.log.configure(state='normal'); self.log.delete('1.0','end'); self.log.configure(state='disabled')
+    def _copy_log(self):
+        text = self.log.get('1.0', 'end-1c')
+        self.root.clipboard_clear(); self.root.clipboard_append(text)
 
     def _open_file(self):
-        fp = filedialog.askopenfilename(title="Open BIOS File", filetypes=[("BIOS Files","*.fd *.bin *.rom *.342"),("All","*.*")])
+        fp = filedialog.askopenfilename(title="Open BIOS File", filetypes=[("All files","*.*"),("BIOS Files","*.fd *.bin *.rom")])
         if not fp: return
         self._log_clear(); self._log(f"Loading: {fp}", 'accent')
         try:
@@ -400,6 +411,12 @@ class APCBToolGUI:
         device_name = self.device_profile['name'] if self.device_profile else 'Unknown Device'
         self.lbl_dev.configure(text=f"Device: {device_name}", style='Info.TLabel')
         self._log(f"Device: {device_name}", 'cyan')
+        # Enable/disable 64GB option based on device support
+        if self.device_profile and 64 in self.device_profile.get('memory_targets', []):
+            self.target_radios[64].configure(state='normal')
+        else:
+            self.target_radios[64].configure(state='disabled')
+            if self.target_var.get() == 64: self.target_var.set(32)
         # Handle signing availability per device
         if self.device_profile and not self.device_profile['supports_signing']:
             self.sign_var.set(False)
@@ -465,7 +482,7 @@ class APCBToolGUI:
             messagebox.showinfo("Signing Skipped", "Raw SPI dump — signing not applicable."); do_sign = False
         sp = Path(self.loaded_file); dn = f"{sp.stem}{'_64GB' if target==64 else '_32GB' if target==32 else '_stock'}{sp.suffix}"
         op = filedialog.asksaveasfilename(title="Save Modified BIOS As", initialfile=dn, initialdir=str(sp.parent),
-            filetypes=[("BIOS Files","*.fd *.bin *.rom"),("All","*.*")])
+            filetypes=[("All files","*.*"),("BIOS Files","*.fd *.bin *.rom")])
         if not op: return
         if os.path.abspath(op) == os.path.abspath(self.loaded_file): messagebox.showerror("Error","Cannot overwrite input."); return
         self._log_clear()
