@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """
-Steam Deck APCB Memory Mod Tool (GUI) v1.2.0
-=============================================
-GUI for analyzing and modifying Steam Deck LCD/OLED BIOS files
-to support 16GB/32GB memory configurations.
+APCB Memory Mod Tool (GUI) v1.4.0
+===================================
+GUI for analyzing and modifying handheld device BIOS files
+to support 16GB/32GB/64GB memory configurations.
 
-Validated against known-good 32GB mods for both LCD (F7A) and OLED (F7G).
-Supports both SPI flash output and signed h2offt-ready firmware.
+Supported devices:
+  - Steam Deck (LCD & OLED) — 16GB/32GB
+  - ASUS ROG Ally / Ally X — 16GB/32GB/64GB
+
+Auto-detects device type from firmware contents.
+Supports both SPI flash output and signed h2offt-ready firmware (Steam Deck only).
 
 Requirements:
   - Python 3.8+ (tkinter included with standard Python on Windows)
-  - For h2offt signing: pip install cryptography
+  - For h2offt signing (Steam Deck only): pip install cryptography
 
 Usage: python sd_apcb_gui.py
 """
@@ -22,32 +26,71 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 
-APP_TITLE = "Steam Deck APCB Memory Mod Tool"
-APP_VERSION = "1.2.0"
+APP_TITLE = "SD APCB Memory Mod Tool"
+APP_VERSION = "1.4.0"
 APCB_MAGIC = b'APCB'
 APCB_MAGIC_MOD = b'QPCB'
 APCB_CHECKSUM_OFFSET = 16
 MEMG_MAGIC = b'MEMG'
 TOKN_MAGIC = b'TOKN'
-LP5_SPD_MAGIC = bytes([0x23, 0x11, 0x13, 0x0E])
+PSPG_MAGIC = b'PSPG'
+LP5_SPD_MAGIC  = bytes([0x23, 0x11, 0x13, 0x0E])
+LP5X_SPD_MAGIC = bytes([0x23, 0x11, 0x15, 0x0E])
+ALL_SPD_MAGICS = [LP5_SPD_MAGIC, LP5X_SPD_MAGIC]
 SPD_ENTRY_SEPARATOR = bytes([0x12, 0x34, 0x56, 0x78])
 MEMORY_CONFIGS = {
     16: {'name': '16GB (Stock)', 'byte6': 0x95, 'byte12': 0x02},
     32: {'name': '32GB Upgrade', 'byte6': 0xB5, 'byte12': 0x0A},
+    64: {'name': '64GB Upgrade', 'byte6': 0xF5, 'byte12': 0x49},
 }
 MODULE_DENSITY_MAP = {
     'MT62F512M32D2DR': '16GB', 'MT62F768M32D2DR': '24GB',
     'MT62F1G64D4BS': '32GB', 'MT62F1G64D4AH': '32GB', 'MT62F1G32D4DR': '32GB',
     'MT62F2G64D8AJ': '32GB', 'MT62F2G64D8': '32GB',
     'K3KL3L30CM': '32GB', 'K3LKCKC0BM': '32GB',
+    'K3LKBKB0BM': '16GB',
+    # LPDDR5X modules
+    'MT62F1G32D2DS': '16GB', 'MT62F768M32D2DS': '24GB',
+    'MT62F1536M32D4DS': '32GB', 'MT62F2G32D4DS': '32GB',
+    'MT62F4G32D8DV': '64GB',
+    'K3KL8L80CM': '16GB', 'K3KLALA0CM': '64GB',
+    'H58G56BK7BX': '16GB', 'H58GE6AK8BX': '32GB',
 }
 MANUFACTURER_IDS = {0x2C: 'Micron', 0xCE: 'Samsung', 0xAD: 'SK Hynix', 0x01: 'Samsung'}
+
+# Device profiles
+DEVICE_PROFILES = {
+    'steam_deck': {'name': 'Steam Deck', 'supports_signing': True, 'memory_targets': [16, 32]},
+    'rog_ally': {'name': 'ROG Ally', 'supports_signing': False, 'memory_targets': [16, 32, 64]},
+}
+
+def detect_device(data):
+    """Auto-detect device type from firmware contents."""
+    has_memg_80, has_pspg_memg_c0 = False, False
+    for magic in [APCB_MAGIC, APCB_MAGIC_MOD]:
+        pos = 0
+        while pos < len(data) - 32:
+            idx = data.find(magic, pos)
+            if idx == -1: break
+            header = data[idx:idx+32]
+            ds = struct.unpack_from('<I', header, 8)[0]
+            if ds > 0x100000 or ds < 16: pos = idx + 1; continue
+            if idx + 0x84 <= len(data):
+                if data[idx+0x80:idx+0x84] == MEMG_MAGIC: has_memg_80 = True
+                elif data[idx+0x80:idx+0x84] == PSPG_MAGIC:
+                    for alt_off in [0xC0, 0xC8]:
+                        if idx + alt_off + 4 <= len(data) and data[idx+alt_off:idx+alt_off+4] == MEMG_MAGIC:
+                            has_pspg_memg_c0 = True; break
+            pos = idx + 1
+    if has_memg_80: return 'steam_deck'
+    elif has_pspg_memg_c0: return 'rog_ally'
+    return 'unknown'
 
 @dataclass
 class SPDEntry:
     offset_in_apcb: int; offset_in_file: int; spd_bytes: bytes
     module_name: str = ''; manufacturer: str = ''; density_guess: str = ''
-    byte6: int = 0; byte12: int = 0; config_id: int = 0; mfr_flag: int = 0
+    byte6: int = 0; byte12: int = 0; config_id: int = 0; mfr_flag: int = 0; mem_type: str = 'LPDDR5'
 
 @dataclass
 class APCBBlock:
@@ -85,6 +128,11 @@ def find_apcb_blocks(data):
             if idx+0x84 < len(data):
                 if data[idx+0x80:idx+0x84] == MEMG_MAGIC: ct = 'MEMG'
                 elif data[idx+0x80:idx+0x84] == TOKN_MAGIC: ct = 'TOKN'
+            if ct == 'UNKNOWN':
+                for alt_off in [0xC0, 0xC8]:
+                    if idx+alt_off+4 < len(data):
+                        if data[idx+alt_off:idx+alt_off+4] == MEMG_MAGIC: ct = 'MEMG'; break
+                        elif data[idx+alt_off:idx+alt_off+4] == TOKN_MAGIC: ct = 'TOKN'; break
             cv = verify_apcb_checksum(data[idx:idx+ds]) if idx+ds <= len(data) else False
             block = APCBBlock(idx, ds, ts, cb, cv, ct)
             if ct == 'MEMG': block.spd_entries = parse_spd_entries(data, idx, ds)
@@ -94,14 +142,20 @@ def find_apcb_blocks(data):
     return blocks
 
 def parse_spd_entries(data, apcb_offset, apcb_size):
-    entries, apcb, pos = [], data[apcb_offset:apcb_offset+apcb_size], 0
-    while pos < len(apcb):
-        idx = apcb.find(LP5_SPD_MAGIC, pos)
-        if idx == -1 or idx+16 > len(apcb): break
+    entries, apcb = [], data[apcb_offset:apcb_offset+apcb_size]
+    raw = []
+    for spd_magic, mt in [(LP5_SPD_MAGIC, 'LPDDR5'), (LP5X_SPD_MAGIC, 'LPDDR5X')]:
+        pos = 0
+        while pos < len(apcb):
+            idx = apcb.find(spd_magic, pos)
+            if idx == -1 or idx+16 > len(apcb): break
+            raw.append((idx, mt)); pos = idx + 1
+    raw.sort(key=lambda x: x[0])
+    for idx, mt in raw:
         spd = apcb[idx:idx+16]
-        e = SPDEntry(idx, apcb_offset+idx, spd, byte6=spd[6], byte12=spd[12])
+        e = SPDEntry(idx, apcb_offset+idx, spd, byte6=spd[6], byte12=spd[12], mem_type=mt)
         for j in range(idx, min(idx+0x200, len(apcb)-20)):
-            if apcb[j:j+3] in [b'MT6', b'K3K', b'SEC', b'SAM']:
+            if apcb[j:j+3] in [b'MT6', b'K3K', b'K3L', b'SEC', b'SAM', b'H9H', b'H58']:
                 end = j
                 while end < min(j+30, len(apcb)) and 0x20 <= apcb[end] < 0x7F: end += 1
                 e.module_name = apcb[j:end].decode('ascii', errors='replace').strip()
@@ -115,14 +169,15 @@ def parse_spd_entries(data, apcb_offset, apcb_size):
         if si >= 0:
             ha = ss + si; hdr = apcb[ha:idx]
             if len(hdr) >= 12: e.mfr_flag = struct.unpack_from('<H', hdr, 8)[0]; e.config_id = struct.unpack_from('<H', hdr, 10)[0]
-        entries.append(e); pos = idx + 1
+        entries.append(e)
     return entries
 
 def detect_current_config(blocks):
     for b in blocks:
         if b.is_memg and b.spd_entries:
             e = b.spd_entries[0]
-            if e.byte6 == 0xB5 and e.byte12 == 0x0A: return "32GB (modified)"
+            if e.byte6 == 0xF5 and e.byte12 == 0x49: return "64GB (modified)"
+            elif e.byte6 == 0xB5 and e.byte12 == 0x0A: return "32GB (modified)"
             elif e.byte6 == 0x95 and e.byte12 == 0x02: return "16GB/24GB (stock)"
             else: return f"Unknown (0x{e.byte6:02X}/0x{e.byte12:02X})"
     return "No MEMG blocks found"
@@ -250,6 +305,7 @@ class APCBToolGUI:
     def __init__(self, root):
         self.root = root; root.title(APP_TITLE); root.geometry("820x720"); root.minsize(700,600); root.configure(bg=C_BG)
         self.loaded_file = None; self.loaded_data = None; self.blocks = []; self.current_config = ""
+        self.detected_device = 'unknown'; self.device_profile = None
         self.signing_available = _check_signing_available()
         self._setup_styles(); self._build_ui()
 
@@ -287,13 +343,15 @@ class APCBToolGUI:
         r1 = tk.Frame(ic, bg=C_BGL); r1.pack(fill='x')
         self.lbl_fn = ttk.Label(r1, text="—", style='Info.TLabel'); self.lbl_fn.pack(side='left')
         self.lbl_fs = ttk.Label(r1, text="", style='Status.TLabel'); self.lbl_fs.pack(side='right')
+        r1b = tk.Frame(ic, bg=C_BGL); r1b.pack(fill='x', pady=(4,0))
+        self.lbl_dev = ttk.Label(r1b, text="", style='Status.TLabel'); self.lbl_dev.pack(side='left')
         r2 = tk.Frame(ic, bg=C_BGL); r2.pack(fill='x', pady=(4,0))
         self.lbl_bl = ttk.Label(r2, text="", style='Status.TLabel'); self.lbl_bl.pack(side='left')
         self.lbl_cf = ttk.Label(r2, text="", style='Status.TLabel'); self.lbl_cf.pack(side='right')
         ttk.Label(m, text="Target Configuration", style='Section.TLabel').pack(anchor='w', pady=(4,4))
         tc = tk.Frame(m, bg=C_BGL, padx=16, pady=12, highlightbackground=C_BDR, highlightthickness=1); tc.pack(fill='x', pady=(0,10))
         self.target_var = tk.IntVar(value=32)
-        for val, txt, desc in [(32,"32GB Upgrade","Patches SPD for 32GB LPDDR5"),(16,"16GB Restore","Restores stock configuration")]:
+        for val, txt, desc in [(32,"32GB Upgrade","Patches SPD for 32GB"),(64,"64GB Upgrade","Patches SPD for 64GB (ROG Ally X)"),(16,"16GB Restore","Restores stock configuration")]:
             rf = tk.Frame(tc, bg=C_BGL); rf.pack(fill='x', pady=(0,4))
             ttk.Radiobutton(rf, text=txt, variable=self.target_var, value=val).pack(side='left')
             ttk.Label(rf, text=f"— {desc}", style='Status.TLabel').pack(side='left', padx=(8,0))
@@ -326,7 +384,7 @@ class APCBToolGUI:
         self.log.configure(state='normal'); self.log.delete('1.0','end'); self.log.configure(state='disabled')
 
     def _open_file(self):
-        fp = filedialog.askopenfilename(title="Open Steam Deck BIOS File", filetypes=[("BIOS Files","*.fd *.bin *.rom"),("All","*.*")])
+        fp = filedialog.askopenfilename(title="Open BIOS File", filetypes=[("BIOS Files","*.fd *.bin *.rom *.342"),("All","*.*")])
         if not fp: return
         self._log_clear(); self._log(f"Loading: {fp}", 'accent')
         try:
@@ -336,13 +394,23 @@ class APCBToolGUI:
         fn, fs = os.path.basename(fp), len(data)
         self.file_label.configure(text=fn); self.lbl_fn.configure(text=fn)
         self.lbl_fs.configure(text=f"{fs:,} bytes ({fs/1024/1024:.2f} MB)")
+        # Device detection
+        self.detected_device = detect_device(data)
+        self.device_profile = DEVICE_PROFILES.get(self.detected_device)
+        device_name = self.device_profile['name'] if self.device_profile else 'Unknown Device'
+        self.lbl_dev.configure(text=f"Device: {device_name}", style='Info.TLabel')
+        self._log(f"Device: {device_name}", 'cyan')
+        # Handle signing availability per device
+        if self.device_profile and not self.device_profile['supports_signing']:
+            self.sign_var.set(False)
+            self._log(f"Signing: Not supported for {device_name} (SPI flash only)", 'dim')
         self._log(f"Format: {'PE firmware (.fd)' if data[:2]==b'MZ' else 'Raw SPI dump'}", 'dim')
         self._log("Scanning...", 'dim')
         self.blocks = find_apcb_blocks(data)
         mc = sum(1 for b in self.blocks if b.is_memg); tc = sum(1 for b in self.blocks if b.content_type=='TOKN')
         self.lbl_bl.configure(text=f"APCB: {len(self.blocks)} blocks ({mc} MEMG, {tc} TOKN)")
         if mc == 0:
-            self.lbl_cf.configure(text="⚠ No MEMG!", style='Bad.TLabel'); self._log("No APCB MEMG blocks found.", 'warning')
+            self.lbl_cf.configure(text="No MEMG!", style='Bad.TLabel'); self._log("No APCB MEMG blocks found.", 'warning')
             self.btn_mod.configure(state='disabled'); self.btn_ana.configure(state='normal'); return
         self.current_config = detect_current_config(self.blocks)
         self.lbl_cf.configure(text=f"Config: {self.current_config}", style='Warn.TLabel' if '32GB' in self.current_config else 'Good.TLabel')
@@ -350,19 +418,26 @@ class APCBToolGUI:
         self._log(f"Config: {self.current_config}", 'cyan')
         for b in self.blocks:
             if b.is_memg and b.spd_entries:
-                self._log(f"\nMEMG @ 0x{b.offset:08X} — {len(b.spd_entries)} SPD entries, cksum {'VALID' if b.checksum_valid else 'INVALID'}", 'header')
+                lp5 = sum(1 for e in b.spd_entries if e.mem_type == 'LPDDR5')
+                lp5x = sum(1 for e in b.spd_entries if e.mem_type == 'LPDDR5X')
+                ts = ', '.join(filter(None, [f"{lp5} LPDDR5" if lp5 else "", f"{lp5x} LPDDR5X" if lp5x else ""]))
+                self._log(f"\nMEMG @ 0x{b.offset:08X} — {len(b.spd_entries)} SPD entries ({ts}), cksum {'VALID' if b.checksum_valid else 'INVALID'}", 'header')
                 for i,e in enumerate(b.spd_entries):
-                    mk = " ◄ 32GB" if e.byte6==0xB5 and e.byte12==0x0A else ""
-                    self._log(f"  [{i+1}] {e.module_name or '(unnamed)':<28} {e.density_guess or '?':<6}  {e.manufacturer or '?':<8}  b6=0x{e.byte6:02X}  b12=0x{e.byte12:02X}{mk}", 'warning' if mk else 'dim')
+                    mk = ""
+                    if e.byte6==0xF5 and e.byte12==0x49: mk = " ◄ 64GB"
+                    elif e.byte6==0xB5 and e.byte12==0x0A: mk = " ◄ 32GB"
+                    self._log(f"  [{i+1}] {e.mem_type:<8} {e.module_name or '(unnamed)':<28} {e.density_guess or '?':<6}  {e.manufacturer or '?':<8}  b6=0x{e.byte6:02X}  b12=0x{e.byte12:02X}{mk}", 'warning' if mk else 'dim')
                 break
         self.btn_mod.configure(state='normal'); self.btn_ana.configure(state='normal')
 
     def _do_analyze(self):
         if not self.loaded_data: return
         self._log_clear()
+        dev_name = self.device_profile['name'] if self.device_profile else 'Unknown Device'
         self._log("═"*70, 'header'); self._log("  FULL BIOS ANALYSIS", 'header'); self._log("═"*70, 'header')
         self._log(f"  File: {os.path.basename(self.loaded_file)}", 'info')
         self._log(f"  Size: {len(self.loaded_data):,} bytes", 'info')
+        self._log(f"  Device: {dev_name}", 'cyan')
         self._log(f"  Config: {self.current_config}", 'cyan')
         for i,block in enumerate(self.blocks):
             self._log(f"\n{'─'*60}", 'dim')
@@ -370,21 +445,25 @@ class APCBToolGUI:
             self._log(f"  Offset: 0x{block.offset:08X}  |  Size: 0x{block.data_size:04X}  |  Checksum: 0x{block.checksum_byte:02X} ({'VALID' if block.checksum_valid else 'INVALID'})",
                       'success' if block.checksum_valid else 'error')
             if block.is_memg and block.spd_entries:
-                self._log(f"\n  {'#':<4} {'Module':<28} {'Size':<7} {'Mfr':<10} {'b6':<6} {'b12':<6} {'cfg'}", 'accent')
-                self._log(f"  {'─'*64}", 'dim')
+                self._log(f"\n  {'#':<4} {'Type':<8} {'Module':<28} {'Size':<7} {'Mfr':<10} {'b6':<6} {'b12':<6} {'cfg'}", 'accent')
+                self._log(f"  {'─'*72}", 'dim')
                 for j,e in enumerate(block.spd_entries):
-                    mk = "  ◄◄ 32GB CONFIG" if e.byte6==0xB5 and e.byte12==0x0A else ""
-                    self._log(f"  {j+1:<4} {e.module_name or '—':<28} {e.density_guess or '?':<7} {e.manufacturer or '?':<10} 0x{e.byte6:02X}   0x{e.byte12:02X}   0x{e.config_id:04X}{mk}",
+                    mk = ""
+                    if e.byte6==0xF5 and e.byte12==0x49: mk = "  ◄◄ 64GB CONFIG"
+                    elif e.byte6==0xB5 and e.byte12==0x0A: mk = "  ◄◄ 32GB CONFIG"
+                    self._log(f"  {j+1:<4} {e.mem_type:<8} {e.module_name or '—':<28} {e.density_guess or '?':<7} {e.manufacturer or '?':<10} 0x{e.byte6:02X}   0x{e.byte12:02X}   0x{e.config_id:04X}{mk}",
                               'warning' if mk else 'info')
 
     def _do_modify(self):
         if not self.loaded_data or not self.loaded_file: return
         target = self.target_var.get(); config = MEMORY_CONFIGS[target]; do_sign = self.sign_var.get()
+        if do_sign and self.device_profile and not self.device_profile['supports_signing']:
+            messagebox.showinfo("Signing Not Supported", f"{self.device_profile['name']} does not support firmware signing.\n\nUse SPI flash instead."); do_sign = False
         if do_sign and not self.signing_available:
             messagebox.showwarning("Signing Unavailable", "Install: pip install cryptography\n\nContinuing unsigned."); do_sign = False
         if do_sign and self.loaded_data[:2] != b'MZ':
             messagebox.showinfo("Signing Skipped", "Raw SPI dump — signing not applicable."); do_sign = False
-        sp = Path(self.loaded_file); dn = f"{sp.stem}{'_32GB' if target==32 else '_stock'}{sp.suffix}"
+        sp = Path(self.loaded_file); dn = f"{sp.stem}{'_64GB' if target==64 else '_32GB' if target==32 else '_stock'}{sp.suffix}"
         op = filedialog.asksaveasfilename(title="Save Modified BIOS As", initialfile=dn, initialdir=str(sp.parent),
             filetypes=[("BIOS Files","*.fd *.bin *.rom"),("All","*.*")])
         if not op: return
@@ -416,9 +495,10 @@ class APCBToolGUI:
                         if not m: ok = False
             if ok:
                 self._log(f"\n  ✓ MODIFICATION SUCCESSFUL", 'success')
+                dev_name = self.device_profile['name'] if self.device_profile else 'device'
                 if do_sign: self._log(f"  Ready for h2offt: sudo h2offt {os.path.basename(op)}", 'cyan')
                 else: self._log(f"  Ready for SPI flash.", 'success')
-                msg = f"Modified for {config['name']}!\n\n{op}\n\n{len(mods)} bytes changed.\n\n"
+                msg = f"Modified for {config['name']}!\n\nDevice: {dev_name}\n{op}\n\n{len(mods)} bytes changed.\n\n"
                 msg += f"{'Signed for h2offt.' if do_sign else 'Ready for SPI flash.'}"
                 messagebox.showinfo("Success", msg)
             else:
