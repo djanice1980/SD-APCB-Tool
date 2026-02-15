@@ -2,7 +2,9 @@
 
 ## Project Overview
 
-SD-APCB-Tool is a Python tool for patching Steam Deck BIOS firmware to support 32GB RAM upgrades. It modifies APCB (AMD Platform Configuration Block) SPD entries in Steam Deck LCD and OLED firmware files. Includes both a CLI (`sd_apcb_tool.py`) and a Tkinter GUI (`sd_apcb_gui.py`).
+SD-APCB-Tool is a Python tool for patching handheld gaming device BIOS firmware to support RAM upgrades (32GB/64GB). It modifies APCB (AMD Platform Configuration Block) SPD entries in firmware files. Includes both a CLI (`sd_apcb_tool.py`) and a Tkinter GUI (`sd_apcb_gui.py`).
+
+**Supported devices:** Steam Deck (LCD & OLED), ASUS ROG Ally, ASUS ROG Ally X
 
 ## Tech Stack
 
@@ -33,10 +35,23 @@ CHANGELOG.md       # Version history
 
 - CLI tool is the core engine; GUI reimplements the same logic inline
 - APCB blocks found by scanning for magic bytes (`APCB`/`QPCB`)
-- SPD entries identified by magic `23 11 13 0E`, separated by `12 34 56 78`
+- SPD entries identified by two magics:
+  - LPDDR5: `23 11 13 0E`
+  - LPDDR5X: `23 11 15 0E`
 - Modification changes two bytes per SPD entry: byte[6] (density) and byte[12] (config)
+- Memory configurations: 16GB (0x95/0x02), 32GB (0xB5/0x0A), 64GB (0xF5/0x49)
 - PE Authenticode signing is a pure-Python implementation (DER/PKCS#7/RSA-2048/SHA-256)
 - Input files are never modified — output always written to a separate file
+- **Device auto-detection** from firmware contents via `detect_device()`
+- Device profiles in `DEVICE_PROFILES` dict control per-device behavior
+
+## Device-Specific Notes
+
+| Device | MEMG Offset | Signing | Memory Targets | SPD Types | Notes |
+|--------|-------------|---------|----------------|-----------|-------|
+| Steam Deck | 0x80 | Supported (h2offt) | 16/32GB | LPDDR5 | MEMG directly at offset 0x80 |
+| ROG Ally | 0xC0 | Not supported | 16/32/64GB | LPDDR5 + LPDDR5X | PSPG at 0x80, MEMG at 0xC0 |
+| ROG Ally X | 0xC8 | Not supported | 16/32/64GB | LPDDR5 + LPDDR5X | PSPG at 0x80, MEMG at 0xC8; 24GB stock |
 
 ## Safety Rules
 
@@ -50,14 +65,23 @@ CHANGELOG.md       # Version history
 ## Common Commands
 
 ```bash
-# Analyze a BIOS file
+# Analyze a BIOS file (auto-detects device)
 python sd_apcb_tool.py analyze <bios_file>
 
-# Modify for 32GB with signing
+# Analyze with explicit device type
+python sd_apcb_tool.py analyze <bios_file> --device rog_ally
+
+# Modify for 32GB with signing (Steam Deck)
 python sd_apcb_tool.py modify <input> <output> --target 32 --sign
 
+# Modify for 32GB (ROG Ally, no signing)
+python sd_apcb_tool.py modify <input> <output> --target 32
+
+# Modify for 64GB (ROG Ally X, all entries)
+python sd_apcb_tool.py modify <input> <output> --target 64 --all-entries
+
 # Restore to 16GB
-python sd_apcb_tool.py modify <input> <output> --target 16 --sign
+python sd_apcb_tool.py modify <input> <output> --target 16
 
 # Run the GUI
 python sd_apcb_gui.py

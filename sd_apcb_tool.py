@@ -1,32 +1,38 @@
 #!/usr/bin/env python3
 """
-Steam Deck APCB Memory Configuration Tool v1.2.0
-=================================================
-Automated BIOS modification tool for Steam Deck LCD/OLED 32GB RAM upgrades.
+APCB Memory Configuration Tool v1.4.0
+======================================
+Automated BIOS modification tool for handheld gaming device RAM upgrades.
+
+Supported devices:
+  - Steam Deck (LCD & OLED) — 16GB/32GB
+  - ASUS ROG Ally / Ally X — 16GB/32GB/64GB
 
 Works on both raw SPI dumps and firmware update (.fd) files.
-Validated against known-good 32GB mods for both LCD (F7A) and OLED (F7G) firmware.
+Auto-detects device type from firmware contents.
 
-Core modification: patches LPDDR5 SPD density bytes in APCB MEMG blocks
-  - byte[6]:  0x95 → 0xB5  (density/package type)
-  - byte[12]: 0x02 → 0x0A  (configuration)
+Core modification: patches LPDDR5/LPDDR5X SPD density bytes in APCB MEMG blocks
+  - 16GB: byte[6]=0x95, byte[12]=0x02  (stock)
+  - 32GB: byte[6]=0xB5, byte[12]=0x0A
+  - 64GB: byte[6]=0xF5, byte[12]=0x49  (requires LPDDR5X hardware)
 
 Flashing Paths:
   - SPI programmer (CH341A + SOIC8 clip): Writes raw image directly to the
-    Winbond W25Q128JW flash chip. No signing required. This is the expected
-    path for 32GB RAM mods since the board is already open for soldering.
-  - h2offt (software flash): Requires a validly signed PE Authenticode capsule.
-    Use --sign to automatically re-sign the modified firmware for h2offt.
-    Requires the 'cryptography' Python package (pip install cryptography).
+    flash chip. No signing required. Supported by all devices.
+  - h2offt (software flash, Steam Deck only): Requires a validly signed PE
+    Authenticode capsule. Use --sign to automatically re-sign the modified
+    firmware for h2offt. Requires 'cryptography' (pip install cryptography).
 
 Supports:
   - Analysis mode: scans BIOS and reports all APCB blocks and SPD entries
   - Modify mode: patches SPD parameters for target memory configuration
+  - Automatic device detection (Steam Deck vs ROG Ally)
   - Automatic PE Authenticode re-signing (--sign) for h2offt software flash
   - Validates checksums before and after modification
 
 Usage:
   python sd_apcb_tool.py analyze <bios_file>
+  python sd_apcb_tool.py analyze <bios_file> --device rog_ally
   python sd_apcb_tool.py modify <bios_in> <bios_out> --target 32
   python sd_apcb_tool.py modify <bios_in> <bios_out> --target 32 --sign
   python sd_apcb_tool.py modify <bios_in> <bios_out> --target 16  (restore stock)
@@ -46,7 +52,7 @@ from typing import List, Optional, Tuple
 # Constants
 # ============================================================================
 
-TOOL_VERSION = "1.2.0"
+TOOL_VERSION = "1.4.0"
 
 APCB_MAGIC = b'APCB'                         # APCB header signature (stock)
 APCB_MAGIC_MOD = b'QPCB'                     # APCB header signature (one modder's marker - cosmetic only)
@@ -55,8 +61,10 @@ ECB2_MAGIC = b'ECB2'                          # APCB sub-header marker
 MEMG_MAGIC = b'MEMG'                          # Memory Group marker
 TOKN_MAGIC = b'TOKN'                          # Token marker
 BCBA_MAGIC = b'BCBA'                          # Block marker preceding MEMG/TOKN
-LP5_SPD_MAGIC = bytes([0x23, 0x11, 0x13, 0x0E])  # LPDDR5 SPD entry magic
-LP4_SPD_MAGIC = bytes([0x23, 0x11, 0x11, 0x0E])  # LPDDR4 SPD entry magic (for reference)
+LP5_SPD_MAGIC  = bytes([0x23, 0x11, 0x13, 0x0E])  # LPDDR5 SPD entry magic
+LP5X_SPD_MAGIC = bytes([0x23, 0x11, 0x15, 0x0E])  # LPDDR5X SPD entry magic
+LP4_SPD_MAGIC  = bytes([0x23, 0x11, 0x11, 0x0E])  # LPDDR4 SPD entry magic (for reference)
+ALL_SPD_MAGICS = [LP5_SPD_MAGIC, LP5X_SPD_MAGIC]  # All supported SPD magic types
 SPD_ENTRY_SEPARATOR = bytes([0x12, 0x34, 0x56, 0x78])  # Entry boundary marker
 BL2_MAGIC = b'$BL2'                           # BIOS Level 2 directory marker
 
@@ -73,12 +81,19 @@ MEMORY_CONFIGS = {
         'name': '32GB Upgrade',
         'byte6': 0xB5,    # Higher density
         'byte12': 0x0A,   # 32GB config
-        'description': 'Configures APCB for 32GB LPDDR5 memory',
+        'description': 'Configures APCB for 32GB memory',
+    },
+    64: {
+        'name': '64GB Upgrade',
+        'byte6': 0xF5,    # 64GB density (8 die x 16Gb per die)
+        'byte12': 0x49,   # 64GB config
+        'description': 'Configures APCB for 64GB memory (requires LPDDR5X hardware)',
     },
 }
 
 # Known module part numbers and their memory sizes
 MODULE_DENSITY_MAP = {
+    # Micron LPDDR5
     'MT62F512M32D2DR': '16GB',    # Micron 512Mx32, 2-die (8GB/pkg × 2)
     'MT62F768M32D2DR': '24GB',    # Micron 768Mx32, 2-die (12GB/pkg × 2)
     'MT62F1G64D4BS':   '32GB',    # Micron 1Gx64, 4-die (16GB/pkg × 2)
@@ -86,8 +101,22 @@ MODULE_DENSITY_MAP = {
     'MT62F1G32D4DR':   '32GB',    # Micron 1Gx32, 4-die - reference 32GB APCB entry
     'MT62F2G64D8AJ':   '32GB',    # Micron 2Gx64, 8-die (16GB/pkg × 2) - TESTED for 32GB mod
     'MT62F2G64D8':     '32GB',    # Micron 2Gx64, 8-die generic (16GB/pkg × 2)
+    # Micron LPDDR5X
+    'MT62F1G32D2DS':   '16GB',    # Micron LPDDR5X 16GB — Ally X
+    'MT62F768M32D2DS': '24GB',    # Micron LPDDR5X 24GB — ROG Ally
+    'MT62F1536M32D4DS':'32GB',    # Micron LPDDR5X 32GB — Ally X
+    'MT62F2G32D4DS':   '32GB',    # Micron LPDDR5X 32GB — Ally X
+    'MT62F4G32D8DV':   '64GB',    # Micron LPDDR5X 64GB (16GB/pkg × 4)
+    # Samsung LPDDR5
     'K3KL3L30CM':      '32GB',    # Samsung LPDDR5 32GB
     'K3LKCKC0BM':      '32GB',    # Samsung LPDDR5X 8GB/pkg × 4 (LCD) - TESTED for 32GB mod
+    'K3LKBKB0BM':      '16GB',    # Samsung LPDDR5 — ROG Ally stock
+    # Samsung LPDDR5X
+    'K3KL8L80CM':      '16GB',    # Samsung LPDDR5X — Ally X stock
+    'K3KLALA0CM':      '64GB',    # Samsung LPDDR5X 64GB (16GB/pkg × 4)
+    # SK Hynix LPDDR5X
+    'H58G56BK7BX':     '16GB',    # SK Hynix LPDDR5X 16GB — Ally X stock
+    'H58GE6AK8BX':     '32GB',    # SK Hynix LPDDR5X 32GB — Ally X
 }
 
 MANUFACTURER_IDS = {
@@ -95,6 +124,29 @@ MANUFACTURER_IDS = {
     0xCE: 'Samsung',
     0xAD: 'SK Hynix',
     0x01: 'Samsung (alt)',
+}
+
+# Known MEMG content type offsets within APCB blocks (device-dependent)
+MEMG_OFFSET_STANDARD = 0x80    # Steam Deck: MEMG directly at 0x80
+MEMG_OFFSET_PSPG = [0xC0, 0xC8]  # ROG Ally/Ally X: PSPG at 0x80, MEMG at 0xC0 or 0xC8
+PSPG_MAGIC = b'PSPG'           # PSP Group marker (ROG Ally series)
+
+# Device profiles for supported handhelds
+DEVICE_PROFILES = {
+    'steam_deck': {
+        'name': 'Steam Deck',
+        'memg_offset': MEMG_OFFSET_STANDARD,
+        'supports_signing': True,
+        'memory_targets': [16, 32],
+        'flash_instructions': 'sudo /usr/share/jupiter_bios_updater/h2offt {filename}',
+    },
+    'rog_ally': {
+        'name': 'ROG Ally',
+        'memg_offsets': MEMG_OFFSET_PSPG,
+        'supports_signing': False,
+        'memory_targets': [16, 32, 64],
+        'flash_instructions': 'Flash via SPI programmer (CH341A + SOIC8 clip)',
+    },
 }
 
 
@@ -115,6 +167,7 @@ class SPDEntry:
     byte12: int = 0              # Key byte: configuration
     config_id: int = 0           # Configuration index from entry header
     mfr_flag: int = 0            # Manufacturer flag from entry header
+    mem_type: str = 'LPDDR5'     # Memory type ('LPDDR5' or 'LPDDR5X')
 
 
 @dataclass
@@ -160,6 +213,56 @@ def verify_apcb_checksum(block_data: bytes) -> bool:
 
 
 # ============================================================================
+# Device Detection
+# ============================================================================
+
+def detect_device(data: bytes) -> str:
+    """
+    Auto-detect the device type from firmware contents.
+
+    Scans APCB blocks and checks content type marker locations:
+      - MEMG at offset 0x80 → Steam Deck
+      - PSPG at offset 0x80 + MEMG at offset 0xC0 → ROG Ally
+
+    Returns:
+        Device key ('steam_deck', 'rog_ally') or 'unknown'
+    """
+    has_memg_at_80 = False
+    has_pspg_at_80_memg_at_c0 = False
+
+    for magic in [APCB_MAGIC, APCB_MAGIC_MOD]:
+        pos = 0
+        while pos < len(data) - 32:
+            idx = data.find(magic, pos)
+            if idx == -1:
+                break
+
+            header = data[idx:idx+32]
+            data_size = struct.unpack_from('<I', header, 8)[0]
+            if data_size > 0x100000 or data_size < 16:
+                pos = idx + 1
+                continue
+
+            # Check what's at offset 0x80 and fallback offsets (0xC0, 0xC8)
+            if idx + 0x84 <= len(data):
+                if data[idx+0x80:idx+0x84] == MEMG_MAGIC:
+                    has_memg_at_80 = True
+                elif data[idx+0x80:idx+0x84] == PSPG_MAGIC:
+                    for alt_off in MEMG_OFFSET_PSPG:
+                        if idx + alt_off + 4 <= len(data) and data[idx+alt_off:idx+alt_off+4] == MEMG_MAGIC:
+                            has_pspg_at_80_memg_at_c0 = True
+                            break
+
+            pos = idx + 1
+
+    if has_memg_at_80:
+        return 'steam_deck'
+    elif has_pspg_at_80_memg_at_c0:
+        return 'rog_ally'
+    return 'unknown'
+
+
+# ============================================================================
 # APCB Scanning and Parsing
 # ============================================================================
 
@@ -195,12 +298,23 @@ def find_apcb_blocks(data: bytes) -> List[APCBBlock]:
                 continue
             
             # Determine content type
+            # Check standard offset 0x80 (Steam Deck) and 0xC0 (ROG Ally)
             content_type = 'UNKNOWN'
             if idx + 0x84 < len(data):
                 if data[idx+0x80:idx+0x84] == MEMG_MAGIC:
                     content_type = 'MEMG'
                 elif data[idx+0x80:idx+0x84] == TOKN_MAGIC:
                     content_type = 'TOKN'
+            # ROG Ally series layout: PSPG at 0x80, MEMG/TOKN at 0xC0 or 0xC8
+            if content_type == 'UNKNOWN':
+                for alt_off in MEMG_OFFSET_PSPG:
+                    if idx + alt_off + 4 < len(data):
+                        if data[idx+alt_off:idx+alt_off+4] == MEMG_MAGIC:
+                            content_type = 'MEMG'
+                            break
+                        elif data[idx+alt_off:idx+alt_off+4] == TOKN_MAGIC:
+                            content_type = 'TOKN'
+                            break
             
             # Verify checksum
             if idx + data_size <= len(data):
@@ -231,51 +345,59 @@ def find_apcb_blocks(data: bytes) -> List[APCBBlock]:
 
 
 def parse_spd_entries(data: bytes, apcb_offset: int, apcb_size: int) -> List[SPDEntry]:
-    """Parse all LPDDR5 SPD entries within an APCB MEMG block."""
+    """Parse all LPDDR5/LPDDR5X SPD entries within an APCB MEMG block."""
     entries = []
     apcb = data[apcb_offset:apcb_offset + apcb_size]
-    
-    pos = 0
-    while pos < len(apcb):
-        idx = apcb.find(LP5_SPD_MAGIC, pos)
-        if idx == -1:
-            break
-        
-        if idx + 16 > len(apcb):
-            break
-        
+
+    # Find all SPD entries with both LPDDR5 and LPDDR5X magics
+    raw_entries = []  # (offset_in_apcb, mem_type)
+    for spd_magic, mem_type in [(LP5_SPD_MAGIC, 'LPDDR5'), (LP5X_SPD_MAGIC, 'LPDDR5X')]:
+        pos = 0
+        while pos < len(apcb):
+            idx = apcb.find(spd_magic, pos)
+            if idx == -1:
+                break
+            if idx + 16 <= len(apcb):
+                raw_entries.append((idx, mem_type))
+            pos = idx + 1
+
+    # Sort by offset for consistent ordering
+    raw_entries.sort(key=lambda x: x[0])
+
+    for idx, mem_type in raw_entries:
         spd_bytes = apcb[idx:idx+16]
-        
+
         entry = SPDEntry(
             offset_in_apcb=idx,
             offset_in_file=apcb_offset + idx,
             spd_bytes=spd_bytes,
             byte6=spd_bytes[6],
             byte12=spd_bytes[12],
+            mem_type=mem_type,
         )
-        
+
         # Find module part number (search forward for ASCII strings)
         for j in range(idx, min(idx + 0x200, len(apcb) - 20)):
             prefix = apcb[j:j+3]
-            if prefix in [b'MT6', b'K3K', b'SEC', b'SAM']:
+            if prefix in [b'MT6', b'K3K', b'K3L', b'SEC', b'SAM', b'H9H', b'H58']:
                 end = j
                 while end < min(j + 30, len(apcb)) and 0x20 <= apcb[end] < 0x7F:
                     end += 1
                 entry.module_name = apcb[j:end].decode('ascii', errors='replace').strip()
-                
+
                 # Manufacturer ID is typically 2 bytes after name null terminator
                 mfr_off = end + 2
                 if mfr_off < len(apcb):
                     mfr_byte = apcb[mfr_off]
                     entry.manufacturer = MANUFACTURER_IDS.get(mfr_byte, f'0x{mfr_byte:02X}')
                 break
-        
+
         # Guess density from module name
         for prefix, density in MODULE_DENSITY_MAP.items():
             if prefix in entry.module_name:
                 entry.density_guess = density
                 break
-        
+
         # Parse entry header (look for separator before SPD magic)
         sep_search_start = max(0, idx - 48)
         pre = apcb[sep_search_start:idx]
@@ -286,10 +408,9 @@ def parse_spd_entries(data: bytes, apcb_offset: int, apcb_size: int) -> List[SPD
             if len(hdr) >= 12:
                 entry.mfr_flag = struct.unpack_from('<H', hdr, 8)[0]
                 entry.config_id = struct.unpack_from('<H', hdr, 10)[0]
-        
+
         entries.append(entry)
-        pos = idx + 1
-    
+
     return entries
 
 
@@ -297,23 +418,35 @@ def parse_spd_entries(data: bytes, apcb_offset: int, apcb_size: int) -> List[SPD
 # Analysis / Display
 # ============================================================================
 
-def analyze_bios(filepath: str) -> List[APCBBlock]:
-    """Analyze a BIOS file and display all APCB blocks and SPD entries."""
-    
-    print(f"\n{'='*78}")
-    print(f"  Steam Deck APCB Memory Configuration Analyzer v{TOOL_VERSION}")
-    print(f"{'='*78}")
-    
+def analyze_bios(filepath: str, device: str = 'auto') -> List[APCBBlock]:
+    """Analyze a BIOS file and display all APCB blocks and SPD entries.
+
+    Args:
+        filepath: Path to the BIOS file to analyze
+        device: Device type ('auto', 'steam_deck', 'rog_ally')
+    """
+
     if not os.path.exists(filepath):
         print(f"\n  ERROR: File not found: {filepath}")
         sys.exit(1)
-    
+
     with open(filepath, 'rb') as f:
         data = f.read()
-    
+
+    # Device detection
+    if device == 'auto':
+        device = detect_device(data)
+    device_profile = DEVICE_PROFILES.get(device)
+    device_name = device_profile['name'] if device_profile else 'Unknown Device'
+
+    print(f"\n{'='*78}")
+    print(f"  APCB Memory Configuration Analyzer v{TOOL_VERSION}")
+    print(f"{'='*78}")
+
     file_size = len(data)
-    print(f"\n  File: {os.path.basename(filepath)}")
-    print(f"  Size: {file_size:,} bytes ({file_size/1024/1024:.2f} MB)")
+    print(f"\n  File:   {os.path.basename(filepath)}")
+    print(f"  Size:   {file_size:,} bytes ({file_size/1024/1024:.2f} MB)")
+    print(f"  Device: {device_name}")
     
     # Detect file type
     if file_size == 16 * 1024 * 1024:
@@ -346,27 +479,40 @@ def analyze_bios(filepath: str) -> List[APCBBlock]:
         print(f"    Checksum:   0x{block.checksum_byte:02X} ({'VALID' if block.checksum_valid else 'INVALID'})")
         
         if block.is_memg and block.spd_entries:
-            print(f"\n    SPD Entries ({len(block.spd_entries)}):")
-            print(f"    {'─'*70}")
-            print(f"    {'#':<3} {'Module':<27} {'Density':<8} {'Mfr':<10} {'b6':<5} {'b12':<5} {'cfg':<6}")
-            print(f"    {'─'*70}")
-            
+            # Count entries by memory type
+            lp5_count = sum(1 for e in block.spd_entries if e.mem_type == 'LPDDR5')
+            lp5x_count = sum(1 for e in block.spd_entries if e.mem_type == 'LPDDR5X')
+            type_summary = []
+            if lp5_count:
+                type_summary.append(f"{lp5_count} LPDDR5")
+            if lp5x_count:
+                type_summary.append(f"{lp5x_count} LPDDR5X")
+
+            print(f"\n    SPD Entries ({len(block.spd_entries)}: {', '.join(type_summary)}):")
+            print(f"    {'─'*78}")
+            print(f"    {'#':<3} {'Type':<8} {'Module':<27} {'Density':<8} {'Mfr':<10} {'b6':<5} {'b12':<5} {'cfg':<6}")
+            print(f"    {'─'*78}")
+
             for j, entry in enumerate(block.spd_entries):
                 # Highlight non-stock entries
                 marker = ''
                 if entry.byte6 == 0xB5 and entry.byte12 == 0x0A:
-                    marker = ' ** 32GB CONFIG **'
-                
-                print(f"    {j+1:<3} {entry.module_name:<27} {entry.density_guess:<8} "
+                    marker = ' ** 32GB **'
+                elif entry.byte6 == 0xF5 and entry.byte12 == 0x49:
+                    marker = ' ** 64GB **'
+
+                print(f"    {j+1:<3} {entry.mem_type:<8} {entry.module_name:<27} {entry.density_guess:<8} "
                       f"{entry.manufacturer:<10} 0x{entry.byte6:02X}  0x{entry.byte12:02X}  "
                       f"0x{entry.config_id:04X}{marker}")
-            
+
             # Show current active configuration
             first = block.spd_entries[0]
             if first.byte6 == 0x95 and first.byte12 == 0x02:
                 config = "16GB/24GB (stock)"
             elif first.byte6 == 0xB5 and first.byte12 == 0x0A:
                 config = "32GB (modified)"
+            elif first.byte6 == 0xF5 and first.byte12 == 0x49:
+                config = "64GB (modified)"
             else:
                 config = f"Unknown (byte6=0x{first.byte6:02X}, byte12=0x{first.byte12:02X})"
             print(f"\n    First entry config: {config}")
@@ -651,12 +797,12 @@ def sign_firmware(data_in):
 # Modification Engine
 # ============================================================================
 
-def modify_bios(input_path: str, output_path: str, target_gb: int, 
+def modify_bios(input_path: str, output_path: str, target_gb: int,
                 modify_magic_byte: bool = False, entry_indices: Optional[List[int]] = None,
-                sign_output: bool = False):
+                sign_output: bool = False, device: str = 'auto'):
     """
     Modify BIOS file for target memory configuration.
-    
+
     Args:
         input_path: Path to input BIOS file
         output_path: Path for modified output file
@@ -664,29 +810,49 @@ def modify_bios(input_path: str, output_path: str, target_gb: int,
         modify_magic_byte: If True, change APCB byte[0] from 0x41 to 0x51 (cosmetic only)
         entry_indices: Which SPD entries to modify (0-based). None = first entry only.
         sign_output: If True, re-sign the firmware with PE Authenticode for h2offt
+        device: Device type ('auto', 'steam_deck', 'rog_ally')
     """
-    
+
     if target_gb not in MEMORY_CONFIGS:
         print(f"\n  ERROR: Unsupported target size: {target_gb}GB")
         print(f"  Supported: {', '.join(f'{k}GB' for k in MEMORY_CONFIGS.keys())}")
         sys.exit(1)
-    
+
     config = MEMORY_CONFIGS[target_gb]
-    
+
+    # Read input file
+    with open(input_path, 'rb') as f:
+        data = bytearray(f.read())
+
+    # Device detection
+    if device == 'auto':
+        device = detect_device(bytes(data))
+    device_profile = DEVICE_PROFILES.get(device)
+    device_name = device_profile['name'] if device_profile else 'Unknown Device'
+
+    # Check memory target compatibility with device
+    if device_profile and target_gb not in device_profile['memory_targets']:
+        print(f"\n  WARNING: {target_gb}GB is not a validated target for {device_name}.")
+        print(f"  Validated targets: {', '.join(f'{t}GB' for t in device_profile['memory_targets'])}")
+        print(f"  Proceeding anyway — use at your own risk.")
+
+    # Check signing compatibility
+    if sign_output and device_profile and not device_profile['supports_signing']:
+        print(f"\n  WARNING: {device_name} does not support firmware signing.")
+        print(f"  The --sign flag will be ignored. Use SPI flash instead.")
+        sign_output = False
+
     print(f"\n{'='*78}")
-    print(f"  Steam Deck APCB Memory Modification Tool v{TOOL_VERSION}")
+    print(f"  APCB Memory Modification Tool v{TOOL_VERSION}")
     print(f"{'='*78}")
-    print(f"\n  Input:  {os.path.basename(input_path)}")
+    print(f"\n  Device: {device_name}")
+    print(f"  Input:  {os.path.basename(input_path)}")
     print(f"  Output: {os.path.basename(output_path)}")
     print(f"  Target: {config['name']}")
     print(f"  {config['description']}")
     if sign_output:
         print(f"  Signing: ENABLED (PE Authenticode for h2offt)")
-    
-    # Read input file
-    with open(input_path, 'rb') as f:
-        data = bytearray(f.read())
-    
+
     print(f"\n  File size: {len(data):,} bytes")
     
     # Find APCB blocks
@@ -695,7 +861,8 @@ def modify_bios(input_path: str, output_path: str, target_gb: int,
     
     if not memg_blocks:
         print(f"\n  ERROR: No APCB MEMG blocks found in the BIOS image!")
-        print(f"  This file may not be a Steam Deck BIOS.")
+        print(f"  This file may not be a supported device BIOS.")
+        print(f"  Supported devices: {', '.join(p['name'] for p in DEVICE_PROFILES.values())}")
         sys.exit(1)
     
     print(f"\n  Found {len(memg_blocks)} APCB MEMG block(s) to modify")
@@ -710,7 +877,9 @@ def modify_bios(input_path: str, output_path: str, target_gb: int,
             continue
         
         # Determine which entries to modify
-        if entry_indices is not None:
+        if entry_indices == 'all':
+            indices = list(range(len(block.spd_entries)))
+        elif entry_indices is not None:
             indices = entry_indices
         else:
             # Default: modify the FIRST SPD entry (the active/default one)
@@ -855,10 +1024,17 @@ def modify_bios(input_path: str, output_path: str, target_gb: int,
         print(f"\n  *** MODIFICATION SUCCESSFUL ***")
         if sign_output:
             print(f"  Output is signed and ready for h2offt software flash.")
-            print(f"  Flash with: sudo h2offt {os.path.basename(output_path)}")
+            flash_cmd = device_profile['flash_instructions'].format(filename=os.path.basename(output_path)) if device_profile else ''
+            if flash_cmd:
+                print(f"  Flash with: {flash_cmd}")
         else:
-            print(f"  Output file is ready for SPI flash.")
-            print(f"  NOTE: For h2offt software flash, re-run with --sign flag.")
+            if device_profile and device_profile['supports_signing']:
+                print(f"  Output file is ready for SPI flash.")
+                print(f"  NOTE: For h2offt software flash, re-run with --sign flag.")
+            else:
+                print(f"  Output file is ready for SPI flash.")
+                flash_instr = device_profile['flash_instructions'] if device_profile else 'Flash via SPI programmer'
+                print(f"  {flash_instr}")
     else:
         print(f"\n  *** VERIFICATION FAILED ***")
         print(f"  DO NOT flash this file! Check for errors above.")
@@ -872,30 +1048,32 @@ def modify_bios(input_path: str, output_path: str, target_gb: int,
 
 def main():
     parser = argparse.ArgumentParser(
-        description=f'Steam Deck APCB Memory Configuration Tool v{TOOL_VERSION} (LCD & OLED)',
+        description=f'APCB Memory Configuration Tool v{TOOL_VERSION} (Steam Deck, ROG Ally)',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  Analyze a BIOS file:
+  Analyze a BIOS file (auto-detects device):
     python sd_apcb_tool.py analyze my_bios_dump.bin
-    
+
+  Analyze with explicit device type:
+    python sd_apcb_tool.py analyze my_bios.fd --device rog_ally
+
   Modify for 32GB (SPI flash ready, no signing):
     python sd_apcb_tool.py modify my_bios.fd my_bios_32gb.fd --target 32
-    
-  Modify for 32GB with signing (ready for h2offt software flash):
+
+  Modify for 64GB (ROG Ally X, requires LPDDR5X hardware):
+    python sd_apcb_tool.py modify my_bios.bin my_bios_64gb.bin --target 64
+
+  Modify for 32GB with signing (Steam Deck h2offt software flash):
     python sd_apcb_tool.py modify my_bios.fd my_bios_32gb.fd --target 32 --sign
-    
+
   Restore to stock 16GB:
     python sd_apcb_tool.py modify my_bios_32gb.fd my_bios_stock.fd --target 16
-    
-  Modify with APCB magic byte marker (cosmetic, not required):
-    python sd_apcb_tool.py modify dump.bin dump_32gb.bin --target 32 --magic
 
-Flashing:
-  SPI programmer: Output works directly with CH341A programmer.
-  h2offt (software): Use --sign flag, then:
-    sudo /usr/share/jupiter_bios_updater/h2offt <output_file>
-  
+Supported devices:
+  Steam Deck (LCD & OLED): 16GB/32GB, SPI flash or h2offt (--sign)
+  ROG Ally / Ally X: 16GB/32GB/64GB, SPI flash only (signing not supported)
+
   The --sign flag requires: pip install cryptography
         """
     )
@@ -905,12 +1083,14 @@ Flashing:
     # Analyze command
     analyze_parser = subparsers.add_parser('analyze', help='Analyze BIOS file')
     analyze_parser.add_argument('bios_file', help='BIOS file to analyze')
+    analyze_parser.add_argument('--device', choices=['auto', 'steam_deck', 'rog_ally'],
+                                default='auto', help='Device type (default: auto-detect)')
     
     # Modify command
     modify_parser = subparsers.add_parser('modify', help='Modify BIOS for target memory')
     modify_parser.add_argument('bios_in', help='Input BIOS file')
     modify_parser.add_argument('bios_out', help='Output BIOS file')
-    modify_parser.add_argument('--target', type=int, required=True, choices=[16, 32],
+    modify_parser.add_argument('--target', type=int, required=True, choices=[16, 32, 64],
                               help='Target memory size in GB')
     modify_parser.add_argument('--sign', action='store_true',
                               help='Re-sign firmware with PE Authenticode for h2offt software flash. '
@@ -922,11 +1102,13 @@ Flashing:
                               help='Modify ALL SPD entries, not just the first')
     modify_parser.add_argument('--entry', type=int, action='append',
                               help='Specific entry index to modify (0-based, can repeat)')
+    modify_parser.add_argument('--device', choices=['auto', 'steam_deck', 'rog_ally'],
+                              default='auto', help='Device type (default: auto-detect)')
     
     args = parser.parse_args()
     
     if args.command == 'analyze':
-        analyze_bios(args.bios_file)
+        analyze_bios(args.bios_file, device=args.device)
         
     elif args.command == 'modify':
         if args.bios_in == args.bios_out:
@@ -935,7 +1117,7 @@ Flashing:
         
         entry_indices = None
         if args.all_entries:
-            entry_indices = list(range(20))  # Will be clamped to actual count
+            entry_indices = 'all'  # Signal to modify all entries
         elif args.entry:
             entry_indices = args.entry
         
@@ -946,6 +1128,7 @@ Flashing:
             modify_magic_byte=args.magic,
             entry_indices=entry_indices,
             sign_output=args.sign,
+            device=args.device,
         )
     else:
         parser.print_help()
