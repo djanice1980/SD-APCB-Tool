@@ -39,8 +39,31 @@ Open your BIOS file, select 32GB, click "Apply Modification". Signing is enabled
 ## Requirements
 
 - **Python 3.8+**
-- **For signing** (optional but recommended): `pip install cryptography`
+- **For signing** (optional, Steam Deck only): `pip install cryptography`
 - Signing is needed for h2offt software flash. Not needed for SPI programmer flash.
+
+### SteamOS Setup (Steam Deck)
+
+SteamOS is Arch-based with a read-only filesystem — avoid `sudo pip install`.
+
+```bash
+# 1. Switch to Desktop Mode and open Konsole (Terminal)
+
+# 2. Create a virtual environment with system site-packages
+python -m venv --system-site-packages ~/sd-apcb-venv
+
+# 3. Activate it
+source ~/sd-apcb-venv/bin/activate
+
+# 4. Upgrade pip and install cryptography
+pip install -U pip
+pip install cryptography
+
+# 5. Run the tool (while venv is active)
+python sd_apcb_tool.py modify <input> <output> --target 32 --sign
+```
+
+You must activate the venv (`source ~/sd-apcb-venv/bin/activate`) each time before running the tool with `--sign`.
 
 ## How It Works
 

@@ -982,6 +982,11 @@ def modify_bios(input_path: str, output_path: str, target_gb: int,
         if not _check_signing_available():
             print(f"\n  ERROR: Signing requires the 'cryptography' Python package.")
             print(f"  Install it with: pip install cryptography")
+            print(f"\n  On SteamOS, use a virtual environment:")
+            print(f"    python -m venv --system-site-packages ~/sd-apcb-venv")
+            print(f"    source ~/sd-apcb-venv/bin/activate")
+            print(f"    pip install cryptography")
+            print(f"    python sd_apcb_tool.py modify ...")
             sys.exit(1)
         
         # Check if this is actually a PE file
