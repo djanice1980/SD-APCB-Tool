@@ -367,7 +367,7 @@ class APCBToolGUI:
         self.sign_var = tk.BooleanVar(value=True)
         self.sign_chk = ttk.Checkbutton(sf, text="Sign firmware for h2offt software flash (PE Authenticode)", variable=self.sign_var)
         self.sign_chk.pack(side='left')
-        st = "✓ cryptography installed" if self.signing_available else "⚠ pip install cryptography"
+        st = "✓ cryptography installed" if self.signing_available else "⚠ pip install cryptography (venv required on SteamOS)"
         ttk.Label(sf, text=st, style='Status.TLabel').pack(side='left', padx=(12,0))
         if not self.signing_available: self.sign_var.set(False)
         br = ttk.Frame(m); br.pack(fill='x', pady=(0,8))
@@ -481,7 +481,7 @@ class APCBToolGUI:
         if do_sign and self.device_profile and not self.device_profile['supports_signing']:
             messagebox.showinfo("Signing Not Supported", f"{self.device_profile['name']} does not support firmware signing.\n\nUse SPI flash instead."); do_sign = False
         if do_sign and not self.signing_available:
-            messagebox.showwarning("Signing Unavailable", "Install: pip install cryptography\n\nContinuing unsigned."); do_sign = False
+            messagebox.showwarning("Signing Unavailable", "Install: pip install cryptography\n\nOn SteamOS, use a virtual environment:\npython -m venv --system-site-packages ~/sd-apcb-venv\nsource ~/sd-apcb-venv/bin/activate\npip install cryptography\n\nContinuing unsigned."); do_sign = False
         if do_sign and self.loaded_data[:2] != b'MZ':
             messagebox.showinfo("Signing Skipped", "Raw SPI dump — signing not applicable."); do_sign = False
         sp = Path(self.loaded_file); dn = f"{sp.stem}{'_64GB' if target==64 else '_32GB' if target==32 else '_stock'}{sp.suffix}"
