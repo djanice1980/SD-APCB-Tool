@@ -61,9 +61,12 @@ pip install cryptography
 
 # 5. Run the tool (while venv is active)
 python sd_apcb_tool.py modify <input> <output> --target 32 --sign
+
+# or
+python sd_apcb_gui.py
 ```
 
-You must activate the venv (`source ~/sd-apcb-venv/bin/activate`) each time before running the tool with `--sign`.
+You must activate the venv (`source ~/sd-apcb-venv/bin/activate`) each time before running the tool.
 
 ## How It Works
 
