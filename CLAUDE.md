@@ -61,7 +61,8 @@ CHANGELOG.md       # Version history
 - **Never modify the input file** — always require distinct input/output paths
 - Verify APCB checksums before and after modification
 - Re-scan output file to confirm correct byte values
-- Only modify the first SPD entry by default (conservative, matches known-good mods)
+- Modifies all SPD entries by default for broad chip compatibility (Micron, Samsung, SK Hynix)
+- GUI provides per-entry checkboxes for selective patching
 - Signing failures fall back gracefully to unsigned output
 - Round-trip safe: 16GB → 32GB → 16GB produces byte-identical output
 
@@ -80,8 +81,8 @@ python sd_apcb_tool.py modify <input> <output> --target 32 --sign
 # Modify for 32GB (ROG Ally, no signing)
 python sd_apcb_tool.py modify <input> <output> --target 32
 
-# Modify for 64GB (ROG Ally X, all entries)
-python sd_apcb_tool.py modify <input> <output> --target 64 --all-entries
+# Modify for 64GB (ROG Ally X)
+python sd_apcb_tool.py modify <input> <output> --target 64
 
 # Restore to 16GB
 python sd_apcb_tool.py modify <input> <output> --target 16

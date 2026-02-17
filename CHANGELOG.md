@@ -1,6 +1,41 @@
 # Changelog
 
-All notable changes to the Steam Deck APCB Memory Mod Tool.
+All notable changes to the APCB Memory Mod Tool.
+
+## [1.5.0] - 2025-02-16
+
+### Added
+- **Patch all SPD entries by default** — covers Micron, Samsung, SK Hynix, and all other manufacturers present in firmware. Fixes issue where only the first entry (typically Micron) was patched.
+- **GUI: Per-entry checkboxes** — scrollable "SPD Entries to Modify" section shows each entry with manufacturer, module name, density, and memory type. All checked by default with "Select All" toggle.
+- **Per-entry verification** — both CLI and GUI now verify each patched entry individually with per-entry status output
+
+### Changed
+- CLI default behavior: patches all SPD entries (was first-only). `--all-entries` flag kept for backward compatibility.
+- CLI `--entry N` can still be used to patch specific entries only
+- GUI verification output shows per-entry results instead of just the first entry
+
+## [1.4.0] - 2025-02-15
+
+### Added
+- **64GB memory support** — new `--target 64` option for ROG Ally and Ally X (SPD values: byte6=0xF5, byte12=0x49)
+- **LPDDR5X SPD detection** — recognizes `23 11 15 0E` magic alongside LPDDR5 `23 11 13 0E`
+- 64GB radio button in GUI (greyed out for Steam Deck, enabled for Ally/Ally X)
+
+## [1.3.0] - 2025-02-14
+
+### Added
+- **ASUS ROG Ally support** — auto-detected via PSPG at offset 0x80, MEMG at 0xC0
+- **ASUS ROG Ally X support** — auto-detected via PSPG at offset 0x80, MEMG at 0xC8
+- **Device auto-detection** from firmware contents (`detect_device()`) — no filename dependency
+- `--device` CLI flag to force device type: `auto`, `steam_deck`, `rog_ally`, `rog_ally_x`
+- GUI: Signing checkbox automatically disabled for ROG Ally/Ally X (uses SPI programmer, not h2offt)
+- GUI: File dialog defaults to "All files" (ROG firmware uses version-number extensions like `.342`, `.312`)
+- GUI: Clear Log and Copy Log buttons
+- SteamOS venv setup instructions in CLI error messages and GUI warnings
+
+### Changed
+- File dialog default changed from "BIOS Files" to "All files" first
+- Warning label updated for SteamOS cryptography venv requirement
 
 ## [1.2.0] - 2025-02-13
 
@@ -36,7 +71,7 @@ All notable changes to the Steam Deck APCB Memory Mod Tool.
 - Flashing documentation in tool help text
 
 ### Changed
-- Default behavior: only first SPD entry modified (matches LCD known-good mods)
+- Default behavior was first SPD entry only (changed to all entries in v1.5.0)
 - Platform scope expanded: "Steam Deck APCB Memory Mod Tool (LCD & OLED)"
 
 ## [1.0.0] - 2025-02-11

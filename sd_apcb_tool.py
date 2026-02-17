@@ -890,14 +890,11 @@ def modify_bios(input_path: str, output_path: str, target_gb: int,
             print(f"    WARNING: No SPD entries found in this block, skipping")
             continue
         
-        # Determine which entries to modify
-        if entry_indices == 'all':
+        # Determine which entries to modify (default: all entries)
+        if entry_indices == 'all' or entry_indices is None:
             indices = list(range(len(block.spd_entries)))
-        elif entry_indices is not None:
-            indices = entry_indices
         else:
-            # Default: modify the FIRST SPD entry (the active/default one)
-            indices = [0]
+            indices = entry_indices
         
         for eidx in indices:
             if eidx >= len(block.spd_entries):
@@ -1032,12 +1029,19 @@ def modify_bios(input_path: str, output_path: str, target_gb: int,
         if not vb.checksum_valid:
             print(f"    FAIL: MEMG block at 0x{vb.offset:08X} has invalid checksum!")
             all_ok = False
-        else:
-            first = vb.spd_entries[0] if vb.spd_entries else None
-            if first:
-                status = "OK" if first.byte6 == config['byte6'] and first.byte12 == config['byte12'] else "MISMATCH"
-                print(f"    Block 0x{vb.offset:08X}: checksum VALID, "
-                      f"entry 1 byte6=0x{first.byte6:02X} byte12=0x{first.byte12:02X} [{status}]")
+        elif vb.spd_entries:
+            # Verify the same entries that were modified
+            if entry_indices == 'all' or entry_indices is None:
+                check_indices = list(range(len(vb.spd_entries)))
+            else:
+                check_indices = entry_indices
+            print(f"    Block 0x{vb.offset:08X}: checksum VALID")
+            for eidx in check_indices:
+                if eidx >= len(vb.spd_entries): continue
+                e = vb.spd_entries[eidx]
+                status = "OK" if e.byte6 == config['byte6'] and e.byte12 == config['byte12'] else "MISMATCH"
+                if status == "MISMATCH": all_ok = False
+                print(f"      [{eidx+1}] byte6=0x{e.byte6:02X} byte12=0x{e.byte12:02X} [{status}]")
     
     if all_ok:
         print(f"\n  *** MODIFICATION SUCCESSFUL ***")
@@ -1118,7 +1122,7 @@ Supported devices:
                               help='Modify APCB magic byte[0] (0x41→0x51). Cosmetic marker only, '
                                    'not required for the mod. LCD known-good mods do NOT change this.')
     modify_parser.add_argument('--all-entries', action='store_true',
-                              help='Modify ALL SPD entries, not just the first')
+                              help='Modify ALL SPD entries (this is now the default behavior)')
     modify_parser.add_argument('--entry', type=int, action='append',
                               help='Specific entry index to modify (0-based, can repeat)')
     modify_parser.add_argument('--device', choices=['auto', 'steam_deck', 'rog_ally', 'rog_ally_x'],

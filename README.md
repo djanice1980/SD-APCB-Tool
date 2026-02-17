@@ -1,31 +1,39 @@
-# Steam Deck APCB Memory Mod Tool
+# APCB Memory Mod Tool
 
-Automated BIOS modification tool for upgrading Steam Deck LCD and OLED models from 16GB to 32GB RAM.
+Automated BIOS modification tool for upgrading RAM on Steam Deck (LCD & OLED) and ASUS ROG Ally / Ally X handhelds.
 
-Patches the APCB (AMD Platform Configuration Block) SPD entries in Steam Deck firmware to recognize 32GB LPDDR5/LPDDR5X memory modules after a hardware RAM swap.
+Patches the APCB (AMD Platform Configuration Block) SPD entries in firmware to recognize upgraded LPDDR5/LPDDR5X memory modules (32GB or 64GB) after a hardware RAM swap.
 
 ## Features
 
-- **Analyze** — Scan any Steam Deck BIOS and display all APCB blocks, SPD entries, and memory configuration
-- **Modify** — Patch SPD density bytes for 32GB memory recognition with automatic checksum recalculation
-- **Sign** — Built-in PE Authenticode re-signing for h2offt software flash (no external tools required)
-- **Restore** — Revert a modified BIOS back to stock 16GB configuration
+- **Analyze** — Scan any supported BIOS and display all APCB blocks, SPD entries, and memory configuration
+- **Modify** — Patch SPD density bytes for 32GB/64GB memory recognition with automatic checksum recalculation
+- **Sign** — Built-in PE Authenticode re-signing for Steam Deck h2offt software flash (no external tools required)
+- **Restore** — Revert a modified BIOS back to stock configuration
+- **Multi-device** — Auto-detects Steam Deck, ROG Ally, and ROG Ally X from firmware contents
+- **All chip brands** — Patches all SPD entries by default (Micron, Samsung, SK Hynix, etc.)
 - **Cross-platform** — Works on Windows, Linux, macOS, and Steam Deck itself
-- **Both interfaces** — CLI tool for scripting/automation, GUI for point-and-click operation
+- **Both interfaces** — CLI tool for scripting/automation, GUI with per-entry checkboxes
 
 ## Quick Start
 
 ### CLI
 
 ```bash
-# Analyze a BIOS file
+# Analyze a BIOS file (auto-detects device)
 python sd_apcb_tool.py analyze F7G0112_sign.fd
 
-# Modify for 32GB + sign for h2offt (one command)
+# Steam Deck: Modify for 32GB + sign for h2offt
 python sd_apcb_tool.py modify F7G0112_sign.fd F7G0112_32GB.fd --target 32 --sign
 
-# Restore to stock 16GB
-python sd_apcb_tool.py modify F7G0112_32GB.fd F7G0112_stock.fd --target 16 --sign
+# ROG Ally / Ally X: Modify for 32GB (no signing needed)
+python sd_apcb_tool.py modify RC71L.342 RC71L_32GB.342 --target 32
+
+# ROG Ally X: Modify for 64GB
+python sd_apcb_tool.py modify RC72LA.312 RC72LA_64GB.312 --target 64
+
+# Restore to stock
+python sd_apcb_tool.py modify modified.fd stock.fd --target 16 --sign
 ```
 
 ### GUI
@@ -34,7 +42,7 @@ python sd_apcb_tool.py modify F7G0112_32GB.fd F7G0112_stock.fd --target 16 --sig
 python sd_apcb_gui.py
 ```
 
-Open your BIOS file, select 32GB, click "Apply Modification". Signing is enabled by default.
+Open your BIOS file, select your target memory size, review the SPD entry checkboxes, and click "Apply Modification".
 
 ## Requirements
 
@@ -72,16 +80,18 @@ You must activate the venv (`source ~/sd-apcb-venv/bin/activate`) each time befo
 
 ### What it modifies
 
-The tool patches two bytes in the first SPD (Serial Presence Detect) entry of each APCB MEMG block:
+The tool patches two bytes in each SPD (Serial Presence Detect) entry of every APCB MEMG block:
 
-| Byte | Offset | Stock (16GB) | Modified (32GB) | Purpose |
-|------|--------|-------------|-----------------|---------|
-| byte[6] | SPD+6 | `0x95` | `0xB5` | Density / package type |
-| byte[12] | SPD+12 | `0x02` | `0x0A` | Configuration |
+| Byte | Offset | 16GB (stock) | 32GB | 64GB | Purpose |
+|------|--------|-------------|------|------|---------|
+| byte[6] | SPD+6 | `0x95` | `0xB5` | `0xF5` | Density / package type |
+| byte[12] | SPD+12 | `0x02` | `0x0A` | `0x49` | Configuration |
+
+All SPD entries are patched by default, covering every memory manufacturer (Micron, Samsung, SK Hynix, etc.). The GUI provides per-entry checkboxes if you want to be selective.
 
 After patching, the APCB block checksum is recalculated to maintain validity.
 
-Steam Deck firmware contains two identical APCB MEMG blocks (primary + backup). Both are patched.
+Firmware typically contains two identical APCB MEMG blocks (primary + backup). Both are patched.
 
 ### Signing
 
@@ -100,7 +110,7 @@ This is implemented entirely in Python using the `cryptography` library — no e
 
 ## Flashing
 
-### Software flash (h2offt) — recommended for OLED
+### Steam Deck — Software flash (h2offt)
 
 Use a signed output file:
 
@@ -111,7 +121,7 @@ sudo /usr/share/jupiter_bios_updater/h2offt F7G0112_32GB.fd
 
 The Deck will reboot and apply the firmware update.
 
-### SPI programmer (CH341A) — typical for LCD
+### Steam Deck — SPI programmer (CH341A)
 
 For SPI flash, signing is not required. The output can be written directly:
 
@@ -123,32 +133,33 @@ python sd_apcb_tool.py modify dump.bin dump_32gb.bin --target 32
 flashrom -p ch341a_spi -w dump_32gb.bin
 ```
 
+### ROG Ally / Ally X — SPI programmer
+
+ROG Ally devices require an SPI programmer (CH341A + SOIC8 clip) to flash modified firmware. ASUS uses UEFI capsule updates which validate signatures — signing is not supported for these devices.
+
 ### Crisis recovery
 
 InsydeH2O crisis mode bypasses signature verification entirely. Useful as a recovery path if something goes wrong.
 
-## Supported Firmware
+## Supported Devices & Firmware
 
-Validated on:
+| Device | Firmware | RAM Targets | Signing | Status |
+|--------|----------|-------------|---------|--------|
+| Steam Deck LCD | F7A0110, F7A0113, F7A0131 | 16/32GB | ✅ Supported | ✅ Tested |
+| Steam Deck OLED | F7G0005, F7G0112 | 16/32GB | ✅ Supported | ✅ Hardware verified |
+| ROG Ally | RC71L series | 16/32/64GB | N/A (SPI only) | ✅ Tested |
+| ROG Ally X | RC72LA series | 16/32/64GB | N/A (SPI only) | ✅ Tested |
 
-| Platform | Firmware | Status |
-|----------|----------|--------|
-| LCD | F7A0110 | ✅ Tested |
-| LCD | F7A0113 | ✅ Tested |
-| LCD | F7A0131 | ✅ Tested |
-| OLED | F7G0005 | ✅ Tested |
-| OLED | F7G0112 | ✅ Tested (hardware verified) |
-
-Should work on any Steam Deck LCD or OLED firmware that uses the standard APCB/MEMG structure with LPDDR5 SPD entries.
+Should work on any firmware using the standard APCB/MEMG structure with LPDDR5/LPDDR5X SPD entries. Device type is auto-detected from firmware contents.
 
 ## Supported Memory Modules
 
 The mod has been confirmed working with:
 
-- **Micron MT62F2G64D8AJ-023 WT:B** — 16GB/pkg LPDDR5X, 8-die (OLED)
-- **Samsung K3LKCKC0BM** — 8GB/pkg LPDDR5X (LCD)
+- **Micron MT62F2G64D8AJ-023 WT:B** — 16GB/pkg LPDDR5X, 8-die (Steam Deck OLED)
+- **Samsung K3LKCKC0BM** — 8GB/pkg LPDDR5X (Steam Deck LCD)
 
-Any LPDDR5/LPDDR5X module with 16GB per package (32GB total) should work with these SPD values.
+Any LPDDR5/LPDDR5X module with the appropriate density should work with these SPD values.
 
 ## CLI Reference
 
@@ -160,11 +171,12 @@ Commands:
   modify               Patch BIOS for target memory configuration
 
 Modify options:
-  --target {16,32}     Target memory size (required)
-  --sign               Re-sign firmware for h2offt software flash
+  --target {16,32,64}  Target memory size (required; 64GB for Ally/Ally X only)
+  --sign               Re-sign firmware for h2offt software flash (Steam Deck only)
+  --device TYPE        Force device type: auto, steam_deck, rog_ally, rog_ally_x
   --magic              Modify APCB magic byte (cosmetic, not required)
-  --all-entries        Modify all SPD entries, not just the first
-  --entry N            Modify specific entry index (0-based, repeatable)
+  --all-entries        Modify all SPD entries (this is now the default)
+  --entry N            Modify only specific entry index (0-based, repeatable)
 ```
 
 ## Project Structure
@@ -183,8 +195,8 @@ CHANGELOG.md       — Version history
 The AMD Platform Configuration Block (APCB) contains memory training parameters stored in the BIOS. Each APCB block has:
 
 - 32-byte header with magic (`APCB`), sizes, and checksum
-- Content type marker at offset 0x80 (`MEMG` for memory, `TOKN` for tokens)
-- For MEMG blocks: multiple SPD entries each starting with magic `23 11 13 0E` (LPDDR5)
+- Content type marker: `MEMG` for memory (Steam Deck at offset 0x80; ROG Ally at 0xC0; Ally X at 0xC8), `TOKN` for tokens
+- For MEMG blocks: multiple SPD entries each starting with magic `23 11 13 0E` (LPDDR5) or `23 11 15 0E` (LPDDR5X)
 
 ### Signing Architecture
 
@@ -198,8 +210,9 @@ h2offt validates Layer 2 for structural integrity but accepts any certificate id
 ## Safety
 
 - The tool never modifies the input file — always writes to a separate output
+- All SPD entries patched by default for broad chip compatibility
 - All APCB checksums are recalculated and verified after modification
-- The output file is re-scanned to confirm correct byte values
+- The output file is re-scanned to confirm correct byte values per entry
 - Signing failures fall back gracefully to unsigned output
 - Stock configuration can be restored at any time with `--target 16`
 
@@ -209,7 +222,7 @@ MIT License. See [LICENSE](LICENSE) for details.
 
 ## Disclaimer
 
-This tool modifies BIOS firmware. Incorrect use can brick your Steam Deck. Always:
+This tool modifies BIOS firmware. Incorrect use can brick your device. Always:
 
 1. **Back up your original BIOS** before any modification
 2. **Verify the output** using the analyze command before flashing
