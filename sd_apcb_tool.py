@@ -2100,7 +2100,33 @@ Supported devices:
                 screen=screen,
             )
     else:
-        parser.print_help()
+        # No subcommand — prompt for file paths and enter interactive mode
+        _enable_ansi_colors()
+        c = _C
+        print(f"\n{c.HEADER}  APCB Memory Configuration Tool v{TOOL_VERSION}{c.RESET}")
+        print(f"  {c.DIM}No command specified -- entering interactive mode.{c.RESET}\n")
+        try:
+            input_path = input(f"  {c.PROMPT}Input BIOS file path: {c.RESET}").strip().strip('"').strip("'")
+            if not input_path:
+                print(f"  {c.ERR}No file specified.{c.RESET}")
+                sys.exit(1)
+            if not os.path.isfile(input_path):
+                print(f"  {c.ERR}File not found: {input_path}{c.RESET}")
+                sys.exit(1)
+            # Generate default output name
+            from pathlib import Path
+            p = Path(input_path)
+            default_out = str(p.parent / f"{p.stem}_modified{p.suffix}")
+            output_path = input(f"  {c.PROMPT}Output file path [{os.path.basename(default_out)}]: {c.RESET}").strip().strip('"').strip("'")
+            if not output_path:
+                output_path = default_out
+        except (EOFError, KeyboardInterrupt):
+            print(f"\n  {c.DIM}Aborted.{c.RESET}")
+            sys.exit(0)
+        if os.path.abspath(input_path) == os.path.abspath(output_path):
+            print(f"  {c.ERR}Input and output must be different files.{c.RESET}")
+            sys.exit(1)
+        interactive_modify(input_path, output_path)
 
 
 if __name__ == '__main__':
