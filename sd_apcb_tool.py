@@ -134,6 +134,22 @@ MEMG_OFFSET_ALLY_X = [0xC8]    # ROG Ally X: PSPG at 0x80, MEMG at 0xC8
 MEMG_OFFSET_PSPG = [0xC0, 0xC8]  # All ROG Ally series offsets (for scanning)
 PSPG_MAGIC = b'PSPG'           # PSP Group marker (ROG Ally series)
 
+# DeckHD 1200p screen replacement EDID (128 bytes, valid checksum)
+# Manufacturer: DHD, 1200x1920 @ 60Hz, monitor name "DeckHD-1200p"
+EDID_MAGIC = bytes([0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00])
+BVDT_MAGIC = b'$BVDT$'
+DECKHD_EDID = bytes([
+    0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x11, 0x04, 0x01, 0x40, 0x01, 0x00, 0x00, 0x00,
+    0x02, 0x21, 0x01, 0x04, 0xA5, 0x0A, 0x0F, 0x78, 0xE2, 0xEE, 0x91, 0xA3, 0x54, 0x4C, 0x99, 0x26,
+    0x0F, 0x50, 0x54, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00,
+    0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0xB8, 0x3B, 0xB0, 0x64, 0x40, 0x80, 0x28, 0x70, 0x28, 0x14,
+    0x22, 0x04, 0x5F, 0x97, 0x00, 0x00, 0x00, 0x1E, 0x00, 0x00, 0x00, 0xFC, 0x00, 0x44, 0x65, 0x63,
+    0x6B, 0x48, 0x44, 0x2D, 0x31, 0x32, 0x30, 0x30, 0x70, 0x0A, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xD5,
+])
+DECKHD_MFR_ID = bytes([0x11, 0x04])  # DHD manufacturer bytes in EDID
+
 # Device profiles for supported handhelds
 DEVICE_PROFILES = {
     'steam_deck': {
@@ -813,12 +829,96 @@ def sign_firmware(data_in):
 
 
 # ============================================================================
+# DeckHD Screen Patch
+# ============================================================================
+
+def find_edid_blocks(data: bytes) -> List[Tuple[int, bytes]]:
+    """Find all EDID blocks in firmware by scanning for EDID magic.
+
+    Returns list of (offset, edid_128_bytes) tuples.
+    Only returns blocks with valid EDID checksums.
+    """
+    blocks = []
+    pos = 0
+    while pos < len(data) - 128:
+        idx = data.find(EDID_MAGIC, pos)
+        if idx == -1:
+            break
+        edid = data[idx:idx + 128]
+        # Validate EDID checksum (all 128 bytes must sum to 0 mod 256)
+        if len(edid) == 128 and sum(edid) % 256 == 0:
+            blocks.append((idx, edid))
+        pos = idx + 1
+    return blocks
+
+
+def patch_deckhd(data: bytearray) -> List[Tuple[int, str]]:
+    """Apply DeckHD 1200p screen patches to Steam Deck LCD firmware.
+
+    Patches:
+      1. Replace stock EDID blocks with DeckHD 1200p EDID
+      2. Append ' DeckHD' to $BVDT$ version strings
+
+    Args:
+        data: Mutable bytearray of firmware (modified in place)
+
+    Returns:
+        List of (offset, description) tuples for logging
+    """
+    patches = []
+
+    # --- Patch EDID blocks ---
+    edid_blocks = find_edid_blocks(bytes(data))
+    for offset, edid in edid_blocks:
+        # Skip if already DeckHD EDID
+        if edid[8:10] == DECKHD_MFR_ID:
+            continue
+        # Filter: must look like a Steam Deck panel (small physical size, portrait)
+        # EDID bytes 21-22: max H/V size in cm. Steam Deck LCD ~10x15cm
+        h_cm, v_cm = edid[21], edid[22]
+        if not (5 <= h_cm <= 20 and 5 <= v_cm <= 25):
+            continue
+        # Replace with DeckHD EDID
+        data[offset:offset + 128] = DECKHD_EDID
+        patches.append((offset, f"EDID replaced with DeckHD-1200p"))
+
+    # --- Patch $BVDT$ version strings ---
+    pos = 0
+    while pos < len(data) - 64:
+        idx = data.find(BVDT_MAGIC, pos)
+        if idx == -1:
+            break
+        # Version string is at offset +0x0E from $BVDT$ magic
+        ver_offset = idx + 0x0E
+        if ver_offset + 32 > len(data):
+            pos = idx + 1
+            continue
+        # Read current version string (null-terminated within ~32 byte field)
+        ver_field = data[ver_offset:ver_offset + 32]
+        null_end = ver_field.find(0x00)
+        if null_end < 0:
+            null_end = 32
+        current_ver = ver_field[:null_end].decode('ascii', errors='replace')
+        if 'DeckHD' not in current_ver:
+            new_ver = current_ver + ' DeckHD'
+            # Write back with null padding (don't exceed field)
+            new_bytes = new_ver.encode('ascii')[:32]
+            new_bytes = new_bytes + b'\x00' * (32 - len(new_bytes))
+            data[ver_offset:ver_offset + 32] = new_bytes
+            patches.append((ver_offset, f"Version string: '{current_ver}' -> '{new_ver}'"))
+        pos = idx + 1
+
+    return patches
+
+
+# ============================================================================
 # Modification Engine
 # ============================================================================
 
 def modify_bios(input_path: str, output_path: str, target_gb: int,
                 modify_magic_byte: bool = False, entry_indices: Optional[List[int]] = None,
-                sign_output: bool = False, device: str = 'auto'):
+                sign_output: bool = False, device: str = 'auto',
+                deckhd: bool = False):
     """
     Modify BIOS file for target memory configuration.
 
@@ -873,7 +973,25 @@ def modify_bios(input_path: str, output_path: str, target_gb: int,
         print(f"  Signing: ENABLED (PE Authenticode for h2offt)")
 
     print(f"\n  File size: {len(data):,} bytes")
-    
+
+    # Apply DeckHD screen patch if requested
+    if deckhd:
+        if device != 'steam_deck':
+            print(f"\n  ERROR: DeckHD patch is only supported for Steam Deck LCD.")
+            print(f"  Detected device: {device_name}")
+            sys.exit(1)
+        print(f"\n  {'─'*74}")
+        print(f"  DECKHD 1200P SCREEN PATCH")
+        print(f"  {'─'*74}")
+        deckhd_patches = patch_deckhd(data)
+        if deckhd_patches:
+            for offset, desc in deckhd_patches:
+                print(f"    0x{offset:08X}: {desc}")
+            print(f"  DeckHD patches applied: {len(deckhd_patches)}")
+        else:
+            print(f"  WARNING: No patchable EDID or version blocks found.")
+            print(f"  The firmware may already have DeckHD patches applied.")
+
     # Find APCB blocks
     blocks = find_apcb_blocks(bytes(data))
     memg_blocks = [b for b in blocks if b.is_memg]
@@ -1132,7 +1250,10 @@ Supported devices:
                               help='Specific entry index to modify (0-based, can repeat)')
     modify_parser.add_argument('--device', choices=['auto', 'steam_deck', 'rog_ally', 'rog_ally_x'],
                               default='auto', help='Device type (default: auto-detect)')
-    
+    modify_parser.add_argument('--deckhd', action='store_true',
+                              help='Apply DeckHD 1200p screen patch (Steam Deck LCD only). '
+                                   'Replaces stock EDID and tags version string.')
+
     args = parser.parse_args()
     
     if args.command == 'analyze':
@@ -1157,6 +1278,7 @@ Supported devices:
             entry_indices=entry_indices,
             sign_output=args.sign,
             device=args.device,
+            deckhd=args.deckhd,
         )
     else:
         parser.print_help()
