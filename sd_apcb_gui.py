@@ -569,7 +569,7 @@ class APCBToolGUI:
                 if var.get():
                     if hn:
                         pw.configure(state='readonly')
-                        sw.configure(state='normal', fg='#1a1b26', insertbackground='#1a1b26')
+                        sw.configure(state='normal', fg='#4a4a5a', insertbackground='#4a4a5a')
                     cw.configure(state='readonly')
                     # Set density to current global target when entry is checked
                     dv.set(f"{self.target_var.get()}GB")
