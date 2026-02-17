@@ -185,16 +185,19 @@ def detect_current_config(blocks):
             else: return f"Unknown (0x{e.byte6:02X}/0x{e.byte12:02X})"
     return "No MEMG blocks found"
 
-def modify_bios_data(data, target_gb, modify_magic=False):
+def modify_bios_data(data, target_gb, modify_magic=False, entry_indices=None):
     config = MEMORY_CONFIGS[target_gb]
     blocks = find_apcb_blocks(bytes(data))
     mods = []
     for block in [b for b in blocks if b.is_memg]:
         if not block.spd_entries: continue
-        e = block.spd_entries[0]
-        b6, b12 = e.offset_in_file+6, e.offset_in_file+12
-        mods.append((b6, data[b6], config['byte6'])); mods.append((b12, data[b12], config['byte12']))
-        data[b6] = config['byte6']; data[b12] = config['byte12']
+        indices = entry_indices if entry_indices is not None else range(len(block.spd_entries))
+        for idx in indices:
+            if idx >= len(block.spd_entries): continue
+            e = block.spd_entries[idx]
+            b6, b12 = e.offset_in_file+6, e.offset_in_file+12
+            mods.append((b6, data[b6], config['byte6'])); mods.append((b12, data[b12], config['byte12']))
+            data[b6] = config['byte6']; data[b12] = config['byte12']
         if modify_magic:
             nb = 0x51 if target_gb == 32 else 0x41
             if data[block.offset] != nb: mods.append((block.offset, data[block.offset], nb)); data[block.offset] = nb
@@ -370,6 +373,25 @@ class APCBToolGUI:
         st = "✓ cryptography installed" if self.signing_available else "⚠ pip install cryptography (venv required on SteamOS)"
         ttk.Label(sf, text=st, style='Status.TLabel').pack(side='left', padx=(12,0))
         if not self.signing_available: self.sign_var.set(False)
+        # SPD entry selection section
+        ttk.Label(m, text="SPD Entries to Modify", style='Section.TLabel').pack(anchor='w', pady=(4,4))
+        self.entry_outer = tk.Frame(m, bg=C_BDR, padx=1, pady=1); self.entry_outer.pack(fill='x', pady=(0,10))
+        self.entry_canvas = tk.Canvas(self.entry_outer, bg=C_BGL, highlightthickness=0, height=100)
+        self.entry_scrollbar = ttk.Scrollbar(self.entry_outer, orient='vertical', command=self.entry_canvas.yview)
+        self.entry_inner = tk.Frame(self.entry_canvas, bg=C_BGL)
+        self.entry_inner.bind('<Configure>', lambda e: self.entry_canvas.configure(scrollregion=self.entry_canvas.bbox('all')))
+        self.entry_canvas.create_window((0, 0), window=self.entry_inner, anchor='nw')
+        self.entry_canvas.configure(yscrollcommand=self.entry_scrollbar.set)
+        self.entry_canvas.pack(side='left', fill='both', expand=True)
+        self.entry_scrollbar.pack(side='right', fill='y')
+        # Mouse wheel scrolling
+        def _on_mousewheel(event): self.entry_canvas.yview_scroll(-1 * (event.delta // 120), 'units')
+        self.entry_canvas.bind_all('<MouseWheel>', _on_mousewheel)
+        # Placeholder
+        self.entry_placeholder = ttk.Label(self.entry_inner, text="  Load a BIOS file to see SPD entries", style='Status.TLabel')
+        self.entry_placeholder.pack(anchor='w', padx=8, pady=8)
+        self.entry_vars = []
+        self.select_all_var = tk.BooleanVar(value=True)
         br = ttk.Frame(m); br.pack(fill='x', pady=(0,8))
         self.btn_mod = ttk.Button(br, text="Apply Modification", style='Action.TButton', command=self._do_modify, state='disabled'); self.btn_mod.pack(side='left')
         self.btn_ana = ttk.Button(br, text="Analyze Only", command=self._do_analyze, state='disabled'); self.btn_ana.pack(side='left', padx=(8,0))
@@ -394,6 +416,35 @@ class APCBToolGUI:
     def _copy_log(self):
         text = self.log.get('1.0', 'end-1c')
         self.root.clipboard_clear(); self.root.clipboard_append(text)
+
+    def _populate_entries(self, entries):
+        """Populate the SPD entry checkboxes from the first MEMG block's entries."""
+        for w in self.entry_inner.winfo_children(): w.destroy()
+        self.entry_vars = []
+        if not entries:
+            ttk.Label(self.entry_inner, text="  No SPD entries found", style='Status.TLabel').pack(anchor='w', padx=8, pady=8)
+            return
+        # Select All checkbox
+        sa_frame = tk.Frame(self.entry_inner, bg=C_BGL); sa_frame.pack(fill='x', padx=8, pady=(6,2))
+        self.select_all_var.set(True)
+        ttk.Checkbutton(sa_frame, text="Select All", variable=self.select_all_var, command=self._toggle_all).pack(side='left')
+        # Separator
+        tk.Frame(self.entry_inner, bg=C_BDR, height=1).pack(fill='x', padx=8, pady=2)
+        # Individual entries
+        for i, e in enumerate(entries):
+            var = tk.BooleanVar(value=True)
+            self.entry_vars.append((var, i))
+            ef = tk.Frame(self.entry_inner, bg=C_BGL); ef.pack(fill='x', padx=8, pady=1)
+            label = f"[{i+1}] {e.mem_type:<8} {e.module_name or '(unnamed)':<24} {e.density_guess or '?':<6} {e.manufacturer or '?'}"
+            ttk.Checkbutton(ef, text=label, variable=var).pack(side='left')
+        # Adjust canvas height based on entry count (cap at 150px)
+        h = min(150, 30 + len(entries) * 24)
+        self.entry_canvas.configure(height=h)
+
+    def _toggle_all(self):
+        """Toggle all entry checkboxes based on Select All state."""
+        val = self.select_all_var.get()
+        for var, _ in self.entry_vars: var.set(val)
 
     def _open_file(self):
         fp = filedialog.askopenfilename(title="Open BIOS File", filetypes=[("All files","*.*"),("BIOS Files","*.fd *.bin *.rom")])
@@ -432,7 +483,11 @@ class APCBToolGUI:
         self.lbl_bl.configure(text=f"APCB: {len(self.blocks)} blocks ({mc} MEMG, {tc} TOKN)")
         if mc == 0:
             self.lbl_cf.configure(text="No MEMG!", style='Bad.TLabel'); self._log("No APCB MEMG blocks found.", 'warning')
+            self._populate_entries([])
             self.btn_mod.configure(state='disabled'); self.btn_ana.configure(state='normal'); return
+        # Populate entry checkboxes from first MEMG block
+        first_memg = next((b for b in self.blocks if b.is_memg and b.spd_entries), None)
+        self._populate_entries(first_memg.spd_entries if first_memg else [])
         self.current_config = detect_current_config(self.blocks)
         self.lbl_cf.configure(text=f"Config: {self.current_config}", style='Warn.TLabel' if '32GB' in self.current_config else 'Good.TLabel')
         self._log(f"Found {len(self.blocks)} blocks ({mc} MEMG, {tc} TOKN)", 'success')
@@ -484,6 +539,10 @@ class APCBToolGUI:
             messagebox.showwarning("Signing Unavailable", "Install: pip install cryptography\n\nOn SteamOS, use a virtual environment:\npython -m venv --system-site-packages ~/sd-apcb-venv\nsource ~/sd-apcb-venv/bin/activate\npip install cryptography\n\nContinuing unsigned."); do_sign = False
         if do_sign and self.loaded_data[:2] != b'MZ':
             messagebox.showinfo("Signing Skipped", "Raw SPI dump — signing not applicable."); do_sign = False
+        # Gather selected entry indices
+        selected = [idx for var, idx in self.entry_vars if var.get()]
+        if not selected:
+            messagebox.showwarning("No Entries Selected", "Select at least one SPD entry to modify."); return
         sp = Path(self.loaded_file); dn = f"{sp.stem}{'_64GB' if target==64 else '_32GB' if target==32 else '_stock'}{sp.suffix}"
         op = filedialog.asksaveasfilename(title="Save Modified BIOS As", initialfile=dn, initialdir=str(sp.parent),
             filetypes=[("All files","*.*"),("BIOS Files","*.fd *.bin *.rom")])
@@ -496,7 +555,7 @@ class APCBToolGUI:
         self._log(f"  Target: {config['name']}", 'accent')
         self._log(f"  Signing: {'Yes (PE Authenticode)' if do_sign else 'No'}", 'dim')
         try:
-            data = bytearray(self.loaded_data); mods = modify_bios_data(data, target, self.magic_var.get())
+            data = bytearray(self.loaded_data); mods = modify_bios_data(data, target, self.magic_var.get(), entry_indices=selected)
             self._log(f"\n  Byte changes: {len(mods)}", 'success')
             for off,old,new in mods: self._log(f"    0x{off:08X}: 0x{old:02X} → 0x{new:02X}", 'dim')
             od = bytes(data)
@@ -511,9 +570,12 @@ class APCBToolGUI:
                 if b.is_memg:
                     if not b.checksum_valid: self._log(f"    FAIL: 0x{b.offset:08X}", 'error'); ok = False
                     elif b.spd_entries:
-                        e = b.spd_entries[0]; m = e.byte6==config['byte6'] and e.byte12==config['byte12']
-                        self._log(f"    0x{b.offset:08X}: cksum VALID, b6=0x{e.byte6:02X} b12=0x{e.byte12:02X} [{'OK' if m else 'MISMATCH'}]", 'success' if m else 'error')
-                        if not m: ok = False
+                        self._log(f"    0x{b.offset:08X}: cksum VALID", 'success')
+                        for idx in selected:
+                            if idx < len(b.spd_entries):
+                                e = b.spd_entries[idx]; m = e.byte6==config['byte6'] and e.byte12==config['byte12']
+                                self._log(f"      [{idx+1}] b6=0x{e.byte6:02X} b12=0x{e.byte12:02X} [{'OK' if m else 'MISMATCH'}]", 'success' if m else 'error')
+                                if not m: ok = False
             if ok:
                 self._log(f"\n  ✓ MODIFICATION SUCCESSFUL", 'success')
                 dev_name = self.device_profile['name'] if self.device_profile else 'device'

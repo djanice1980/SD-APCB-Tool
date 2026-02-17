@@ -61,7 +61,8 @@ CHANGELOG.md       # Version history
 - **Never modify the input file** — always require distinct input/output paths
 - Verify APCB checksums before and after modification
 - Re-scan output file to confirm correct byte values
-- Only modify the first SPD entry by default (conservative, matches known-good mods)
+- Modifies all SPD entries by default for broad chip compatibility (Micron, Samsung, SK Hynix)
+- GUI provides per-entry checkboxes for selective patching
 - Signing failures fall back gracefully to unsigned output
 - Round-trip safe: 16GB → 32GB → 16GB produces byte-identical output
 
