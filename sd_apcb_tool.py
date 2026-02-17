@@ -134,6 +134,47 @@ MEMG_OFFSET_ALLY_X = [0xC8]    # ROG Ally X: PSPG at 0x80, MEMG at 0xC8
 MEMG_OFFSET_PSPG = [0xC0, 0xC8]  # All ROG Ally series offsets (for scanning)
 PSPG_MAGIC = b'PSPG'           # PSP Group marker (ROG Ally series)
 
+# Screen replacement EDID data and profiles (Steam Deck LCD only)
+EDID_MAGIC = bytes([0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00])
+BVDT_MAGIC = b'$BVDT$'
+
+SCREEN_PROFILES = {
+    'deckhd': {
+        'name': 'DeckHD 1200p',
+        'description': 'IPS LCD, 1200x1920 @ 60Hz (16:10)',
+        'version_tag': 'DeckHD',
+        'mfr_id': bytes([0x11, 0x04]),  # DHD
+        'edid': bytes([
+            0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x11, 0x04, 0x01, 0x40, 0x01, 0x00, 0x00, 0x00,
+            0x02, 0x21, 0x01, 0x04, 0xA5, 0x0A, 0x0F, 0x78, 0xE2, 0xEE, 0x91, 0xA3, 0x54, 0x4C, 0x99, 0x26,
+            0x0F, 0x50, 0x54, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00,
+            0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0xB8, 0x3B, 0xB0, 0x64, 0x40, 0x80, 0x28, 0x70, 0x28, 0x14,
+            0x22, 0x04, 0x5F, 0x97, 0x00, 0x00, 0x00, 0x1E, 0x00, 0x00, 0x00, 0xFC, 0x00, 0x44, 0x65, 0x63,
+            0x6B, 0x48, 0x44, 0x2D, 0x31, 0x32, 0x30, 0x30, 0x70, 0x0A, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xD5,
+        ]),
+    },
+    'decksight': {
+        'name': 'DeckSight OLED',
+        'description': 'AMOLED, 1080x1920 @ 60/80Hz (16:9)',
+        'version_tag': 'DeckSight',
+        'mfr_id': bytes([0x12, 0x6F]),  # DSO
+        'edid': bytes([
+            0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x12, 0x6F, 0x01, 0x50, 0x01, 0x00, 0x00, 0x00,
+            0x01, 0x23, 0x01, 0x04, 0xA5, 0x09, 0x10, 0x78, 0x17, 0xB9, 0x74, 0xAE, 0x50, 0x3D, 0xB7, 0x23,
+            0x0B, 0x4F, 0x51, 0x00, 0x00, 0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+            0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x66, 0x39, 0x38, 0xA0, 0x40, 0x80, 0x37, 0x70, 0x30, 0x20,
+            0x3A, 0x00, 0x5A, 0xA0, 0x00, 0x00, 0x00, 0x1E, 0x00, 0x00, 0x00, 0xFC, 0x00, 0x44, 0x65, 0x63,
+            0x6B, 0x53, 0x69, 0x67, 0x68, 0x74, 0x0A, 0x20, 0x20, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x44, 0x4D, 0x38, 0xA0,
+            0x40, 0x80, 0x4A, 0x70, 0x30, 0x20, 0x3A, 0x00, 0x5A, 0xA0, 0x00, 0x00, 0x00, 0x1E, 0x00, 0xDF,
+        ]),
+    },
+}
+# Collect all known screen manufacturer IDs (to skip already-patched EDID blocks)
+SCREEN_MFR_IDS = [p['mfr_id'] for p in SCREEN_PROFILES.values()]
+
 # Device profiles for supported handhelds
 DEVICE_PROFILES = {
     'steam_deck': {
@@ -233,9 +274,9 @@ def detect_device(data: bytes) -> str:
     Auto-detect the device type from firmware contents.
 
     Scans APCB blocks and checks content type marker locations:
-      - MEMG at offset 0x80 → Steam Deck
-      - PSPG at offset 0x80 + MEMG at offset 0xC0 → ROG Ally
-      - PSPG at offset 0x80 + MEMG at offset 0xC8 → ROG Ally X
+      - MEMG at offset 0x80 -> Steam Deck
+      - PSPG at offset 0x80 + MEMG at offset 0xC0 -> ROG Ally
+      - PSPG at offset 0x80 + MEMG at offset 0xC8 -> ROG Ally X
 
     Returns:
         Device key ('steam_deck', 'rog_ally', 'rog_ally_x') or 'unknown'
@@ -489,9 +530,9 @@ def analyze_bios(filepath: str, device: str = 'auto') -> List[APCBBlock]:
     
     # Display each block
     for i, block in enumerate(blocks):
-        print(f"\n  {'─'*74}")
+        print(f"\n  {'-'*74}")
         print(f"  APCB Block {i+1}: {block.content_type}")
-        print(f"  {'─'*74}")
+        print(f"  {'-'*74}")
         print(f"    Offset:     0x{block.offset:08X}")
         print(f"    Data size:  0x{block.data_size:04X} ({block.data_size} bytes)")
         print(f"    Total size: 0x{block.total_size:04X} ({block.total_size} bytes)")
@@ -508,9 +549,9 @@ def analyze_bios(filepath: str, device: str = 'auto') -> List[APCBBlock]:
                 type_summary.append(f"{lp5x_count} LPDDR5X")
 
             print(f"\n    SPD Entries ({len(block.spd_entries)}: {', '.join(type_summary)}):")
-            print(f"    {'─'*78}")
+            print(f"    {'-'*78}")
             print(f"    {'#':<3} {'Type':<8} {'Module':<27} {'Density':<8} {'Mfr':<10} {'b6':<5} {'b12':<5} {'cfg':<6}")
-            print(f"    {'─'*78}")
+            print(f"    {'-'*78}")
 
             for j, entry in enumerate(block.spd_entries):
                 # Highlight non-stock entries
@@ -813,12 +854,105 @@ def sign_firmware(data_in):
 
 
 # ============================================================================
+# DeckHD Screen Patch
+# ============================================================================
+
+def find_edid_blocks(data: bytes) -> List[Tuple[int, bytes]]:
+    """Find all EDID blocks in firmware by scanning for EDID magic.
+
+    Returns list of (offset, edid_128_bytes) tuples.
+    Only returns blocks with valid EDID checksums.
+    """
+    blocks = []
+    pos = 0
+    while pos < len(data) - 128:
+        idx = data.find(EDID_MAGIC, pos)
+        if idx == -1:
+            break
+        edid = data[idx:idx + 128]
+        # Validate EDID checksum (all 128 bytes must sum to 0 mod 256)
+        if len(edid) == 128 and sum(edid) % 256 == 0:
+            blocks.append((idx, edid))
+        pos = idx + 1
+    return blocks
+
+
+def patch_screen(data: bytearray, screen_key: str) -> List[Tuple[int, str]]:
+    """Apply screen replacement patches to Steam Deck LCD firmware.
+
+    Patches:
+      1. Replace stock/other EDID blocks with the target screen's EDID
+      2. Append screen version tag to $BVDT$ version strings
+
+    Args:
+        data: Mutable bytearray of firmware (modified in place)
+        screen_key: Key into SCREEN_PROFILES ('deckhd' or 'decksight')
+
+    Returns:
+        List of (offset, description) tuples for logging
+    """
+    profile = SCREEN_PROFILES[screen_key]
+    target_edid = profile['edid']
+    target_mfr_id = profile['mfr_id']
+    version_tag = profile['version_tag']
+    screen_name = profile['name']
+    patches = []
+
+    # --- Patch EDID blocks ---
+    edid_blocks = find_edid_blocks(bytes(data))
+    for offset, edid in edid_blocks:
+        # Skip if already this screen's EDID
+        if edid[8:10] == target_mfr_id:
+            continue
+        # Skip if it belongs to another known screen replacement
+        if any(edid[8:10] == mid for mid in SCREEN_MFR_IDS):
+            continue
+        # Filter: must look like a Steam Deck panel (small physical size, portrait)
+        # EDID bytes 21-22: max H/V size in cm. Steam Deck LCD ~10x15cm
+        h_cm, v_cm = edid[21], edid[22]
+        if not (5 <= h_cm <= 20 and 5 <= v_cm <= 25):
+            continue
+        # Replace with target screen EDID
+        data[offset:offset + 128] = target_edid
+        patches.append((offset, f"EDID replaced with {screen_name}"))
+
+    # --- Patch $BVDT$ version strings ---
+    pos = 0
+    while pos < len(data) - 64:
+        idx = data.find(BVDT_MAGIC, pos)
+        if idx == -1:
+            break
+        # Version string is at offset +0x0E from $BVDT$ magic
+        ver_offset = idx + 0x0E
+        if ver_offset + 32 > len(data):
+            pos = idx + 1
+            continue
+        # Read current version string (null-terminated within ~32 byte field)
+        ver_field = data[ver_offset:ver_offset + 32]
+        null_end = ver_field.find(0x00)
+        if null_end < 0:
+            null_end = 32
+        current_ver = ver_field[:null_end].decode('ascii', errors='replace')
+        if version_tag not in current_ver:
+            new_ver = current_ver + ' ' + version_tag
+            # Write back with null padding (don't exceed field)
+            new_bytes = new_ver.encode('ascii')[:32]
+            new_bytes = new_bytes + b'\x00' * (32 - len(new_bytes))
+            data[ver_offset:ver_offset + 32] = new_bytes
+            patches.append((ver_offset, f"Version string: '{current_ver}' -> '{new_ver}'"))
+        pos = idx + 1
+
+    return patches
+
+
+# ============================================================================
 # Modification Engine
 # ============================================================================
 
 def modify_bios(input_path: str, output_path: str, target_gb: int,
                 modify_magic_byte: bool = False, entry_indices: Optional[List[int]] = None,
-                sign_output: bool = False, device: str = 'auto'):
+                sign_output: bool = False, device: str = 'auto',
+                screen: Optional[str] = None):
     """
     Modify BIOS file for target memory configuration.
 
@@ -873,7 +1007,28 @@ def modify_bios(input_path: str, output_path: str, target_gb: int,
         print(f"  Signing: ENABLED (PE Authenticode for h2offt)")
 
     print(f"\n  File size: {len(data):,} bytes")
-    
+
+    # Apply screen replacement patch if requested
+    if screen:
+        if device != 'steam_deck':
+            screen_name = SCREEN_PROFILES[screen]['name']
+            print(f"\n  ERROR: {screen_name} screen patch is only supported for Steam Deck LCD.")
+            print(f"  Detected device: {device_name}")
+            sys.exit(1)
+        screen_profile = SCREEN_PROFILES[screen]
+        print(f"\n  {'-'*74}")
+        print(f"  SCREEN REPLACEMENT: {screen_profile['name'].upper()}")
+        print(f"  {'-'*74}")
+        print(f"  {screen_profile['description']}")
+        screen_patches = patch_screen(data, screen)
+        if screen_patches:
+            for offset, desc in screen_patches:
+                print(f"    0x{offset:08X}: {desc}")
+            print(f"  Screen patches applied: {len(screen_patches)}")
+        else:
+            print(f"  WARNING: No patchable EDID or version blocks found.")
+            print(f"  The firmware may already have {screen_profile['name']} patches applied.")
+
     # Find APCB blocks
     blocks = find_apcb_blocks(bytes(data))
     memg_blocks = [b for b in blocks if b.is_memg]
@@ -962,9 +1117,9 @@ def modify_bios(input_path: str, output_path: str, target_gb: int,
             sys.exit(1)
     
     # Summary
-    print(f"\n  {'─'*74}")
+    print(f"\n  {'-'*74}")
     print(f"  MODIFICATION SUMMARY")
-    print(f"  {'─'*74}")
+    print(f"  {'-'*74}")
     print(f"  Total byte changes: {len(modifications)}")
     print(f"  MEMG blocks modified: {len(memg_blocks)}")
     
@@ -977,9 +1132,9 @@ def modify_bios(input_path: str, output_path: str, target_gb: int,
     output_data = bytes(data)
     
     if sign_output:
-        print(f"\n  {'─'*74}")
+        print(f"\n  {'-'*74}")
         print(f"  PE AUTHENTICODE SIGNING")
-        print(f"  {'─'*74}")
+        print(f"  {'-'*74}")
         
         if not _check_signing_available():
             print(f"\n  ERROR: Signing requires the 'cryptography' Python package.")
@@ -1004,7 +1159,7 @@ def modify_bios(input_path: str, output_path: str, target_gb: int,
             
             try:
                 output_data = sign_firmware(bytes(data))
-                print(f"  Signing complete ✓")
+                print(f"  Signing complete [OK]")
                 print(f"  Signed file size: {len(output_data):,} bytes")
             except Exception as e:
                 print(f"\n  ERROR: Signing failed: {e}")
@@ -1071,6 +1226,762 @@ def modify_bios(input_path: str, output_path: str, target_gb: int,
 
 
 # ============================================================================
+# Interactive Mode — DiskPart-style REPL
+# ============================================================================
+
+# ANSI color helpers (Windows 10+ supports VT100 natively)
+class _C:
+    """Terminal color codes for interactive output."""
+    RESET   = '\033[0m'
+    BOLD    = '\033[1m'
+    DIM     = '\033[2m'
+    RED     = '\033[91m'
+    GREEN   = '\033[92m'
+    YELLOW  = '\033[93m'
+    CYAN    = '\033[96m'
+    WHITE   = '\033[97m'
+    GRAY    = '\033[90m'
+
+    # Semantic aliases
+    HEADER  = BOLD + CYAN
+    OK      = GREEN
+    WARN    = YELLOW
+    ERR     = RED
+    PROMPT  = BOLD + WHITE
+    VALUE   = CYAN
+    PENDING = YELLOW
+    LABEL   = GRAY
+
+
+def _enable_ansi_colors():
+    """Enable ANSI escape codes on Windows."""
+    if sys.platform == 'win32':
+        os.system('')  # Triggers VT100 mode on Windows 10+
+
+
+# Known module name prefixes — used for SET NAME validation
+MODULE_NAME_PREFIXES = [
+    ('MT6', 'Micron LPDDR5/5X'),
+    ('K3K', 'Samsung LPDDR5'),
+    ('K3L', 'Samsung LPDDR5X'),
+    ('H58', 'SK Hynix LPDDR5/5X'),
+    ('H9H', 'SK Hynix LPDDR5/5X'),
+    ('SEC', 'Samsung (alt)'),
+    ('SAM', 'Samsung (alt)'),
+]
+VALID_PREFIXES = [pfx for pfx, _ in MODULE_NAME_PREFIXES]
+
+
+@dataclass
+class PendingEntryMod:
+    """A pending modification to a single SPD entry."""
+    index: int
+    target_gb: int
+    new_name: Optional[str] = None
+
+
+@dataclass
+class InteractiveState:
+    """Tracks all state for the interactive modify session."""
+    input_path: str
+    output_path: str
+    data: bytearray
+    device_key: str
+    device_profile: dict
+    blocks: List[APCBBlock]
+    all_entries: List[SPDEntry]
+    entry_mods: dict                       # index -> PendingEntryMod
+    sign_enabled: bool = False
+    magic_enabled: bool = False
+    screen_patch: Optional[str] = None
+    selected_entry: Optional[int] = None   # 0-based index, None = no selection
+    current_menu: str = 'main'
+
+
+def modify_bios_data(data: bytearray, entry_modifications: list,
+                     modify_magic: bool = False) -> list:
+    """Modify BIOS data with per-entry configurations.
+
+    Args:
+        data: bytearray of BIOS (modified in place)
+        entry_modifications: list of dicts with keys:
+            'index': int - SPD entry index
+            'target_gb': int - 16, 32, or 64
+            'new_name': str|None - new module name or None to keep current
+        modify_magic: bool - modify APCB magic byte
+    Returns:
+        list of (offset, old_byte, new_byte) tuples
+    """
+    blocks = find_apcb_blocks(bytes(data))
+    mods = []
+    mod_by_idx = {m['index']: m for m in entry_modifications}
+    first_target = entry_modifications[0]['target_gb'] if entry_modifications else 32
+    for block in [b for b in blocks if b.is_memg]:
+        if not block.spd_entries:
+            continue
+        for idx, mod in mod_by_idx.items():
+            if idx >= len(block.spd_entries):
+                continue
+            e = block.spd_entries[idx]
+            config = MEMORY_CONFIGS[mod['target_gb']]
+            b6, b12 = e.offset_in_file + 6, e.offset_in_file + 12
+            mods.append((b6, data[b6], config['byte6']))
+            mods.append((b12, data[b12], config['byte12']))
+            data[b6] = config['byte6']
+            data[b12] = config['byte12']
+            new_name = mod.get('new_name')
+            if new_name is not None and e.module_name_offset >= 0 and e.module_name_field_len > 0:
+                name_bytes = new_name.encode('ascii', errors='replace')[:e.module_name_field_len]
+                name_bytes = name_bytes + b'\x00' * (e.module_name_field_len - len(name_bytes))
+                for i, nb in enumerate(name_bytes):
+                    off = e.module_name_offset + i
+                    if data[off] != nb:
+                        mods.append((off, data[off], nb))
+                        data[off] = nb
+        if modify_magic:
+            nb = 0x51 if first_target == 32 else 0x41
+            if data[block.offset] != nb:
+                mods.append((block.offset, data[block.offset], nb))
+                data[block.offset] = nb
+        bb = data[block.offset:block.offset + block.data_size]
+        nc = calculate_apcb_checksum(bytes(bb))
+        oc = data[block.offset + APCB_CHECKSUM_OFFSET]
+        if oc != nc:
+            data[block.offset + APCB_CHECKSUM_OFFSET] = nc
+            mods.append((block.offset + APCB_CHECKSUM_OFFSET, oc, nc))
+        if not verify_apcb_checksum(bytes(data[block.offset:block.offset + block.data_size])):
+            raise RuntimeError(f"Checksum failed at 0x{block.offset:08X}")
+    return mods
+
+
+def _parse_command(raw: str):
+    """Parse interactive input into (command, args) tuple."""
+    parts = raw.strip().split()
+    if not parts:
+        return ('', [])
+    cmd = parts[0].lower()
+    args = parts[1:]
+    # Compound commands
+    if cmd == 'set' and args:
+        sub = args[0].lower()
+        if sub in ('density', 'name', 'model'):
+            return (f'set_{sub}', args[1:])
+    if cmd == 'select' and args and args[0].lower() == 'all':
+        return ('select_all', args[1:])
+    if cmd == 'deselect' and args and args[0].lower() == 'all':
+        return ('deselect_all', args[1:])
+    return (cmd, args)
+
+
+def _build_prompt(state: InteractiveState) -> str:
+    """Build the context-sensitive prompt string."""
+    c = _C
+    dev = state.device_profile['name'] if state.device_profile else 'Unknown'
+    base = f"{c.PROMPT}APCB [{dev}]"
+    if state.current_menu == 'spd':
+        if state.selected_entry is not None:
+            return f"{base} SPD [Entry {state.selected_entry + 1}] > {c.RESET}"
+        return f"{base} SPD > {c.RESET}"
+    elif state.current_menu == 'screen':
+        return f"{base} SCREEN > {c.RESET}"
+    return f"{base} > {c.RESET}"
+
+
+def _density_from_bytes(byte6: int, byte12: int) -> str:
+    """Map byte6/byte12 to a density string."""
+    for gb, cfg in MEMORY_CONFIGS.items():
+        if cfg['byte6'] == byte6 and cfg['byte12'] == byte12:
+            return f"{gb}GB"
+    return "??GB"
+
+
+def _print_welcome(state: InteractiveState):
+    """Print the welcome banner on entering interactive mode."""
+    c = _C
+    dev = state.device_profile['name'] if state.device_profile else 'Unknown'
+    mc = sum(1 for b in state.blocks if b.is_memg)
+    tc = sum(1 for b in state.blocks if b.content_type == 'TOKN')
+    lp5 = sum(1 for e in state.all_entries if e.mem_type == 'LPDDR5')
+    lp5x = sum(1 for e in state.all_entries if e.mem_type == 'LPDDR5X')
+    types = ', '.join(filter(None, [f"{lp5} LPDDR5" if lp5 else "", f"{lp5x} LPDDR5X" if lp5x else ""]))
+    # Detect current config from first entry
+    cur_cfg = "Unknown"
+    if state.all_entries:
+        cur_cfg = _density_from_bytes(state.all_entries[0].byte6, state.all_entries[0].byte12)
+        if cur_cfg in ('16GB', '??GB'):
+            cur_cfg = "16GB/24GB (stock)"
+        else:
+            cur_cfg = f"{cur_cfg} (modified)"
+
+    print(f"\n{c.HEADER}  {'='*72}")
+    print(f"    APCB Memory Configuration Tool v{TOOL_VERSION} -- Interactive Mode")
+    print(f"  {'='*72}{c.RESET}")
+    print(f"\n  {c.LABEL}Device:{c.RESET}  {c.VALUE}{dev}{c.RESET} (auto-detected)")
+    print(f"  {c.LABEL}Input:{c.RESET}   {c.VALUE}{os.path.basename(state.input_path)}{c.RESET}"
+          f" ({len(state.data):,} bytes)")
+    print(f"  {c.LABEL}Output:{c.RESET}  {c.VALUE}{os.path.basename(state.output_path)}{c.RESET}")
+    print(f"\n  {c.LABEL}APCB Blocks:{c.RESET} {len(state.blocks)} total ({mc} MEMG, {tc} TOKN)")
+    print(f"  {c.LABEL}SPD Entries:{c.RESET}  {len(state.all_entries)} ({types})")
+    print(f"  {c.LABEL}Current:{c.RESET}     {cur_cfg}")
+    if state.sign_enabled:
+        print(f"  {c.LABEL}Signing:{c.RESET}     {c.OK}ENABLED{c.RESET}")
+    if state.screen_patch:
+        sn = SCREEN_PROFILES[state.screen_patch]['name']
+        print(f"  {c.LABEL}Screen:{c.RESET}      {c.VALUE}{sn}{c.RESET}")
+    print(f"\n  Type {c.BOLD}HELP{c.RESET} for available commands.\n")
+
+
+def _print_entry_table(state: InteractiveState):
+    """Print the SPD entry table with pending changes."""
+    c = _C
+    entries = state.all_entries
+    if not entries:
+        print(f"  {c.WARN}No SPD entries found.{c.RESET}")
+        return
+    # Header
+    print(f"\n  {c.HEADER}{'#':<4} {'Type':<9} {'Module':<28} {'Density':<8} "
+          f"{'Mfr':<10} {'b6':<6} {'b12':<6} {'Pending'}{c.RESET}")
+    print(f"  {c.DIM}{'-'*85}{c.RESET}")
+    for i, e in enumerate(entries):
+        cur_den = _density_from_bytes(e.byte6, e.byte12)
+        pending = ""
+        row_color = ""
+        if i in state.entry_mods:
+            mod = state.entry_mods[i]
+            parts = []
+            if mod.target_gb != int(cur_den.replace('GB', '').replace('?', '0')):
+                parts.append(f"{mod.target_gb}GB")
+            if mod.new_name is not None:
+                parts.append(f"name={mod.new_name}")
+            if parts:
+                pending = f"-> {', '.join(parts)}"
+            else:
+                pending = "(selected)"
+            row_color = c.PENDING
+        sel = "*" if state.selected_entry == i else " "
+        name = e.module_name or '(unnamed)'
+        mfr = e.manufacturer or '?'
+        print(f"  {row_color}{sel}{i+1:<3} {e.mem_type:<9} {name:<28} {cur_den:<8} "
+              f"{mfr:<10} 0x{e.byte6:02X}  0x{e.byte12:02X}  {pending}{c.RESET}")
+    print()
+
+
+def _print_status(state: InteractiveState):
+    """Print full pending changes summary."""
+    c = _C
+    dev = state.device_profile['name'] if state.device_profile else 'Unknown'
+    print(f"\n{c.HEADER}  {'='*72}")
+    print(f"  PENDING CHANGES")
+    print(f"  {'='*72}{c.RESET}")
+    print(f"\n  {c.LABEL}Device:{c.RESET}   {dev}")
+    print(f"  {c.LABEL}Input:{c.RESET}    {os.path.basename(state.input_path)}")
+    print(f"  {c.LABEL}Output:{c.RESET}   {os.path.basename(state.output_path)}")
+    sign_str = f"{c.OK}ENABLED{c.RESET}" if state.sign_enabled else f"{c.DIM}disabled{c.RESET}"
+    print(f"  {c.LABEL}Signing:{c.RESET}  {sign_str}")
+    magic_str = f"{c.OK}ENABLED{c.RESET}" if state.magic_enabled else f"{c.DIM}disabled{c.RESET}"
+    print(f"  {c.LABEL}Magic:{c.RESET}    {magic_str}")
+    if state.screen_patch:
+        sn = SCREEN_PROFILES[state.screen_patch]['name']
+        print(f"  {c.LABEL}Screen:{c.RESET}   {c.VALUE}{sn}{c.RESET}")
+    else:
+        print(f"  {c.LABEL}Screen:{c.RESET}   {c.DIM}(none){c.RESET}")
+
+    if state.entry_mods:
+        print(f"\n  {c.BOLD}SPD Entry Modifications ({len(state.entry_mods)} of {len(state.all_entries)}):{c.RESET}")
+        print(f"  {c.DIM}{'-'*68}{c.RESET}")
+        print(f"  {c.LABEL}{'#':<4} {'Current Module':<28} {'Current':<9} {'Target':<9} {'New Name'}{c.RESET}")
+        print(f"  {c.DIM}{'-'*68}{c.RESET}")
+        for idx in sorted(state.entry_mods.keys()):
+            mod = state.entry_mods[idx]
+            e = state.all_entries[idx]
+            cur_den = _density_from_bytes(e.byte6, e.byte12)
+            name = e.module_name or '(unnamed)'
+            new_name = mod.new_name if mod.new_name is not None else f"{c.DIM}(unchanged){c.RESET}"
+            print(f"  {idx+1:<4} {name:<28} {cur_den:<9} {c.PENDING}{mod.target_gb}GB{c.RESET}      {new_name}")
+    else:
+        print(f"\n  {c.DIM}No pending SPD modifications. Use SPD to select entries.{c.RESET}")
+    print()
+
+
+def _show_help(menu: str, state: InteractiveState):
+    """Show context-sensitive help."""
+    c = _C
+    if menu == 'main':
+        print(f"\n  {c.HEADER}Available Commands:{c.RESET}")
+        print(f"  {c.BOLD}  LIST{c.RESET}          Show all SPD entries")
+        print(f"  {c.BOLD}  SPD{c.RESET}           Enter SPD entry editor")
+        print(f"  {c.BOLD}  SCREEN{c.RESET}        Enter screen patch selector (Steam Deck LCD only)")
+        print(f"  {c.BOLD}  SIGN{c.RESET}          Toggle PE Authenticode signing")
+        print(f"  {c.BOLD}  MAGIC{c.RESET}         Toggle APCB magic byte modification")
+        print(f"  {c.BOLD}  STATUS{c.RESET}        Show all pending changes")
+        print(f"  {c.BOLD}  APPLY{c.RESET}         Write changes to output file")
+        print(f"  {c.BOLD}  HELP{c.RESET}          Show this help")
+        print(f"  {c.BOLD}  EXIT{c.RESET}          Quit without writing\n")
+    elif menu == 'spd':
+        targets = state.device_profile.get('memory_targets', [16, 32]) if state.device_profile else [16, 32]
+        target_str = '/'.join(str(t) for t in targets)
+        print(f"\n  {c.HEADER}SPD Entry Commands:{c.RESET}")
+        print(f"  {c.BOLD}  LIST{c.RESET}                       Show entries with pending changes")
+        print(f"  {c.BOLD}  SELECT <N>{c.RESET}                 Select entry N (1-based)")
+        print(f"  {c.BOLD}  SELECT ALL{c.RESET}                 Mark all entries for modification")
+        print(f"  {c.BOLD}  SET DENSITY <{target_str}>{c.RESET}    Set target density for selected entry")
+        print(f"  {c.BOLD}  SET NAME <prefix> <suffix>{c.RESET}  Set module name (e.g. SET NAME MT6 2F1G32D4DR)")
+        print(f"  {c.BOLD}  DESELECT{c.RESET}                   Remove selected entry from modifications")
+        print(f"  {c.BOLD}  DESELECT ALL{c.RESET}               Clear all pending modifications")
+        print(f"  {c.BOLD}  HELP{c.RESET}                       Show this help")
+        print(f"  {c.BOLD}  BACK{c.RESET}                       Return to main menu")
+        print(f"\n  {c.LABEL}Valid name prefixes:{c.RESET}")
+        for pfx, desc in MODULE_NAME_PREFIXES:
+            print(f"    {c.VALUE}{pfx}{c.RESET}  {desc}")
+        print()
+    elif menu == 'screen':
+        print(f"\n  {c.HEADER}Screen Patch Commands:{c.RESET}")
+        print(f"  {c.BOLD}  LIST{c.RESET}              Show available screen profiles")
+        print(f"  {c.BOLD}  SELECT <key>{c.RESET}      Select a screen profile")
+        print(f"  {c.BOLD}  CLEAR{c.RESET}             Remove screen patch selection")
+        print(f"  {c.BOLD}  HELP{c.RESET}              Show this help")
+        print(f"  {c.BOLD}  BACK{c.RESET}              Return to main menu\n")
+
+
+def _apply_changes(state: InteractiveState) -> bool:
+    """Apply all pending changes. Returns True if successful."""
+    c = _C
+    if not state.entry_mods and not state.screen_patch:
+        print(f"  {c.WARN}No changes to apply. Use SPD or SCREEN to configure modifications.{c.RESET}")
+        return False
+
+    # Confirmation
+    print(f"\n  {c.HEADER}Ready to apply:{c.RESET}")
+    if state.entry_mods:
+        targets = sorted(set(m.target_gb for m in state.entry_mods.values()))
+        target_str = ', '.join(f"{t}GB" for t in targets)
+        print(f"    {len(state.entry_mods)} SPD entry modification(s) ({target_str})")
+    if state.screen_patch:
+        print(f"    Screen: {SCREEN_PROFILES[state.screen_patch]['name']}")
+    if state.sign_enabled:
+        print(f"    Signing: ENABLED")
+    print(f"    Output: {os.path.basename(state.output_path)}")
+
+    try:
+        resp = input(f"\n  {c.PROMPT}Proceed? [y/N]: {c.RESET}").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print(f"\n  {c.DIM}Cancelled.{c.RESET}")
+        return False
+    if resp not in ('y', 'yes'):
+        print(f"  {c.DIM}Cancelled.{c.RESET}")
+        return False
+
+    # Work on a copy of the data
+    data = bytearray(state.data)
+
+    # 1. Apply screen patch
+    if state.screen_patch:
+        screen_name = SCREEN_PROFILES[state.screen_patch]['name']
+        print(f"\n  {c.CYAN}Applying {screen_name} screen patch...{c.RESET}")
+        screen_patches = patch_screen(data, state.screen_patch)
+        if screen_patches:
+            for off, desc in screen_patches:
+                print(f"    0x{off:08X}: {desc}")
+            print(f"  {c.OK}{screen_name}: {len(screen_patches)} patch(es) applied{c.RESET}")
+        else:
+            print(f"  {c.WARN}No patchable blocks found (may already be patched){c.RESET}")
+
+    # 2. Apply SPD modifications
+    if state.entry_mods:
+        entry_mod_list = [
+            {'index': mod.index, 'target_gb': mod.target_gb, 'new_name': mod.new_name}
+            for mod in state.entry_mods.values()
+        ]
+        print(f"\n  {c.CYAN}Applying SPD modifications...{c.RESET}")
+        try:
+            mods = modify_bios_data(data, entry_mod_list, state.magic_enabled)
+        except RuntimeError as e:
+            print(f"  {c.ERR}ERROR: {e}{c.RESET}")
+            return False
+        print(f"  {c.OK}Byte changes: {len(mods)}{c.RESET}")
+        for off, old, new in mods:
+            print(f"    0x{off:08X}: 0x{old:02X} -> 0x{new:02X}")
+
+    # 3. Sign if enabled
+    output_data = bytes(data)
+    if state.sign_enabled:
+        if data[:2] != b'MZ':
+            print(f"\n  {c.WARN}Not a PE file -- signing skipped.{c.RESET}")
+        elif not _check_signing_available():
+            print(f"\n  {c.ERR}Signing requires 'cryptography' package. Skipping.{c.RESET}")
+        else:
+            print(f"\n  {c.CYAN}Signing firmware (PE Authenticode RSA-2048/SHA-256)...{c.RESET}")
+            try:
+                output_data = sign_firmware(bytes(data))
+                print(f"  {c.OK}Signed ({len(output_data):,} bytes){c.RESET}")
+            except Exception as e:
+                print(f"  {c.ERR}Sign failed: {e}{c.RESET}")
+                output_data = bytes(data)
+
+    # 4. Write output
+    with open(state.output_path, 'wb') as f:
+        f.write(output_data)
+    print(f"\n  {c.OK}Output written:{c.RESET} {state.output_path} ({len(output_data):,} bytes)")
+
+    # 5. Verify
+    print(f"\n  {c.CYAN}Verifying output...{c.RESET}")
+    with open(state.output_path, 'rb') as f:
+        verify_data = f.read()
+    verify_blocks = find_apcb_blocks(verify_data)
+    all_ok = True
+    for vb in verify_blocks:
+        if not vb.is_memg:
+            continue
+        if not vb.checksum_valid:
+            print(f"    {c.ERR}FAIL: Block 0x{vb.offset:08X} invalid checksum{c.RESET}")
+            all_ok = False
+        elif vb.spd_entries and state.entry_mods:
+            print(f"    Block 0x{vb.offset:08X}: checksum {c.OK}VALID{c.RESET}")
+            for idx, mod in state.entry_mods.items():
+                if idx >= len(vb.spd_entries):
+                    continue
+                e = vb.spd_entries[idx]
+                ecfg = MEMORY_CONFIGS[mod.target_gb]
+                match = e.byte6 == ecfg['byte6'] and e.byte12 == ecfg['byte12']
+                status = f"{c.OK}OK{c.RESET}" if match else f"{c.ERR}MISMATCH{c.RESET}"
+                print(f"      [{idx+1}] b6=0x{e.byte6:02X} b12=0x{e.byte12:02X} [{status}]")
+                if not match:
+                    all_ok = False
+
+    if all_ok:
+        print(f"\n  {c.OK}{c.BOLD}*** MODIFICATION SUCCESSFUL ***{c.RESET}")
+        if state.sign_enabled and data[:2] == b'MZ':
+            flash_cmd = state.device_profile.get('flash_instructions', '').format(
+                filename=os.path.basename(state.output_path)) if state.device_profile else ''
+            if flash_cmd:
+                print(f"  Flash with: {flash_cmd}")
+        else:
+            print(f"  Ready for SPI flash.")
+    else:
+        print(f"\n  {c.ERR}{c.BOLD}*** VERIFICATION FAILED ***{c.RESET}")
+        print(f"  {c.ERR}DO NOT flash this file!{c.RESET}")
+    print()
+    return all_ok
+
+
+def _handle_main_command(state: InteractiveState, cmd: str, args: list) -> Optional[str]:
+    """Handle a main menu command. Returns 'exit' to quit."""
+    c = _C
+    if cmd == 'list':
+        _print_entry_table(state)
+    elif cmd == 'spd':
+        state.current_menu = 'spd'
+        _print_entry_table(state)
+    elif cmd == 'screen':
+        if state.device_key != 'steam_deck':
+            dev = state.device_profile['name'] if state.device_profile else 'Unknown'
+            print(f"  {c.WARN}Screen patches are only available for Steam Deck LCD.{c.RESET}")
+            print(f"  {c.LABEL}Detected device: {dev}{c.RESET}")
+            return None
+        state.current_menu = 'screen'
+        # Show current selection
+        if state.screen_patch:
+            sn = SCREEN_PROFILES[state.screen_patch]['name']
+            print(f"  {c.LABEL}Current selection:{c.RESET} {c.VALUE}{sn}{c.RESET}")
+        else:
+            print(f"  {c.LABEL}Current selection:{c.RESET} {c.DIM}(none){c.RESET}")
+    elif cmd == 'sign':
+        if state.device_profile and not state.device_profile['supports_signing']:
+            dev = state.device_profile['name'] if state.device_profile else 'Unknown'
+            print(f"  {c.WARN}{dev} does not support firmware signing.{c.RESET}")
+            print(f"  {c.LABEL}Use SPI flash for this device.{c.RESET}")
+            return None
+        state.sign_enabled = not state.sign_enabled
+        status = f"{c.OK}ENABLED{c.RESET}" if state.sign_enabled else f"{c.DIM}DISABLED{c.RESET}"
+        print(f"  PE Authenticode signing: {status}")
+    elif cmd == 'magic':
+        state.magic_enabled = not state.magic_enabled
+        status = f"{c.OK}ENABLED{c.RESET}" if state.magic_enabled else f"{c.DIM}DISABLED{c.RESET}"
+        print(f"  APCB magic byte modification: {status}")
+    elif cmd == 'status':
+        _print_status(state)
+    elif cmd == 'apply':
+        _apply_changes(state)
+    elif cmd == 'help':
+        _show_help('main', state)
+    elif cmd in ('exit', 'quit', 'q'):
+        return 'exit'
+    elif cmd == '':
+        pass
+    else:
+        print(f"  {c.WARN}Unknown command: {cmd}{c.RESET}")
+        print(f"  Type {c.BOLD}HELP{c.RESET} for available commands.")
+    return None
+
+
+def _handle_spd_command(state: InteractiveState, cmd: str, args: list):
+    """Handle an SPD submenu command."""
+    c = _C
+    entries = state.all_entries
+    targets = state.device_profile.get('memory_targets', [16, 32]) if state.device_profile else [16, 32]
+    default_target = max(t for t in targets if t <= 32) if any(t <= 32 for t in targets) else targets[0]
+
+    if cmd == 'list':
+        _print_entry_table(state)
+
+    elif cmd == 'select':
+        if not args:
+            print(f"  {c.WARN}Usage: SELECT <N> (1-based entry number){c.RESET}")
+            return
+        try:
+            n = int(args[0])
+        except ValueError:
+            print(f"  {c.ERR}Invalid entry number: {args[0]}{c.RESET}")
+            return
+        if n < 1 or n > len(entries):
+            print(f"  {c.ERR}Entry {n} out of range (1-{len(entries)}){c.RESET}")
+            return
+        idx = n - 1
+        state.selected_entry = idx
+        # Add to mods if not already there
+        if idx not in state.entry_mods:
+            state.entry_mods[idx] = PendingEntryMod(index=idx, target_gb=default_target)
+        e = entries[idx]
+        mod = state.entry_mods[idx]
+        name = e.module_name or '(unnamed)'
+        cur = _density_from_bytes(e.byte6, e.byte12)
+        print(f"\n  {c.OK}Entry {n} selected:{c.RESET} {c.VALUE}{name}{c.RESET}"
+              f" ({e.mem_type}, {e.manufacturer or '?'}, {cur})")
+        print(f"  {c.LABEL}Target: {mod.target_gb}GB{c.RESET}")
+        print(f"  {c.DIM}Use SET DENSITY, SET NAME, or DESELECT.{c.RESET}")
+
+    elif cmd == 'select_all':
+        for i in range(len(entries)):
+            if i not in state.entry_mods:
+                state.entry_mods[i] = PendingEntryMod(index=i, target_gb=default_target)
+        state.selected_entry = None
+        print(f"  {c.OK}{len(entries)} entries selected for modification -> {default_target}GB{c.RESET}")
+
+    elif cmd == 'set_density':
+        if state.selected_entry is None:
+            print(f"  {c.ERR}No entry selected. Use SELECT <N> first.{c.RESET}")
+            return
+        if not args:
+            print(f"  {c.WARN}Usage: SET DENSITY <{'/'.join(str(t) for t in targets)}>{c.RESET}")
+            return
+        try:
+            gb = int(args[0])
+        except ValueError:
+            print(f"  {c.ERR}Invalid density: {args[0]}{c.RESET}")
+            return
+        if gb not in targets:
+            print(f"  {c.ERR}{gb}GB is not a valid target for this device.{c.RESET}")
+            print(f"  {c.LABEL}Valid targets: {', '.join(f'{t}GB' for t in targets)}{c.RESET}")
+            return
+        idx = state.selected_entry
+        if idx not in state.entry_mods:
+            state.entry_mods[idx] = PendingEntryMod(index=idx, target_gb=gb)
+        else:
+            state.entry_mods[idx].target_gb = gb
+        cfg = MEMORY_CONFIGS[gb]
+        print(f"  {c.OK}Entry {idx+1} density set to {gb}GB{c.RESET}"
+              f" (byte6=0x{cfg['byte6']:02X}, byte12=0x{cfg['byte12']:02X})")
+
+    elif cmd in ('set_name', 'set_model'):
+        if state.selected_entry is None:
+            print(f"  {c.ERR}No entry selected. Use SELECT <N> first.{c.RESET}")
+            return
+        if not args:
+            print(f"  {c.WARN}Usage: SET NAME <prefix> <suffix>{c.RESET}")
+            print(f"  {c.LABEL}Example: SET NAME MT6 2F1G32D4DR-031{c.RESET}")
+            print(f"  {c.LABEL}Valid prefixes: {', '.join(VALID_PREFIXES)}{c.RESET}")
+            return
+        prefix = args[0]
+        # Match prefix case-insensitively
+        matched_prefix = None
+        for vp in VALID_PREFIXES:
+            if prefix.upper() == vp.upper():
+                matched_prefix = vp
+                break
+        if matched_prefix is None:
+            print(f"  {c.ERR}Unknown prefix: {prefix}{c.RESET}")
+            print(f"  {c.LABEL}Valid prefixes:{c.RESET}")
+            for pfx, desc in MODULE_NAME_PREFIXES:
+                print(f"    {c.VALUE}{pfx}{c.RESET}  {desc}")
+            return
+        suffix = ''.join(args[1:]) if len(args) > 1 else ''
+        new_name = matched_prefix + suffix
+        # Validate length
+        idx = state.selected_entry
+        e = entries[idx]
+        if e.module_name_offset < 0 or e.module_name_field_len == 0:
+            print(f"  {c.ERR}Entry {idx+1} has no editable name field.{c.RESET}")
+            return
+        if len(new_name) > e.module_name_field_len:
+            print(f"  {c.ERR}Name too long: {len(new_name)} chars (max {e.module_name_field_len}){c.RESET}")
+            return
+        # Validate printable ASCII
+        if not all(0x20 <= ord(ch) < 0x7F for ch in new_name):
+            print(f"  {c.ERR}Name contains invalid characters (ASCII printable only){c.RESET}")
+            return
+        old_name = e.module_name or '(unnamed)'
+        if idx not in state.entry_mods:
+            state.entry_mods[idx] = PendingEntryMod(index=idx, target_gb=32, new_name=new_name)
+        else:
+            state.entry_mods[idx].new_name = new_name
+        print(f"  {c.OK}Entry {idx+1} module name set to:{c.RESET} {c.VALUE}{new_name}{c.RESET}")
+        print(f"  {c.DIM}(was: {old_name}){c.RESET}")
+
+    elif cmd == 'deselect':
+        if state.selected_entry is None:
+            print(f"  {c.WARN}No entry selected.{c.RESET}")
+            return
+        idx = state.selected_entry
+        if idx in state.entry_mods:
+            del state.entry_mods[idx]
+            print(f"  {c.OK}Entry {idx+1} removed from pending modifications.{c.RESET}")
+        else:
+            print(f"  {c.DIM}Entry {idx+1} was not in pending modifications.{c.RESET}")
+        state.selected_entry = None
+
+    elif cmd == 'deselect_all':
+        count = len(state.entry_mods)
+        state.entry_mods.clear()
+        state.selected_entry = None
+        print(f"  {c.OK}Cleared {count} pending modification(s).{c.RESET}")
+
+    elif cmd == 'status':
+        _print_status(state)
+
+    elif cmd == 'help':
+        _show_help('spd', state)
+
+    elif cmd in ('back', 'exit', 'quit', 'q'):
+        state.current_menu = 'main'
+        state.selected_entry = None
+
+    elif cmd == '':
+        pass
+
+    else:
+        print(f"  {c.WARN}Unknown SPD command: {cmd}{c.RESET}")
+        print(f"  Type {c.BOLD}HELP{c.RESET} for available commands.")
+
+
+def _handle_screen_command(state: InteractiveState, cmd: str, args: list):
+    """Handle a screen submenu command."""
+    c = _C
+
+    if cmd == 'list':
+        print(f"\n  {c.HEADER}Available Screen Profiles:{c.RESET}")
+        print(f"  {c.DIM}{'-'*60}{c.RESET}")
+        for key, prof in SCREEN_PROFILES.items():
+            sel = " *" if state.screen_patch == key else ""
+            print(f"    {c.VALUE}{key:<12}{c.RESET} {prof['name']:<18} {c.LABEL}{prof['description']}{c.RESET}{c.OK}{sel}{c.RESET}")
+        print(f"\n  {c.LABEL}Current:{c.RESET} "
+              f"{c.VALUE}{SCREEN_PROFILES[state.screen_patch]['name']}{c.RESET}" if state.screen_patch
+              else f"\n  {c.LABEL}Current:{c.RESET} {c.DIM}(none){c.RESET}")
+        print()
+
+    elif cmd == 'select':
+        if not args:
+            print(f"  {c.WARN}Usage: SELECT <key>{c.RESET}")
+            print(f"  {c.LABEL}Keys: {', '.join(SCREEN_PROFILES.keys())}{c.RESET}")
+            return
+        key = args[0].lower()
+        if key not in SCREEN_PROFILES:
+            print(f"  {c.ERR}Unknown screen: {key}{c.RESET}")
+            print(f"  {c.LABEL}Available: {', '.join(SCREEN_PROFILES.keys())}{c.RESET}")
+            return
+        state.screen_patch = key
+        sn = SCREEN_PROFILES[key]['name']
+        print(f"  {c.OK}Screen patch selected: {sn}{c.RESET}")
+        print(f"  {c.DIM}EDID blocks and $BVDT$ version strings will be patched on APPLY.{c.RESET}")
+
+    elif cmd == 'clear':
+        state.screen_patch = None
+        print(f"  {c.OK}Screen patch cleared.{c.RESET}")
+
+    elif cmd == 'status':
+        if state.screen_patch:
+            sn = SCREEN_PROFILES[state.screen_patch]['name']
+            desc = SCREEN_PROFILES[state.screen_patch]['description']
+            print(f"  {c.LABEL}Selected:{c.RESET} {c.VALUE}{sn}{c.RESET} ({desc})")
+        else:
+            print(f"  {c.DIM}No screen patch selected.{c.RESET}")
+
+    elif cmd == 'help':
+        _show_help('screen', state)
+
+    elif cmd in ('back', 'exit', 'quit', 'q'):
+        state.current_menu = 'main'
+
+    elif cmd == '':
+        pass
+
+    else:
+        print(f"  {c.WARN}Unknown SCREEN command: {cmd}{c.RESET}")
+        print(f"  Type {c.BOLD}HELP{c.RESET} for available commands.")
+
+
+def interactive_modify(input_path: str, output_path: str, device: str = 'auto',
+                       sign_output: bool = False, magic: bool = False,
+                       screen: Optional[str] = None):
+    """Launch interactive DiskPart-style REPL for BIOS modification."""
+    _enable_ansi_colors()
+    c = _C
+
+    # Load and analyze
+    with open(input_path, 'rb') as f:
+        data = bytearray(f.read())
+
+    if device == 'auto':
+        device = detect_device(bytes(data))
+    device_profile = DEVICE_PROFILES.get(device)
+
+    blocks = find_apcb_blocks(bytes(data))
+    memg_blocks = [b for b in blocks if b.is_memg]
+    if not memg_blocks:
+        print(f"  {c.ERR}No APCB MEMG blocks found. Not a supported BIOS file.{c.RESET}")
+        return
+
+    # Flatten entries from first MEMG block with SPD entries
+    first_memg = next((b for b in memg_blocks if b.spd_entries), None)
+    all_entries = first_memg.spd_entries if first_memg else []
+
+    state = InteractiveState(
+        input_path=input_path,
+        output_path=output_path,
+        data=data,
+        device_key=device,
+        device_profile=device_profile,
+        blocks=blocks,
+        all_entries=all_entries,
+        entry_mods={},
+        sign_enabled=sign_output,
+        magic_enabled=magic,
+        screen_patch=screen,
+    )
+
+    _print_welcome(state)
+
+    # REPL
+    while True:
+        prompt = _build_prompt(state)
+        try:
+            raw = input(prompt)
+        except (EOFError, KeyboardInterrupt):
+            print(f"\n  {c.DIM}Aborted.{c.RESET}")
+            return
+
+        cmd, cmd_args = _parse_command(raw)
+
+        if state.current_menu == 'main':
+            result = _handle_main_command(state, cmd, cmd_args)
+            if result == 'exit':
+                return
+        elif state.current_menu == 'spd':
+            _handle_spd_command(state, cmd, cmd_args)
+        elif state.current_menu == 'screen':
+            _handle_screen_command(state, cmd, cmd_args)
+
+
+# ============================================================================
 # CLI
 # ============================================================================
 
@@ -1083,26 +1994,29 @@ Examples:
   Analyze a BIOS file (auto-detects device):
     python sd_apcb_tool.py analyze my_bios_dump.bin
 
-  Analyze with explicit device type:
-    python sd_apcb_tool.py analyze my_bios.fd --device rog_ally
+  Interactive mode (DiskPart-style per-entry editor):
+    python sd_apcb_tool.py modify my_bios.fd my_bios_mod.fd
 
-  Modify for 32GB (SPI flash ready, no signing):
+  Interactive with signing and screen patch pre-set:
+    python sd_apcb_tool.py modify my_bios.fd my_bios_mod.fd --sign --screen deckhd
+
+  Batch: modify for 32GB (SPI flash ready, no signing):
     python sd_apcb_tool.py modify my_bios.fd my_bios_32gb.fd --target 32
 
-  Modify for 64GB (ROG Ally X, requires LPDDR5X hardware):
-    python sd_apcb_tool.py modify my_bios.bin my_bios_64gb.bin --target 64
-
-  Modify for 32GB with signing (Steam Deck h2offt software flash):
+  Batch: modify for 32GB with signing (Steam Deck h2offt):
     python sd_apcb_tool.py modify my_bios.fd my_bios_32gb.fd --target 32 --sign
 
-  Restore to stock 16GB:
+  Batch: modify for 64GB (ROG Ally X):
+    python sd_apcb_tool.py modify my_bios.bin my_bios_64gb.bin --target 64
+
+  Batch: restore to stock 16GB:
     python sd_apcb_tool.py modify my_bios_32gb.fd my_bios_stock.fd --target 16
 
 Supported devices:
   Steam Deck (LCD & OLED): 16GB/32GB, SPI flash or h2offt (--sign)
   ROG Ally / Ally X: 16GB/32GB/64GB, SPI flash only (signing not supported)
 
-  The --sign flag requires: pip install cryptography
+  Omit --target for interactive mode. The --sign flag requires: pip install cryptography
         """
     )
     
@@ -1118,13 +2032,13 @@ Supported devices:
     modify_parser = subparsers.add_parser('modify', help='Modify BIOS for target memory')
     modify_parser.add_argument('bios_in', help='Input BIOS file')
     modify_parser.add_argument('bios_out', help='Output BIOS file')
-    modify_parser.add_argument('--target', type=int, required=True, choices=[16, 32, 64],
-                              help='Target memory size in GB')
+    modify_parser.add_argument('--target', type=int, default=None, choices=[16, 32, 64],
+                              help='Target memory size in GB (omit for interactive mode)')
     modify_parser.add_argument('--sign', action='store_true',
                               help='Re-sign firmware with PE Authenticode for h2offt software flash. '
                                    'Requires: pip install cryptography')
     modify_parser.add_argument('--magic', action='store_true',
-                              help='Modify APCB magic byte[0] (0x41→0x51). Cosmetic marker only, '
+                              help='Modify APCB magic byte[0] (0x41->0x51). Cosmetic marker only, '
                                    'not required for the mod. LCD known-good mods do NOT change this.')
     modify_parser.add_argument('--all-entries', action='store_true',
                               help='Modify ALL SPD entries (this is now the default behavior)')
@@ -1132,7 +2046,15 @@ Supported devices:
                               help='Specific entry index to modify (0-based, can repeat)')
     modify_parser.add_argument('--device', choices=['auto', 'steam_deck', 'rog_ally', 'rog_ally_x'],
                               default='auto', help='Device type (default: auto-detect)')
-    
+    modify_parser.add_argument('--screen', choices=list(SCREEN_PROFILES.keys()),
+                              default=None, metavar='SCREEN',
+                              help='Apply screen replacement patch (Steam Deck LCD only). '
+                                   f'Choices: {", ".join(SCREEN_PROFILES.keys())}. '
+                                   'Replaces EDID and tags version string.')
+    # Keep --deckhd as a convenience alias
+    modify_parser.add_argument('--deckhd', action='store_true',
+                              help='Shortcut for --screen deckhd')
+
     args = parser.parse_args()
     
     if args.command == 'analyze':
@@ -1142,22 +2064,40 @@ Supported devices:
         if args.bios_in == args.bios_out:
             print("\n  ERROR: Input and output must be different files (safety measure)")
             sys.exit(1)
-        
-        entry_indices = None
-        if args.all_entries:
-            entry_indices = 'all'  # Signal to modify all entries
-        elif args.entry:
-            entry_indices = args.entry
-        
-        modify_bios(
-            args.bios_in,
-            args.bios_out,
-            args.target,
-            modify_magic_byte=args.magic,
-            entry_indices=entry_indices,
-            sign_output=args.sign,
-            device=args.device,
-        )
+
+        # Resolve screen option (--deckhd is shortcut for --screen deckhd)
+        screen = args.screen
+        if args.deckhd and not screen:
+            screen = 'deckhd'
+
+        if args.target is not None:
+            # Batch mode: existing modify_bios() flow
+            entry_indices = None
+            if args.all_entries:
+                entry_indices = 'all'
+            elif args.entry:
+                entry_indices = args.entry
+
+            modify_bios(
+                args.bios_in,
+                args.bios_out,
+                args.target,
+                modify_magic_byte=args.magic,
+                entry_indices=entry_indices,
+                sign_output=args.sign,
+                device=args.device,
+                screen=screen,
+            )
+        else:
+            # Interactive mode
+            interactive_modify(
+                args.bios_in,
+                args.bios_out,
+                device=args.device,
+                sign_output=args.sign,
+                magic=args.magic,
+                screen=screen,
+            )
     else:
         parser.print_help()
 
