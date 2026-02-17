@@ -111,6 +111,7 @@ MODULE_DENSITY_MAP = {
     'K3KL3L30CM':      '32GB',    # Samsung LPDDR5 32GB
     'K3LKCKC0BM':      '32GB',    # Samsung LPDDR5X 8GB/pkg × 4 (LCD) - TESTED for 32GB mod
     'K3LKBKB0BM':      '16GB',    # Samsung LPDDR5 — ROG Ally stock
+    'K3LK7K70BM':      '16GB',    # Samsung LPDDR5 16GB — Steam Deck LCD
     # Samsung LPDDR5X
     'K3KL8L80CM':      '16GB',    # Samsung LPDDR5X — Ally X stock
     'K3KLALA0CM':      '64GB',    # Samsung LPDDR5X 64GB (16GB/pkg × 4)
