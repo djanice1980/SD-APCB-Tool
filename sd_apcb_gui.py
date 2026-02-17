@@ -72,21 +72,44 @@ MODULE_PREFIX_LABELS = [label for _, label in MODULE_NAME_PREFIXES]
 MODULE_PREFIX_MAP = {label: prefix for prefix, label in MODULE_NAME_PREFIXES}
 MODULE_LABEL_MAP = {prefix: label for prefix, label in MODULE_NAME_PREFIXES}
 
-# DeckHD 1200p screen replacement EDID (128 bytes, valid checksum)
-# Manufacturer: DHD, 1200x1920 @ 60Hz, monitor name "DeckHD-1200p"
+# Screen replacement EDID data and profiles (Steam Deck LCD only)
 EDID_MAGIC = bytes([0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00])
 BVDT_MAGIC = b'$BVDT$'
-DECKHD_EDID = bytes([
-    0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x11, 0x04, 0x01, 0x40, 0x01, 0x00, 0x00, 0x00,
-    0x02, 0x21, 0x01, 0x04, 0xA5, 0x0A, 0x0F, 0x78, 0xE2, 0xEE, 0x91, 0xA3, 0x54, 0x4C, 0x99, 0x26,
-    0x0F, 0x50, 0x54, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00,
-    0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0xB8, 0x3B, 0xB0, 0x64, 0x40, 0x80, 0x28, 0x70, 0x28, 0x14,
-    0x22, 0x04, 0x5F, 0x97, 0x00, 0x00, 0x00, 0x1E, 0x00, 0x00, 0x00, 0xFC, 0x00, 0x44, 0x65, 0x63,
-    0x6B, 0x48, 0x44, 0x2D, 0x31, 0x32, 0x30, 0x30, 0x70, 0x0A, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xD5,
-])
-DECKHD_MFR_ID = bytes([0x11, 0x04])  # DHD manufacturer bytes in EDID
+SCREEN_PROFILES = {
+    'deckhd': {
+        'name': 'DeckHD 1200p',
+        'description': 'IPS LCD, 1200x1920 @ 60Hz (16:10)',
+        'version_tag': 'DeckHD',
+        'mfr_id': bytes([0x11, 0x04]),
+        'edid': bytes([
+            0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x11, 0x04, 0x01, 0x40, 0x01, 0x00, 0x00, 0x00,
+            0x02, 0x21, 0x01, 0x04, 0xA5, 0x0A, 0x0F, 0x78, 0xE2, 0xEE, 0x91, 0xA3, 0x54, 0x4C, 0x99, 0x26,
+            0x0F, 0x50, 0x54, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00,
+            0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0xB8, 0x3B, 0xB0, 0x64, 0x40, 0x80, 0x28, 0x70, 0x28, 0x14,
+            0x22, 0x04, 0x5F, 0x97, 0x00, 0x00, 0x00, 0x1E, 0x00, 0x00, 0x00, 0xFC, 0x00, 0x44, 0x65, 0x63,
+            0x6B, 0x48, 0x44, 0x2D, 0x31, 0x32, 0x30, 0x30, 0x70, 0x0A, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xD5,
+        ]),
+    },
+    'decksight': {
+        'name': 'DeckSight OLED',
+        'description': 'AMOLED, 1080x1920 @ 60/80Hz (16:9)',
+        'version_tag': 'DeckSight',
+        'mfr_id': bytes([0x12, 0x6F]),
+        'edid': bytes([
+            0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x12, 0x6F, 0x01, 0x50, 0x01, 0x00, 0x00, 0x00,
+            0x01, 0x23, 0x01, 0x04, 0xA5, 0x09, 0x10, 0x78, 0x17, 0xB9, 0x74, 0xAE, 0x50, 0x3D, 0xB7, 0x23,
+            0x0B, 0x4F, 0x51, 0x00, 0x00, 0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+            0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x66, 0x39, 0x38, 0xA0, 0x40, 0x80, 0x37, 0x70, 0x30, 0x20,
+            0x3A, 0x00, 0x5A, 0xA0, 0x00, 0x00, 0x00, 0x1E, 0x00, 0x00, 0x00, 0xFC, 0x00, 0x44, 0x65, 0x63,
+            0x6B, 0x53, 0x69, 0x67, 0x68, 0x74, 0x0A, 0x20, 0x20, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x44, 0x4D, 0x38, 0xA0,
+            0x40, 0x80, 0x4A, 0x70, 0x30, 0x20, 0x3A, 0x00, 0x5A, 0xA0, 0x00, 0x00, 0x00, 0x1E, 0x00, 0xDF,
+        ]),
+    },
+}
+SCREEN_MFR_IDS = [p['mfr_id'] for p in SCREEN_PROFILES.values()]
 
 # Device profiles
 DEVICE_PROFILES = {
@@ -273,7 +296,7 @@ def modify_bios_data(data, entry_modifications, modify_magic=False):
             raise RuntimeError(f"Checksum failed at 0x{block.offset:08X}")
     return mods
 
-# ── DeckHD Screen Patch ──
+# ── Screen Replacement Patch ──
 
 def find_edid_blocks(data):
     """Find all EDID blocks in firmware. Returns list of (offset, edid_bytes) tuples."""
@@ -288,20 +311,26 @@ def find_edid_blocks(data):
         pos = idx + 1
     return blocks
 
-def patch_deckhd(data):
-    """Apply DeckHD 1200p screen patches to Steam Deck LCD firmware.
-    Patches EDID blocks and appends ' DeckHD' to $BVDT$ version strings.
+def patch_screen(data, screen_key):
+    """Apply screen replacement patches to Steam Deck LCD firmware.
+    Patches EDID blocks and appends version tag to $BVDT$ version strings.
     Returns list of (offset, description) tuples for logging.
     """
+    profile = SCREEN_PROFILES[screen_key]
+    target_edid = profile['edid']
+    target_mfr_id = profile['mfr_id']
+    version_tag = profile['version_tag']
+    screen_name = profile['name']
     patches = []
-    # Replace stock EDID blocks with DeckHD EDID
+    # Replace stock EDID blocks with target screen EDID
     for offset, edid in find_edid_blocks(bytes(data)):
-        if edid[8:10] == DECKHD_MFR_ID: continue  # Already DeckHD
+        if edid[8:10] == target_mfr_id: continue  # Already this screen
+        if any(edid[8:10] == mid for mid in SCREEN_MFR_IDS): continue  # Another known screen
         h_cm, v_cm = edid[21], edid[22]
         if not (5 <= h_cm <= 20 and 5 <= v_cm <= 25): continue  # Not a handheld panel
-        data[offset:offset + 128] = DECKHD_EDID
-        patches.append((offset, "EDID replaced with DeckHD-1200p"))
-    # Append ' DeckHD' to $BVDT$ version strings
+        data[offset:offset + 128] = target_edid
+        patches.append((offset, f"EDID replaced with {screen_name}"))
+    # Append version tag to $BVDT$ version strings
     pos = 0
     while pos < len(data) - 64:
         idx = data.find(BVDT_MAGIC, pos)
@@ -312,8 +341,8 @@ def patch_deckhd(data):
         null_end = ver_field.find(0x00)
         if null_end < 0: null_end = 32
         current_ver = ver_field[:null_end].decode('ascii', errors='replace')
-        if 'DeckHD' not in current_ver:
-            new_ver = current_ver + ' DeckHD'
+        if version_tag not in current_ver:
+            new_ver = current_ver + ' ' + version_tag
             new_bytes = new_ver.encode('ascii')[:32]
             new_bytes = new_bytes + b'\x00' * (32 - len(new_bytes))
             data[ver_offset:ver_offset + 32] = new_bytes
@@ -488,10 +517,13 @@ class APCBToolGUI:
         ttk.Label(sf, text=st, style='Status.TLabel').pack(side='left', padx=(12,0))
         if not self.signing_available: self.sign_var.set(False)
         df = tk.Frame(tc, bg=C_BGL); df.pack(fill='x', pady=(4,0))
-        self.deckhd_var = tk.BooleanVar(value=False)
-        self.deckhd_chk = ttk.Checkbutton(df, text="Apply DeckHD 1200p screen patch (Steam Deck LCD only)", variable=self.deckhd_var)
-        self.deckhd_chk.pack(side='left')
-        self.deckhd_chk.configure(state='disabled')  # Enabled only when Steam Deck detected
+        tk.Label(df, text="Screen patch:", bg=C_BGL, fg=C_FG, font=('Segoe UI', 10)).pack(side='left')
+        self.screen_var = tk.StringVar(value="None")
+        screen_options = ["None"] + [p['name'] for p in SCREEN_PROFILES.values()]
+        self.screen_combo = ttk.Combobox(df, textvariable=self.screen_var, values=screen_options,
+            state='disabled', width=20, font=('Segoe UI', 9))
+        self.screen_combo.pack(side='left', padx=(8,0))
+        tk.Label(df, text="(Steam Deck LCD only)", bg=C_BGL, fg=C_FGD, font=('Segoe UI', 9)).pack(side='left', padx=(8,0))
         # SPD entry selection section
         ttk.Label(m, text="SPD Entries to Modify", style='Section.TLabel').pack(anchor='w', pady=(4,4))
         self.entry_outer = tk.Frame(m, bg=C_BDR, padx=1, pady=1); self.entry_outer.pack(fill='x', pady=(0,10))
@@ -660,7 +692,7 @@ class APCBToolGUI:
             if val:
                 if row['has_name_field']:
                     row['prefix_widget'].configure(state='readonly')
-                    row['suffix_widget'].configure(state='normal', fg='#1a1b26', insertbackground='#1a1b26')
+                    row['suffix_widget'].configure(state='normal', fg='#4a4a5a', insertbackground='#4a4a5a')
                 row['combo_widget'].configure(state='readonly')
                 row['density_var'].set(density_str)
             else:
@@ -706,12 +738,12 @@ class APCBToolGUI:
             self._log(f"Signing: Not applicable — {device_name} requires SPI flash", 'dim')
         else:
             self.sign_chk.configure(state='normal')
-        # Enable DeckHD option only for Steam Deck LCD
+        # Enable screen patch dropdown only for Steam Deck LCD
         if self.detected_device == 'steam_deck':
-            self.deckhd_chk.configure(state='normal')
+            self.screen_combo.configure(state='readonly')
         else:
-            self.deckhd_var.set(False)
-            self.deckhd_chk.configure(state='disabled')
+            self.screen_var.set('None')
+            self.screen_combo.configure(state='disabled')
         self._log(f"Format: {'PE firmware (.fd)' if data[:2]==b'MZ' else 'Raw SPI dump'}", 'dim')
         self._log("Scanning...", 'dim')
         self.blocks = find_apcb_blocks(data)
@@ -808,20 +840,28 @@ class APCBToolGUI:
             name_note = f" → '{mod['new_name']}'" if mod['new_name'] else ''
             self._log(f"    [{mod['index']+1}] → {mod['target_gb']}GB{name_note}", 'dim')
         self._log(f"  Signing: {'Yes (PE Authenticode)' if do_sign else 'No'}", 'dim')
-        if self.deckhd_var.get():
-            self._log(f"  DeckHD: 1200p screen patch enabled", 'cyan')
+        # Resolve screen selection to profile key
+        screen_selection = self.screen_var.get()
+        screen_key = None
+        if screen_selection != 'None':
+            for key, profile in SCREEN_PROFILES.items():
+                if profile['name'] == screen_selection:
+                    screen_key = key; break
+        if screen_key:
+            self._log(f"  Screen: {SCREEN_PROFILES[screen_key]['name']} patch enabled", 'cyan')
         try:
             data = bytearray(self.loaded_data)
-            # Apply DeckHD screen patch if enabled
-            if self.deckhd_var.get():
-                self._log(f"\n  Applying DeckHD 1200p screen patch...", 'accent')
-                deckhd_patches = patch_deckhd(data)
-                if deckhd_patches:
-                    for off, desc in deckhd_patches:
+            # Apply screen replacement patch if selected
+            if screen_key:
+                screen_name = SCREEN_PROFILES[screen_key]['name']
+                self._log(f"\n  Applying {screen_name} screen patch...", 'accent')
+                screen_patches = patch_screen(data, screen_key)
+                if screen_patches:
+                    for off, desc in screen_patches:
                         self._log(f"    0x{off:08X}: {desc}", 'dim')
-                    self._log(f"  DeckHD: {len(deckhd_patches)} patch(es) applied", 'success')
+                    self._log(f"  {screen_name}: {len(screen_patches)} patch(es) applied", 'success')
                 else:
-                    self._log(f"  DeckHD: No patchable blocks found (may already be patched)", 'warning')
+                    self._log(f"  {screen_name}: No patchable blocks found (may already be patched)", 'warning')
             mods = modify_bios_data(data, entry_mods, self.magic_var.get())
             self._log(f"\n  Byte changes: {len(mods)}", 'success')
             for off,old,new in mods: self._log(f"    0x{off:08X}: 0x{old:02X} → 0x{new:02X}", 'dim')
@@ -851,7 +891,7 @@ class APCBToolGUI:
                 if do_sign: self._log(f"  Ready for h2offt: sudo h2offt {os.path.basename(op)}", 'cyan')
                 else: self._log(f"  Ready for SPI flash.", 'success')
                 msg = f"Modified {len(entry_mods)} entries ({target_summary})!\n\nDevice: {dev_name}\n{op}\n\n{len(mods)} bytes changed."
-                if self.deckhd_var.get(): msg += "\nDeckHD 1200p screen patch applied."
+                if screen_key: msg += f"\n{SCREEN_PROFILES[screen_key]['name']} screen patch applied."
                 msg += f"\n\n{'Signed for h2offt.' if do_sign else 'Ready for SPI flash.'}"
                 messagebox.showinfo("Success", msg)
             else:
