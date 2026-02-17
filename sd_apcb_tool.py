@@ -117,6 +117,7 @@ MODULE_DENSITY_MAP = {
     # SK Hynix LPDDR5X
     'H58G56BK7BX':     '16GB',    # SK Hynix LPDDR5X 16GB — Ally X stock
     'H58GE6AK8BX':     '32GB',    # SK Hynix LPDDR5X 32GB — Ally X
+    'H58G66BK8HX':     '16GB',    # SK Hynix LPDDR5 16GB — Steam Deck OLED (16Gb die × 8)
 }
 
 MANUFACTURER_IDS = {

@@ -54,7 +54,7 @@ MODULE_DENSITY_MAP = {
     'MT62F1536M32D4DS': '32GB', 'MT62F2G32D4DS': '32GB',
     'MT62F4G32D8DV': '64GB',
     'K3KL8L80CM': '16GB', 'K3KLALA0CM': '64GB',
-    'H58G56BK7BX': '16GB', 'H58GE6AK8BX': '32GB',
+    'H58G56BK7BX': '16GB', 'H58GE6AK8BX': '32GB', 'H58G66BK8HX': '16GB',
 }
 MANUFACTURER_IDS = {0x2C: 'Micron', 0xCE: 'Samsung', 0xAD: 'SK Hynix', 0x01: 'Samsung'}
 # Known module name prefixes — used for prefix dropdown in GUI editor
@@ -483,7 +483,7 @@ class APCBToolGUI:
             density_options = ['16GB', '32GB']
         # Select All checkbox
         sa_frame = tk.Frame(self.entry_inner, bg=C_BGL); sa_frame.pack(fill='x', padx=8, pady=(6,2))
-        self.select_all_var.set(True)
+        self.select_all_var.set(False)
         ttk.Checkbutton(sa_frame, text="Select All", variable=self.select_all_var, command=self._toggle_all).pack(side='left')
         # Column headers
         hdr = tk.Frame(self.entry_inner, bg=C_BGL); hdr.pack(fill='x', padx=8, pady=(4,2))
@@ -493,7 +493,7 @@ class APCBToolGUI:
         tk.Frame(self.entry_inner, bg=C_BDR, height=1).pack(fill='x', padx=8, pady=2)
         # Individual entry rows
         for i, e in enumerate(entries):
-            enabled_var = tk.BooleanVar(value=True)
+            enabled_var = tk.BooleanVar(value=False)
             current_density = density_from_bytes(e.byte6, e.byte12)
             density_var = tk.StringVar(value=current_density)
             # Split module name into prefix and suffix
@@ -520,13 +520,13 @@ class APCBToolGUI:
             # Manufacturer prefix dropdown (shows descriptive labels, maps to 3-char prefix)
             has_name = e.module_name_offset >= 0
             prefix_combo = ttk.Combobox(ef, textvariable=prefix_var, values=MODULE_PREFIX_LABELS,
-                state='readonly' if has_name else 'disabled', width=24, font=('Consolas', 9))
+                state='disabled', width=24, font=('Consolas', 9))
             prefix_combo.pack(side='left', padx=(2,0))
             # Module name suffix entry (constrained)
             field_len = e.module_name_field_len if e.module_name_field_len > 0 else 20
             suffix_entry = tk.Entry(ef, textvariable=suffix_var, font=('Consolas', 9), width=18,
                 bg=C_BGE, fg=C_FG, insertbackground=C_FG, relief='flat', borderwidth=1,
-                highlightbackground=C_BDR, highlightthickness=1)
+                highlightbackground=C_BDR, highlightthickness=1, state='disabled')
             suffix_entry.pack(side='left', padx=(0,4))
             # Validate suffix: printable ASCII only, length constrained by field_len minus prefix (3 chars)
             def _validate_suffix(new_val, fl=field_len, pv=prefix_var):
@@ -538,11 +538,10 @@ class APCBToolGUI:
             vcmd = (self.root.register(_validate_suffix), '%P')
             suffix_entry.configure(validate='key', validatecommand=vcmd)
             if not has_name:
-                suffix_entry.configure(state='disabled')
                 suffix_var.set('(no name field)')
             # Density combobox
             density_combo = ttk.Combobox(ef, textvariable=density_var, values=density_options,
-                state='readonly', width=6, font=('Consolas', 9))
+                state='disabled', width=6, font=('Consolas', 9))
             density_combo.pack(side='left', padx=(0,4))
             # Current bytes
             tk.Label(ef, text=f"b6=0x{e.byte6:02X} b12=0x{e.byte12:02X}", bg=C_BGL, fg=C_FGD, font=('Consolas', 8), anchor='w').pack(side='left')
@@ -564,13 +563,16 @@ class APCBToolGUI:
                 'has_name_field': has_name,
             }
             self.entry_rows.append(row)
-            # Bind checkbox toggle to enable/disable widgets
-            def _on_toggle(var=enabled_var, pw=prefix_combo, sw=suffix_entry, cw=density_combo, hn=has_name):
+            # Bind checkbox toggle to enable/disable widgets and sync density from global target
+            def _on_toggle(var=enabled_var, pw=prefix_combo, sw=suffix_entry, cw=density_combo,
+                           hn=has_name, dv=density_var):
                 if var.get():
                     if hn:
                         pw.configure(state='readonly')
                         sw.configure(state='normal')
                     cw.configure(state='readonly')
+                    # Set density to current global target when entry is checked
+                    dv.set(f"{self.target_var.get()}GB")
                 else:
                     pw.configure(state='disabled')
                     sw.configure(state='disabled')
@@ -583,6 +585,7 @@ class APCBToolGUI:
     def _toggle_all(self):
         """Toggle all entry checkboxes and enable/disable widgets."""
         val = self.select_all_var.get()
+        density_str = f"{self.target_var.get()}GB"
         for row in self.entry_rows:
             row['enabled_var'].set(val)
             if val:
@@ -590,6 +593,7 @@ class APCBToolGUI:
                     row['prefix_widget'].configure(state='readonly')
                     row['suffix_widget'].configure(state='normal')
                 row['combo_widget'].configure(state='readonly')
+                row['density_var'].set(density_str)
             else:
                 row['prefix_widget'].configure(state='disabled')
                 row['suffix_widget'].configure(state='disabled')
