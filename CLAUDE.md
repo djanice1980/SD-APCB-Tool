@@ -81,8 +81,8 @@ python sd_apcb_tool.py modify <input> <output> --target 32 --sign
 # Modify for 32GB (ROG Ally, no signing)
 python sd_apcb_tool.py modify <input> <output> --target 32
 
-# Modify for 64GB (ROG Ally X, all entries)
-python sd_apcb_tool.py modify <input> <output> --target 64 --all-entries
+# Modify for 64GB (ROG Ally X)
+python sd_apcb_tool.py modify <input> <output> --target 64
 
 # Restore to 16GB
 python sd_apcb_tool.py modify <input> <output> --target 16
