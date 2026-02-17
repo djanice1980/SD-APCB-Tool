@@ -2130,4 +2130,22 @@ Supported devices:
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except SystemExit as e:
+        # On Windows double-click, pause so user can read errors before window closes
+        if sys.platform == 'win32' and e.code != 0:
+            try:
+                input("\n  Press Enter to exit...")
+            except (EOFError, KeyboardInterrupt):
+                pass
+        raise
+    except Exception as e:
+        print(f"\n  ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        try:
+            input("\n  Press Enter to exit...")
+        except (EOFError, KeyboardInterrupt):
+            pass
+        sys.exit(1)
