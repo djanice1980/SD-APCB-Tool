@@ -62,7 +62,9 @@ CHANGELOG.md       # Version history
 - Verify APCB checksums before and after modification
 - Re-scan output file to confirm correct byte values
 - Modifies all SPD entries by default for broad chip compatibility (Micron, Samsung, SK Hynix)
-- GUI provides per-entry checkboxes for selective patching
+- GUI provides per-entry editor with density dropdown and editable module name per entry
+- GUI `modify_bios_data()` accepts `entry_modifications` list of `{index, target_gb, new_name}` dicts
+- Module name editing writes to the fixed-width ASCII field in the binary, null-padded
 - Signing failures fall back gracefully to unsigned output
 - Round-trip safe: 16GB → 32GB → 16GB produces byte-identical output
 
