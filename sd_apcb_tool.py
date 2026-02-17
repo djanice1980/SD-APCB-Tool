@@ -177,6 +177,8 @@ class SPDEntry:
     config_id: int = 0           # Configuration index from entry header
     mfr_flag: int = 0            # Manufacturer flag from entry header
     mem_type: str = 'LPDDR5'     # Memory type ('LPDDR5' or 'LPDDR5X')
+    module_name_offset: int = -1 # Absolute offset in file where module name starts
+    module_name_field_len: int = 0  # Byte length of the name field (for null-padding on write)
 
 
 @dataclass
@@ -398,6 +400,8 @@ def parse_spd_entries(data: bytes, apcb_offset: int, apcb_size: int) -> List[SPD
                 while end < min(j + 30, len(apcb)) and 0x20 <= apcb[end] < 0x7F:
                     end += 1
                 entry.module_name = apcb[j:end].decode('ascii', errors='replace').strip()
+                entry.module_name_offset = apcb_offset + j
+                entry.module_name_field_len = end - j
 
                 # Manufacturer ID is typically 2 bytes after name null terminator
                 mfr_off = end + 2

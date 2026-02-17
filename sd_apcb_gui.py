@@ -57,6 +57,20 @@ MODULE_DENSITY_MAP = {
     'H58G56BK7BX': '16GB', 'H58GE6AK8BX': '32GB',
 }
 MANUFACTURER_IDS = {0x2C: 'Micron', 0xCE: 'Samsung', 0xAD: 'SK Hynix', 0x01: 'Samsung'}
+# Known module name prefixes — used for prefix dropdown in GUI editor
+# Format: (prefix, display_label) — dropdown shows label, value uses prefix only
+MODULE_NAME_PREFIXES = [
+    ('MT6', 'MT6 - Micron LPDDR5/5X'),
+    ('K3K', 'K3K - Samsung LPDDR5'),
+    ('K3L', 'K3L - Samsung LPDDR5X'),
+    ('H58', 'H58 - SK Hynix LPDDR5/5X'),
+    ('H9H', 'H9H - SK Hynix LPDDR5/5X'),
+    ('SEC', 'SEC - Samsung (alt)'),
+    ('SAM', 'SAM - Samsung (alt)'),
+]
+MODULE_PREFIX_LABELS = [label for _, label in MODULE_NAME_PREFIXES]
+MODULE_PREFIX_MAP = {label: prefix for prefix, label in MODULE_NAME_PREFIXES}
+MODULE_LABEL_MAP = {prefix: label for prefix, label in MODULE_NAME_PREFIXES}
 
 # Device profiles
 DEVICE_PROFILES = {
@@ -94,6 +108,7 @@ class SPDEntry:
     offset_in_apcb: int; offset_in_file: int; spd_bytes: bytes
     module_name: str = ''; manufacturer: str = ''; density_guess: str = ''
     byte6: int = 0; byte12: int = 0; config_id: int = 0; mfr_flag: int = 0; mem_type: str = 'LPDDR5'
+    module_name_offset: int = -1; module_name_field_len: int = 0
 
 @dataclass
 class APCBBlock:
@@ -162,6 +177,8 @@ def parse_spd_entries(data, apcb_offset, apcb_size):
                 end = j
                 while end < min(j+30, len(apcb)) and 0x20 <= apcb[end] < 0x7F: end += 1
                 e.module_name = apcb[j:end].decode('ascii', errors='replace').strip()
+                e.module_name_offset = apcb_offset + j
+                e.module_name_field_len = end - j
                 mfr_off = end + 2
                 if mfr_off < len(apcb): e.manufacturer = MANUFACTURER_IDS.get(apcb[mfr_off], f'0x{apcb[mfr_off]:02X}')
                 break
@@ -185,21 +202,53 @@ def detect_current_config(blocks):
             else: return f"Unknown (0x{e.byte6:02X}/0x{e.byte12:02X})"
     return "No MEMG blocks found"
 
-def modify_bios_data(data, target_gb, modify_magic=False, entry_indices=None):
-    config = MEMORY_CONFIGS[target_gb]
+def density_from_bytes(byte6, byte12):
+    """Map current byte6/byte12 to a density string for the dropdown."""
+    for gb, cfg in MEMORY_CONFIGS.items():
+        if cfg['byte6'] == byte6 and cfg['byte12'] == byte12:
+            return f"{gb}GB"
+    return "16GB"
+
+def modify_bios_data(data, entry_modifications, modify_magic=False):
+    """Modify BIOS data with per-entry configurations.
+
+    Args:
+        data: bytearray of BIOS
+        entry_modifications: list of dicts with keys:
+            'index': int - SPD entry index
+            'target_gb': int - 16, 32, or 64
+            'new_name': str|None - new module name or None to keep current
+        modify_magic: bool - modify APCB magic byte
+    Returns:
+        list of (offset, old_byte, new_byte) tuples
+    """
     blocks = find_apcb_blocks(bytes(data))
     mods = []
+    # Build a lookup: index -> modification
+    mod_by_idx = {m['index']: m for m in entry_modifications}
+    # Determine magic byte from first modification's target (or default 32)
+    first_target = entry_modifications[0]['target_gb'] if entry_modifications else 32
     for block in [b for b in blocks if b.is_memg]:
         if not block.spd_entries: continue
-        indices = entry_indices if entry_indices is not None else range(len(block.spd_entries))
-        for idx in indices:
+        for idx, mod in mod_by_idx.items():
             if idx >= len(block.spd_entries): continue
             e = block.spd_entries[idx]
+            config = MEMORY_CONFIGS[mod['target_gb']]
+            # Write density bytes
             b6, b12 = e.offset_in_file+6, e.offset_in_file+12
             mods.append((b6, data[b6], config['byte6'])); mods.append((b12, data[b12], config['byte12']))
             data[b6] = config['byte6']; data[b12] = config['byte12']
+            # Write module name if changed
+            new_name = mod.get('new_name')
+            if new_name is not None and e.module_name_offset >= 0 and e.module_name_field_len > 0:
+                name_bytes = new_name.encode('ascii', errors='replace')[:e.module_name_field_len]
+                name_bytes = name_bytes + b'\x00' * (e.module_name_field_len - len(name_bytes))
+                for i, nb in enumerate(name_bytes):
+                    off = e.module_name_offset + i
+                    if data[off] != nb:
+                        mods.append((off, data[off], nb)); data[off] = nb
         if modify_magic:
-            nb = 0x51 if target_gb == 32 else 0x41
+            nb = 0x51 if first_target == 32 else 0x41
             if data[block.offset] != nb: mods.append((block.offset, data[block.offset], nb)); data[block.offset] = nb
         bb = data[block.offset:block.offset+block.data_size]
         nc = calculate_apcb_checksum(bytes(bb)); oc = data[block.offset+APCB_CHECKSUM_OFFSET]
@@ -354,7 +403,8 @@ class APCBToolGUI:
         r2 = tk.Frame(ic, bg=C_BGL); r2.pack(fill='x', pady=(4,0))
         self.lbl_bl = ttk.Label(r2, text="", style='Status.TLabel'); self.lbl_bl.pack(side='left')
         self.lbl_cf = ttk.Label(r2, text="", style='Status.TLabel'); self.lbl_cf.pack(side='right')
-        ttk.Label(m, text="Target Configuration", style='Section.TLabel').pack(anchor='w', pady=(4,4))
+        ttk.Label(m, text="Target Configuration", style='Section.TLabel').pack(anchor='w', pady=(4,0))
+        ttk.Label(m, text="Sets density for all checked entries below", style='Subtitle.TLabel').pack(anchor='w', pady=(0,4))
         tc = tk.Frame(m, bg=C_BGL, padx=16, pady=12, highlightbackground=C_BDR, highlightthickness=1); tc.pack(fill='x', pady=(0,10))
         self.target_var = tk.IntVar(value=32)
         self.target_radios = {}
@@ -390,8 +440,10 @@ class APCBToolGUI:
         # Placeholder
         self.entry_placeholder = ttk.Label(self.entry_inner, text="  Load a BIOS file to see SPD entries", style='Status.TLabel')
         self.entry_placeholder.pack(anchor='w', padx=8, pady=8)
-        self.entry_vars = []
+        self.entry_rows = []
         self.select_all_var = tk.BooleanVar(value=True)
+        # Wire global target radio to sync per-entry dropdowns
+        self.target_var.trace_add('write', self._sync_target_to_entries)
         br = ttk.Frame(m); br.pack(fill='x', pady=(0,8))
         self.btn_mod = ttk.Button(br, text="Apply Modification", style='Action.TButton', command=self._do_modify, state='disabled'); self.btn_mod.pack(side='left')
         self.btn_ana = ttk.Button(br, text="Analyze Only", command=self._do_analyze, state='disabled'); self.btn_ana.pack(side='left', padx=(8,0))
@@ -418,33 +470,138 @@ class APCBToolGUI:
         self.root.clipboard_clear(); self.root.clipboard_append(text)
 
     def _populate_entries(self, entries):
-        """Populate the SPD entry checkboxes from the first MEMG block's entries."""
+        """Populate the SPD entry editor rows from the first MEMG block's entries."""
         for w in self.entry_inner.winfo_children(): w.destroy()
-        self.entry_vars = []
+        self.entry_rows = []
         if not entries:
             ttk.Label(self.entry_inner, text="  No SPD entries found", style='Status.TLabel').pack(anchor='w', padx=8, pady=8)
             return
+        # Determine available density options based on device
+        if self.device_profile and 64 in self.device_profile.get('memory_targets', []):
+            density_options = ['16GB', '32GB', '64GB']
+        else:
+            density_options = ['16GB', '32GB']
         # Select All checkbox
         sa_frame = tk.Frame(self.entry_inner, bg=C_BGL); sa_frame.pack(fill='x', padx=8, pady=(6,2))
         self.select_all_var.set(True)
         ttk.Checkbutton(sa_frame, text="Select All", variable=self.select_all_var, command=self._toggle_all).pack(side='left')
+        # Column headers
+        hdr = tk.Frame(self.entry_inner, bg=C_BGL); hdr.pack(fill='x', padx=8, pady=(4,2))
+        for txt, w in [('#', 4), ('Type', 8), ('Manufacturer Prefix', 25), ('Module Suffix', 18), ('Density', 7), ('Current', 14)]:
+            tk.Label(hdr, text=txt, bg=C_BGL, fg=C_FGD, font=('Consolas', 8), anchor='w', width=w).pack(side='left', padx=1)
         # Separator
         tk.Frame(self.entry_inner, bg=C_BDR, height=1).pack(fill='x', padx=8, pady=2)
-        # Individual entries
+        # Individual entry rows
         for i, e in enumerate(entries):
-            var = tk.BooleanVar(value=True)
-            self.entry_vars.append((var, i))
+            enabled_var = tk.BooleanVar(value=True)
+            current_density = density_from_bytes(e.byte6, e.byte12)
+            density_var = tk.StringVar(value=current_density)
+            # Split module name into prefix and suffix
+            orig_name = e.module_name or ''
+            orig_prefix = ''
+            orig_prefix_label = ''
+            orig_suffix = orig_name
+            for pfx, label in MODULE_NAME_PREFIXES:
+                if orig_name.startswith(pfx):
+                    orig_prefix = pfx
+                    orig_prefix_label = label
+                    orig_suffix = orig_name[len(pfx):]
+                    break
+            prefix_var = tk.StringVar(value=orig_prefix_label)
+            suffix_var = tk.StringVar(value=orig_suffix)
             ef = tk.Frame(self.entry_inner, bg=C_BGL); ef.pack(fill='x', padx=8, pady=1)
-            label = f"[{i+1}] {e.mem_type:<8} {e.module_name or '(unnamed)':<24} {e.density_guess or '?':<6} {e.manufacturer or '?'}"
-            ttk.Checkbutton(ef, text=label, variable=var).pack(side='left')
-        # Adjust canvas height based on entry count (cap at 150px)
-        h = min(150, 30 + len(entries) * 24)
+            # Checkbox
+            cb = ttk.Checkbutton(ef, variable=enabled_var)
+            cb.pack(side='left')
+            # Index
+            tk.Label(ef, text=f"[{i+1}]", bg=C_BGL, fg=C_FG, font=('Consolas', 9), width=4, anchor='w').pack(side='left')
+            # Type
+            tk.Label(ef, text=e.mem_type, bg=C_BGL, fg=C_FGD, font=('Consolas', 9), width=8, anchor='w').pack(side='left')
+            # Manufacturer prefix dropdown (shows descriptive labels, maps to 3-char prefix)
+            has_name = e.module_name_offset >= 0
+            prefix_combo = ttk.Combobox(ef, textvariable=prefix_var, values=MODULE_PREFIX_LABELS,
+                state='readonly' if has_name else 'disabled', width=24, font=('Consolas', 9))
+            prefix_combo.pack(side='left', padx=(2,0))
+            # Module name suffix entry (constrained)
+            field_len = e.module_name_field_len if e.module_name_field_len > 0 else 20
+            suffix_entry = tk.Entry(ef, textvariable=suffix_var, font=('Consolas', 9), width=18,
+                bg=C_BGE, fg=C_FG, insertbackground=C_FG, relief='flat', borderwidth=1,
+                highlightbackground=C_BDR, highlightthickness=1)
+            suffix_entry.pack(side='left', padx=(0,4))
+            # Validate suffix: printable ASCII only, length constrained by field_len minus prefix (3 chars)
+            def _validate_suffix(new_val, fl=field_len, pv=prefix_var):
+                # Prefix is always 3 chars regardless of display label
+                pfx = MODULE_PREFIX_MAP.get(pv.get(), pv.get())
+                max_suf = fl - len(pfx)
+                if len(new_val) > max_suf: return False
+                return all(0x20 <= ord(c) < 0x7F for c in new_val)
+            vcmd = (self.root.register(_validate_suffix), '%P')
+            suffix_entry.configure(validate='key', validatecommand=vcmd)
+            if not has_name:
+                suffix_entry.configure(state='disabled')
+                suffix_var.set('(no name field)')
+            # Density combobox
+            density_combo = ttk.Combobox(ef, textvariable=density_var, values=density_options,
+                state='readonly', width=6, font=('Consolas', 9))
+            density_combo.pack(side='left', padx=(0,4))
+            # Current bytes
+            tk.Label(ef, text=f"b6=0x{e.byte6:02X} b12=0x{e.byte12:02X}", bg=C_BGL, fg=C_FGD, font=('Consolas', 8), anchor='w').pack(side='left')
+            # Store row data
+            row = {
+                'index': i,
+                'enabled_var': enabled_var,
+                'prefix_var': prefix_var,
+                'suffix_var': suffix_var,
+                'density_var': density_var,
+                'prefix_widget': prefix_combo,
+                'suffix_widget': suffix_entry,
+                'combo_widget': density_combo,
+                'original_name': orig_name,
+                'original_prefix': orig_prefix,
+                'original_suffix': orig_suffix,
+                'original_density': current_density,
+                'max_name_len': field_len,
+                'has_name_field': has_name,
+            }
+            self.entry_rows.append(row)
+            # Bind checkbox toggle to enable/disable widgets
+            def _on_toggle(var=enabled_var, pw=prefix_combo, sw=suffix_entry, cw=density_combo, hn=has_name):
+                if var.get():
+                    if hn:
+                        pw.configure(state='readonly')
+                        sw.configure(state='normal')
+                    cw.configure(state='readonly')
+                else:
+                    pw.configure(state='disabled')
+                    sw.configure(state='disabled')
+                    cw.configure(state='disabled')
+            cb.configure(command=_on_toggle)
+        # Adjust canvas height based on entry count (cap at 250px)
+        h = min(250, 50 + len(entries) * 26)
         self.entry_canvas.configure(height=h)
 
     def _toggle_all(self):
-        """Toggle all entry checkboxes based on Select All state."""
+        """Toggle all entry checkboxes and enable/disable widgets."""
         val = self.select_all_var.get()
-        for var, _ in self.entry_vars: var.set(val)
+        for row in self.entry_rows:
+            row['enabled_var'].set(val)
+            if val:
+                if row['has_name_field']:
+                    row['prefix_widget'].configure(state='readonly')
+                    row['suffix_widget'].configure(state='normal')
+                row['combo_widget'].configure(state='readonly')
+            else:
+                row['prefix_widget'].configure(state='disabled')
+                row['suffix_widget'].configure(state='disabled')
+                row['combo_widget'].configure(state='disabled')
+
+    def _sync_target_to_entries(self, *args):
+        """When global target changes, update all checked entries' density dropdowns."""
+        target = self.target_var.get()
+        density_str = f"{target}GB"
+        for row in self.entry_rows:
+            if row['enabled_var'].get():
+                row['density_var'].set(density_str)
 
     def _open_file(self):
         fp = filedialog.askopenfilename(title="Open BIOS File", filetypes=[("All files","*.*"),("BIOS Files","*.fd *.bin *.rom")])
@@ -532,30 +689,48 @@ class APCBToolGUI:
 
     def _do_modify(self):
         if not self.loaded_data or not self.loaded_file: return
-        target = self.target_var.get(); config = MEMORY_CONFIGS[target]; do_sign = self.sign_var.get()
+        do_sign = self.sign_var.get()
         if do_sign and self.device_profile and not self.device_profile['supports_signing']:
             messagebox.showinfo("Signing Not Supported", f"{self.device_profile['name']} does not support firmware signing.\n\nUse SPI flash instead."); do_sign = False
         if do_sign and not self.signing_available:
             messagebox.showwarning("Signing Unavailable", "Install: pip install cryptography\n\nOn SteamOS, use a virtual environment:\npython -m venv --system-site-packages ~/sd-apcb-venv\nsource ~/sd-apcb-venv/bin/activate\npip install cryptography\n\nContinuing unsigned."); do_sign = False
         if do_sign and self.loaded_data[:2] != b'MZ':
             messagebox.showinfo("Signing Skipped", "Raw SPI dump — signing not applicable."); do_sign = False
-        # Gather selected entry indices
-        selected = [idx for var, idx in self.entry_vars if var.get()]
-        if not selected:
+        # Gather per-entry modifications from editor rows
+        entry_mods = []
+        for row in self.entry_rows:
+            if not row['enabled_var'].get(): continue
+            target_gb = int(row['density_var'].get().replace('GB', ''))
+            prefix_label = row['prefix_var'].get()
+            prefix = MODULE_PREFIX_MAP.get(prefix_label, prefix_label)
+            new_name = prefix + row['suffix_var'].get().strip()
+            name_to_write = new_name if (row['has_name_field'] and new_name != row['original_name']) else None
+            entry_mods.append({'index': row['index'], 'target_gb': target_gb, 'new_name': name_to_write})
+        if not entry_mods:
             messagebox.showwarning("No Entries Selected", "Select at least one SPD entry to modify."); return
-        sp = Path(self.loaded_file); dn = f"{sp.stem}{'_64GB' if target==64 else '_32GB' if target==32 else '_stock'}{sp.suffix}"
+        # Determine output filename from most common target
+        targets = [m['target_gb'] for m in entry_mods]
+        primary_target = max(set(targets), key=targets.count)
+        config = MEMORY_CONFIGS[primary_target]
+        sp = Path(self.loaded_file); dn = f"{sp.stem}{'_64GB' if primary_target==64 else '_32GB' if primary_target==32 else '_stock'}{sp.suffix}"
         op = filedialog.asksaveasfilename(title="Save Modified BIOS As", initialfile=dn, initialdir=str(sp.parent),
             filetypes=[("All files","*.*"),("BIOS Files","*.fd *.bin *.rom")])
         if not op: return
         if os.path.abspath(op) == os.path.abspath(self.loaded_file): messagebox.showerror("Error","Cannot overwrite input."); return
         self._log_clear()
-        self._log("═"*70, 'header'); self._log(f"  MODIFYING FOR {config['name'].upper()}", 'header'); self._log("═"*70, 'header')
+        # Build summary of per-entry changes
+        unique_targets = sorted(set(targets))
+        target_summary = ', '.join(f"{t}GB" for t in unique_targets)
+        self._log("═"*70, 'header'); self._log(f"  MODIFYING SPD ENTRIES ({target_summary})", 'header'); self._log("═"*70, 'header')
         self._log(f"  Input:  {os.path.basename(self.loaded_file)}", 'info')
         self._log(f"  Output: {os.path.basename(op)}", 'info')
-        self._log(f"  Target: {config['name']}", 'accent')
+        self._log(f"  Entries: {len(entry_mods)} selected", 'accent')
+        for mod in entry_mods:
+            name_note = f" → '{mod['new_name']}'" if mod['new_name'] else ''
+            self._log(f"    [{mod['index']+1}] → {mod['target_gb']}GB{name_note}", 'dim')
         self._log(f"  Signing: {'Yes (PE Authenticode)' if do_sign else 'No'}", 'dim')
         try:
-            data = bytearray(self.loaded_data); mods = modify_bios_data(data, target, self.magic_var.get(), entry_indices=selected)
+            data = bytearray(self.loaded_data); mods = modify_bios_data(data, entry_mods, self.magic_var.get())
             self._log(f"\n  Byte changes: {len(mods)}", 'success')
             for off,old,new in mods: self._log(f"    0x{off:08X}: 0x{old:02X} → 0x{new:02X}", 'dim')
             od = bytes(data)
@@ -566,22 +741,24 @@ class APCBToolGUI:
             with open(op,'wb') as f: f.write(od)
             self._log(f"\n  Verifying...", 'dim')
             vb = find_apcb_blocks(open(op,'rb').read()); ok = True
+            # Build per-entry expected config lookup
+            expected = {m['index']: MEMORY_CONFIGS[m['target_gb']] for m in entry_mods}
             for b in vb:
                 if b.is_memg:
                     if not b.checksum_valid: self._log(f"    FAIL: 0x{b.offset:08X}", 'error'); ok = False
                     elif b.spd_entries:
                         self._log(f"    0x{b.offset:08X}: cksum VALID", 'success')
-                        for idx in selected:
+                        for idx, ecfg in expected.items():
                             if idx < len(b.spd_entries):
-                                e = b.spd_entries[idx]; m = e.byte6==config['byte6'] and e.byte12==config['byte12']
-                                self._log(f"      [{idx+1}] b6=0x{e.byte6:02X} b12=0x{e.byte12:02X} [{'OK' if m else 'MISMATCH'}]", 'success' if m else 'error')
+                                e = b.spd_entries[idx]; m = e.byte6==ecfg['byte6'] and e.byte12==ecfg['byte12']
+                                self._log(f"      [{idx+1}] b6=0x{e.byte6:02X} b12=0x{e.byte12:02X} → {ecfg['name']} [{'OK' if m else 'MISMATCH'}]", 'success' if m else 'error')
                                 if not m: ok = False
             if ok:
                 self._log(f"\n  ✓ MODIFICATION SUCCESSFUL", 'success')
                 dev_name = self.device_profile['name'] if self.device_profile else 'device'
                 if do_sign: self._log(f"  Ready for h2offt: sudo h2offt {os.path.basename(op)}", 'cyan')
                 else: self._log(f"  Ready for SPI flash.", 'success')
-                msg = f"Modified for {config['name']}!\n\nDevice: {dev_name}\n{op}\n\n{len(mods)} bytes changed.\n\n"
+                msg = f"Modified {len(entry_mods)} entries ({target_summary})!\n\nDevice: {dev_name}\n{op}\n\n{len(mods)} bytes changed.\n\n"
                 msg += f"{'Signed for h2offt.' if do_sign else 'Ready for SPI flash.'}"
                 messagebox.showinfo("Success", msg)
             else:
@@ -592,7 +769,7 @@ class APCBToolGUI:
 
 def main():
     root = tk.Tk(); root.update_idletasks()
-    w,h = 820,720; root.geometry(f"{w}x{h}+{(root.winfo_screenwidth()//2)-(w//2)}+{(root.winfo_screenheight()//2)-(h//2)}")
+    w,h = 920,800; root.geometry(f"{w}x{h}+{(root.winfo_screenwidth()//2)-(w//2)}+{(root.winfo_screenheight()//2)-(h//2)}")
     APCBToolGUI(root); root.mainloop()
 
 if __name__ == '__main__':
