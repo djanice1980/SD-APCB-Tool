@@ -569,13 +569,13 @@ class APCBToolGUI:
                 if var.get():
                     if hn:
                         pw.configure(state='readonly')
-                        sw.configure(state='normal')
+                        sw.configure(state='normal', fg='#1a1b26', insertbackground='#1a1b26')
                     cw.configure(state='readonly')
                     # Set density to current global target when entry is checked
                     dv.set(f"{self.target_var.get()}GB")
                 else:
                     pw.configure(state='disabled')
-                    sw.configure(state='disabled')
+                    sw.configure(state='disabled', fg=C_FG, insertbackground=C_FG)
                     cw.configure(state='disabled')
             cb.configure(command=_on_toggle)
         # Adjust canvas height based on entry count (cap at 250px)
@@ -591,12 +591,12 @@ class APCBToolGUI:
             if val:
                 if row['has_name_field']:
                     row['prefix_widget'].configure(state='readonly')
-                    row['suffix_widget'].configure(state='normal')
+                    row['suffix_widget'].configure(state='normal', fg='#1a1b26', insertbackground='#1a1b26')
                 row['combo_widget'].configure(state='readonly')
                 row['density_var'].set(density_str)
             else:
                 row['prefix_widget'].configure(state='disabled')
-                row['suffix_widget'].configure(state='disabled')
+                row['suffix_widget'].configure(state='disabled', fg=C_FG, insertbackground=C_FG)
                 row['combo_widget'].configure(state='disabled')
 
     def _sync_target_to_entries(self, *args):
