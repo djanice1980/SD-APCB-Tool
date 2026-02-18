@@ -111,6 +111,7 @@ MODULE_DENSITY_MAP = {
     'K3KL3L30CM':      '32GB',    # Samsung LPDDR5 32GB
     'K3LKCKC0BM':      '32GB',    # Samsung LPDDR5X 8GB/pkg × 4 (LCD) - TESTED for 32GB mod
     'K3LKBKB0BM':      '16GB',    # Samsung LPDDR5 — ROG Ally stock
+    'K3LK7K70BM':      '16GB',    # Samsung LPDDR5 16GB — Steam Deck LCD
     # Samsung LPDDR5X
     'K3KL8L80CM':      '16GB',    # Samsung LPDDR5X — Ally X stock
     'K3KLALA0CM':      '64GB',    # Samsung LPDDR5X 64GB (16GB/pkg × 4)
@@ -2099,8 +2100,80 @@ Supported devices:
                 screen=screen,
             )
     else:
-        parser.print_help()
+        # No subcommand — prompt for file paths and enter interactive mode
+        _enable_ansi_colors()
+        c = _C
+        print(f"\n{c.HEADER}  APCB Memory Configuration Tool v{TOOL_VERSION}{c.RESET}")
+        print(f"  {c.DIM}No command specified -- entering interactive mode.{c.RESET}\n")
+        try:
+            input_path = input(f"  {c.PROMPT}Input BIOS file path: {c.RESET}").strip().strip('"').strip("'")
+            if not input_path:
+                print(f"  {c.ERR}No file specified.{c.RESET}")
+                sys.exit(1)
+            if not os.path.isfile(input_path):
+                print(f"  {c.ERR}File not found: {input_path}{c.RESET}")
+                sys.exit(1)
+            # Generate default output name
+            from pathlib import Path
+            p = Path(input_path)
+            default_out = str(p.parent / f"{p.stem}_modified{p.suffix}")
+            output_path = input(f"  {c.PROMPT}Output file path [{os.path.basename(default_out)}]: {c.RESET}").strip().strip('"').strip("'")
+            if not output_path:
+                output_path = default_out
+        except (EOFError, KeyboardInterrupt):
+            print(f"\n  {c.DIM}Aborted.{c.RESET}")
+            sys.exit(0)
+        if os.path.abspath(input_path) == os.path.abspath(output_path):
+            print(f"  {c.ERR}Input and output must be different files.{c.RESET}")
+            sys.exit(1)
+        interactive_modify(input_path, output_path)
+
+
+def _is_transient_window() -> bool:
+    """Detect if we're in a transient console window that will close on exit.
+
+    On Windows, double-clicking a .py file (or running via 'start python ...')
+    opens a new console window that disappears the moment the process exits.
+    We detect this by checking whether our console process is the root of its
+    console session -- if so, the window was created just for us.
+    """
+    if sys.platform != 'win32':
+        return False
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        # GetConsoleProcessList returns the number of processes attached
+        # to the current console.  If we're the only one, this is a
+        # transient window that will vanish when we exit.
+        pid_array = (ctypes.c_uint32 * 16)()
+        count = kernel32.GetConsoleProcessList(pid_array, 16)
+        return count <= 1
+    except Exception:
+        # If anything goes wrong, be safe and assume it's transient
+        # when running on Windows with no explicit subcommand
+        return len(sys.argv) <= 1
+
+
+def _pause_before_exit():
+    """Pause so the user can read output before a transient window closes."""
+    try:
+        input("\n  Press Enter to exit...")
+    except (EOFError, KeyboardInterrupt):
+        pass
 
 
 if __name__ == '__main__':
-    main()
+    _transient = _is_transient_window()
+    try:
+        main()
+    except SystemExit as e:
+        if _transient or (sys.platform == 'win32' and e.code != 0):
+            _pause_before_exit()
+        raise
+    except Exception as e:
+        print(f"\n  ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        if sys.platform == 'win32':
+            _pause_before_exit()
+        sys.exit(1)
