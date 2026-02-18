@@ -206,12 +206,107 @@ DEVICE_PROFILES = {
 # Data Structures
 # ============================================================================
 
+# SPD byte field constants (JEDEC SPD4.1.2.M-2 / LPDDR5 layout)
+# MTB = Medium Time Base = 125ps (0.125ns)
+SPD_MTB_PS = 125  # picoseconds
+
+# Die density decoding (byte 4 bits 3:0)
+_DIE_DENSITY_MAP = {
+    0x4: '4Gb', 0xB: '6Gb', 0x5: '8Gb', 0x8: '12Gb',
+    0x6: '16Gb', 0x9: '24Gb', 0x7: '32Gb',
+}
+
+# Die count decoding (byte 6 bits 6:4)
+_DIE_COUNT_MAP = {0: 1, 1: 2, 2: 4, 3: 8}
+
+# Device width decoding (byte 12 bits 2:0)
+_DEV_WIDTH_MAP = {0: 'x4', 1: 'x8', 2: 'x16', 3: 'x32'}
+
+# Bank groups decoding (byte 4 bits 5:4)
+_BANK_GROUPS_MAP = {0: 1, 1: 2, 2: 4}
+
+# Banks per group decoding (byte 4 bits 7:6)
+_BANKS_PER_GROUP_MAP = {0: 4, 1: 8, 2: 16}
+
+
+def _decode_spd_fields(spd: bytes) -> dict:
+    """Decode LPDDR5/LPDDR5X SPD bytes into human-readable fields.
+
+    Args:
+        spd: At least 32 bytes of SPD data starting at the magic.
+
+    Returns:
+        Dict with decoded field values.
+    """
+    if len(spd) < 29:
+        return {}
+
+    b4 = spd[4]   # SDRAM Density and Banks
+    b5 = spd[5]   # SDRAM Addressing (rows/cols)
+    b6 = spd[6]   # SDRAM Package Type (die count, density)
+    b7 = spd[7]   # Optional Features (tMAW, MAC)
+    b12 = spd[12] # Module Organization (ranks, device width)
+    b13 = spd[13] # Module Memory Bus Width
+
+    # Die density
+    die_density_code = b4 & 0x0F
+    die_density = _DIE_DENSITY_MAP.get(die_density_code, f'?({die_density_code})')
+
+    # Bank architecture
+    bank_groups = _BANK_GROUPS_MAP.get((b4 >> 4) & 0x03, '?')
+    banks_per_group = _BANKS_PER_GROUP_MAP.get((b4 >> 6) & 0x03, '?')
+
+    # Addressing
+    col_bits = (b5 & 0x07) + 9
+    row_bits = ((b5 >> 3) & 0x07) + 12
+
+    # Package type (byte 6)
+    die_count_code = (b6 >> 4) & 0x07
+    die_count = _DIE_COUNT_MAP.get(die_count_code, die_count_code)
+
+    # Module organization (byte 12)
+    dev_width_code = b12 & 0x07
+    dev_width = _DEV_WIDTH_MAP.get(dev_width_code, f'x?({dev_width_code})')
+    ranks = ((b12 >> 3) & 0x07) + 1
+
+    # Bus width (byte 13)
+    bus_width_code = b13 & 0x07
+    bus_width = {0: 8, 1: 16, 2: 32, 3: 64}.get(bus_width_code, '?')
+
+    result = {
+        'die_density': die_density,
+        'die_count': die_count,
+        'ranks': ranks,
+        'dev_width': dev_width,
+        'bus_width': bus_width,
+        'row_bits': row_bits,
+        'col_bits': col_bits,
+        'bank_groups': bank_groups,
+        'banks_per_group': banks_per_group,
+    }
+
+    # Timing parameters (require at least 29 bytes)
+    b18 = spd[18]  # tCKmin (MTB)
+    b24 = spd[24]  # tAAmin (MTB)
+    b26 = spd[26]  # tRCDmin (MTB)
+    b27 = spd[27]  # tRPABmin (MTB)
+    b28 = spd[28]  # tRPPBmin (MTB)
+
+    result['tCK_mtb'] = b18
+    result['tAA_ns'] = round(b24 * SPD_MTB_PS / 1000, 2)
+    result['tRCD_ns'] = round(b26 * SPD_MTB_PS / 1000, 2)
+    result['tRPAB_ns'] = round(b27 * SPD_MTB_PS / 1000, 2)
+    result['tRPPB_ns'] = round(b28 * SPD_MTB_PS / 1000, 2)
+
+    return result
+
+
 @dataclass
 class SPDEntry:
     """A single SPD (Serial Presence Detect) entry within an APCB MEMG block."""
     offset_in_apcb: int          # Offset of SPD magic within the APCB block
     offset_in_file: int          # Absolute offset in the BIOS file
-    spd_bytes: bytes             # The 16 SPD parameter bytes (magic + config)
+    spd_bytes: bytes             # The SPD parameter bytes (magic + config, up to 128)
     module_name: str = ''        # Module part number (e.g., MT62F512M32D2DR-031)
     manufacturer: str = ''       # Manufacturer name
     density_guess: str = ''      # Estimated memory density
@@ -222,6 +317,20 @@ class SPDEntry:
     mem_type: str = 'LPDDR5'     # Memory type ('LPDDR5' or 'LPDDR5X')
     module_name_offset: int = -1 # Absolute offset in file where module name starts
     module_name_field_len: int = 0  # Byte length of the name field (for null-padding on write)
+    # Decoded SPD fields (populated by _decode_spd_fields)
+    die_density: str = ''        # Per-die density (e.g., '16Gb')
+    die_count: int = 0           # Dies per package (1, 2, 4, 8)
+    ranks: int = 0               # Number of ranks (1, 2, 4)
+    dev_width: str = ''          # Device I/O width (x8, x16, x32)
+    bus_width: int = 0           # Primary bus width in bits (16, 32, 64)
+    row_bits: int = 0            # Row address bits (14-18)
+    col_bits: int = 0            # Column address bits (9-12)
+    bank_groups: int = 0         # Number of bank groups
+    banks_per_group: int = 0     # Banks per bank group
+    tAA_ns: float = 0.0          # CAS Latency time (ns)
+    tRCD_ns: float = 0.0         # RAS-to-CAS delay (ns)
+    tRPAB_ns: float = 0.0       # Row precharge all banks (ns)
+    tRPPB_ns: float = 0.0       # Row precharge per bank (ns)
 
 
 @dataclass
@@ -424,16 +533,35 @@ def parse_spd_entries(data: bytes, apcb_offset: int, apcb_size: int) -> List[SPD
     raw_entries.sort(key=lambda x: x[0])
 
     for idx, mem_type in raw_entries:
-        spd_bytes = apcb[idx:idx+16]
+        # Read up to 128 bytes of SPD data for field decoding
+        spd_len = min(128, len(apcb) - idx)
+        spd_bytes = apcb[idx:idx + spd_len]
 
         entry = SPDEntry(
             offset_in_apcb=idx,
             offset_in_file=apcb_offset + idx,
             spd_bytes=spd_bytes,
-            byte6=spd_bytes[6],
-            byte12=spd_bytes[12],
+            byte6=spd_bytes[6] if len(spd_bytes) > 6 else 0,
+            byte12=spd_bytes[12] if len(spd_bytes) > 12 else 0,
             mem_type=mem_type,
         )
+
+        # Decode detailed SPD fields
+        fields = _decode_spd_fields(spd_bytes)
+        if fields:
+            entry.die_density = fields.get('die_density', '')
+            entry.die_count = fields.get('die_count', 0)
+            entry.ranks = fields.get('ranks', 0)
+            entry.dev_width = fields.get('dev_width', '')
+            entry.bus_width = fields.get('bus_width', 0)
+            entry.row_bits = fields.get('row_bits', 0)
+            entry.col_bits = fields.get('col_bits', 0)
+            entry.bank_groups = fields.get('bank_groups', 0)
+            entry.banks_per_group = fields.get('banks_per_group', 0)
+            entry.tAA_ns = fields.get('tAA_ns', 0.0)
+            entry.tRCD_ns = fields.get('tRCD_ns', 0.0)
+            entry.tRPAB_ns = fields.get('tRPAB_ns', 0.0)
+            entry.tRPPB_ns = fields.get('tRPPB_ns', 0.0)
 
         # Find module part number (search forward for ASCII strings)
         for j in range(idx, min(idx + 0x200, len(apcb) - 20)):
@@ -478,6 +606,14 @@ def parse_spd_entries(data: bytes, apcb_offset: int, apcb_size: int) -> List[SPD
 # ============================================================================
 # Analysis / Display
 # ============================================================================
+
+def _density_label(byte6: int, byte12: int) -> str:
+    """Return a factual density label from SPD byte values (no assumptions)."""
+    for gb, cfg in MEMORY_CONFIGS.items():
+        if cfg['byte6'] == byte6 and cfg['byte12'] == byte12:
+            return f"{gb}GB"
+    return f"Unknown (0x{byte6:02X}/0x{byte12:02X})"
+
 
 def analyze_bios(filepath: str, device: str = 'auto') -> List[APCBBlock]:
     """Analyze a BIOS file and display all APCB blocks and SPD entries.
@@ -550,33 +686,28 @@ def analyze_bios(filepath: str, device: str = 'auto') -> List[APCBBlock]:
                 type_summary.append(f"{lp5x_count} LPDDR5X")
 
             print(f"\n    SPD Entries ({len(block.spd_entries)}: {', '.join(type_summary)}):")
-            print(f"    {'-'*78}")
-            print(f"    {'#':<3} {'Type':<8} {'Module':<27} {'Density':<8} {'Mfr':<10} {'b6':<5} {'b12':<5} {'cfg':<6}")
-            print(f"    {'-'*78}")
+            print(f"    {'-'*110}")
+            print(f"    {'#':<3} {'Type':<8} {'Module':<24} {'Mfr':<9} {'Density':<7} "
+                  f"{'Dies':<5} {'Width':<6} {'Ranks':<6} "
+                  f"{'tAA':<7} {'tRCD':<7} {'tRP':<7}")
+            print(f"    {'-'*110}")
 
             for j, entry in enumerate(block.spd_entries):
-                # Highlight non-stock entries
-                marker = ''
-                if entry.byte6 == 0xB5 and entry.byte12 == 0x0A:
-                    marker = ' ** 32GB **'
-                elif entry.byte6 == 0xF5 and entry.byte12 == 0x49:
-                    marker = ' ** 64GB **'
+                entry_den = _density_label(entry.byte6, entry.byte12)
+                die_info = f"{entry.die_count}x{entry.die_density}" if entry.die_count and entry.die_density else '?'
+                tAA = f"{entry.tAA_ns}ns" if entry.tAA_ns else '?'
+                tRCD = f"{entry.tRCD_ns}ns" if entry.tRCD_ns else '?'
+                tRP = f"{entry.tRPPB_ns}ns" if entry.tRPPB_ns else '?'
 
-                print(f"    {j+1:<3} {entry.mem_type:<8} {entry.module_name:<27} {entry.density_guess:<8} "
-                      f"{entry.manufacturer:<10} 0x{entry.byte6:02X}  0x{entry.byte12:02X}  "
-                      f"0x{entry.config_id:04X}{marker}")
+                print(f"    {j+1:<3} {entry.mem_type:<8} {entry.module_name:<24} "
+                      f"{entry.manufacturer:<9} {entry_den:<7} "
+                      f"{die_info:<5} {entry.dev_width:<6} {entry.ranks}R    "
+                      f"{tAA:<7} {tRCD:<7} {tRP:<7}")
 
-            # Show current active configuration
+            # Show first-entry SPD config (factual, no assumptions)
             first = block.spd_entries[0]
-            if first.byte6 == 0x95 and first.byte12 == 0x02:
-                config = "16GB/24GB (stock)"
-            elif first.byte6 == 0xB5 and first.byte12 == 0x0A:
-                config = "32GB (modified)"
-            elif first.byte6 == 0xF5 and first.byte12 == 0x49:
-                config = "64GB (modified)"
-            else:
-                config = f"Unknown (byte6=0x{first.byte6:02X}, byte12=0x{first.byte12:02X})"
-            print(f"\n    First entry config: {config}")
+            first_den = _density_label(first.byte6, first.byte12)
+            print(f"\n    First entry SPD config: {first_den}")
     
     return blocks
 
@@ -1405,14 +1536,10 @@ def _print_welcome(state: InteractiveState):
     lp5 = sum(1 for e in state.all_entries if e.mem_type == 'LPDDR5')
     lp5x = sum(1 for e in state.all_entries if e.mem_type == 'LPDDR5X')
     types = ', '.join(filter(None, [f"{lp5} LPDDR5" if lp5 else "", f"{lp5x} LPDDR5X" if lp5x else ""]))
-    # Detect current config from first entry
+    # Detect current config from first entry (factual, no assumptions)
     cur_cfg = "Unknown"
     if state.all_entries:
         cur_cfg = _density_from_bytes(state.all_entries[0].byte6, state.all_entries[0].byte12)
-        if cur_cfg in ('16GB', '??GB'):
-            cur_cfg = "16GB/24GB (stock)"
-        else:
-            cur_cfg = f"{cur_cfg} (modified)"
 
     print(f"\n{c.HEADER}  {'='*72}")
     print(f"    APCB Memory Configuration Tool v{TOOL_VERSION} -- Interactive Mode")
@@ -1440,11 +1567,12 @@ def _print_entry_table(state: InteractiveState):
         print(f"  {c.WARN}No SPD entries found.{c.RESET}")
         return
     # Header
-    print(f"\n  {c.HEADER}{'#':<4} {'Type':<9} {'Module':<28} {'Density':<8} "
-          f"{'Mfr':<10} {'b6':<6} {'b12':<6} {'Pending'}{c.RESET}")
-    print(f"  {c.DIM}{'-'*85}{c.RESET}")
+    print(f"\n  {c.HEADER}{'#':<4} {'Type':<9} {'Module':<24} {'Mfr':<9} {'Density':<7} "
+          f"{'Dies':<8} {'Width':<6} {'Ranks':<6} {'Pending'}{c.RESET}")
+    print(f"  {c.DIM}{'-'*95}{c.RESET}")
     for i, e in enumerate(entries):
         cur_den = _density_from_bytes(e.byte6, e.byte12)
+        die_info = f"{e.die_count}x{e.die_density}" if e.die_count and e.die_density else '?'
         pending = ""
         row_color = ""
         if i in state.entry_mods:
@@ -1462,8 +1590,9 @@ def _print_entry_table(state: InteractiveState):
         sel = "*" if state.selected_entry == i else " "
         name = e.module_name or '(unnamed)'
         mfr = e.manufacturer or '?'
-        print(f"  {row_color}{sel}{i+1:<3} {e.mem_type:<9} {name:<28} {cur_den:<8} "
-              f"{mfr:<10} 0x{e.byte6:02X}  0x{e.byte12:02X}  {pending}{c.RESET}")
+        print(f"  {row_color}{sel}{i+1:<3} {e.mem_type:<9} {name:<24} "
+              f"{mfr:<9} {cur_den:<7} "
+              f"{die_info:<8} {e.dev_width:<6} {e.ranks}R    {pending}{c.RESET}")
     print()
 
 
@@ -1746,9 +1875,18 @@ def _handle_spd_command(state: InteractiveState, cmd: str, args: list):
         mod = state.entry_mods[idx]
         name = e.module_name or '(unnamed)'
         cur = _density_from_bytes(e.byte6, e.byte12)
-        print(f"\n  {c.OK}Entry {n} selected:{c.RESET} {c.VALUE}{name}{c.RESET}"
-              f" ({e.mem_type}, {e.manufacturer or '?'}, {cur})")
-        print(f"  {c.LABEL}Target: {mod.target_gb}GB{c.RESET}")
+        die_info = f"{e.die_count}x{e.die_density}" if e.die_count and e.die_density else '?'
+        print(f"\n  {c.OK}Entry {n} selected:{c.RESET} {c.VALUE}{name}{c.RESET}")
+        print(f"    {c.LABEL}Type:{c.RESET}     {e.mem_type}  ({e.manufacturer or '?'})")
+        print(f"    {c.LABEL}Density:{c.RESET}  {cur}  (b6=0x{e.byte6:02X}, b12=0x{e.byte12:02X})")
+        print(f"    {c.LABEL}Package:{c.RESET}  {die_info} dies, {e.dev_width}, {e.ranks}R")
+        if e.tAA_ns:
+            print(f"    {c.LABEL}Timings:{c.RESET}  tAA={e.tAA_ns}ns  tRCD={e.tRCD_ns}ns  "
+                  f"tRPab={e.tRPAB_ns}ns  tRPpb={e.tRPPB_ns}ns")
+        if e.row_bits:
+            print(f"    {c.LABEL}Address:{c.RESET}  {e.row_bits} rows, {e.col_bits} cols, "
+                  f"{e.bank_groups}BG x {e.banks_per_group} banks")
+        print(f"    {c.LABEL}Target:{c.RESET}   {c.PENDING}{mod.target_gb}GB{c.RESET}")
         print(f"  {c.DIM}Use SET DENSITY, SET NAME, or DESELECT.{c.RESET}")
 
     elif cmd == 'select_all':

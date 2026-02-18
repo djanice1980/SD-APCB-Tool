@@ -142,12 +142,43 @@ def detect_device(data):
     elif has_pspg_memg_c0: return 'rog_ally'
     return 'unknown'
 
+# SPD byte field constants (JEDEC SPD4.1.2.M-2 / LPDDR5 layout)
+SPD_MTB_PS = 125  # Medium Time Base in picoseconds
+_DIE_DENSITY_MAP = {0x4: '4Gb', 0xB: '6Gb', 0x5: '8Gb', 0x8: '12Gb', 0x6: '16Gb', 0x9: '24Gb', 0x7: '32Gb'}
+_DIE_COUNT_MAP = {0: 1, 1: 2, 2: 4, 3: 8}
+_DEV_WIDTH_MAP = {0: 'x4', 1: 'x8', 2: 'x16', 3: 'x32'}
+
+def _decode_spd_fields(spd):
+    """Decode LPDDR5/LPDDR5X SPD bytes into human-readable fields."""
+    if len(spd) < 29: return {}
+    b4, b5, b6, b12, b13 = spd[4], spd[5], spd[6], spd[12], spd[13]
+    return {
+        'die_density': _DIE_DENSITY_MAP.get(b4 & 0x0F, '?'),
+        'die_count': _DIE_COUNT_MAP.get((b6 >> 4) & 0x07, 0),
+        'ranks': ((b12 >> 3) & 0x07) + 1,
+        'dev_width': _DEV_WIDTH_MAP.get(b12 & 0x07, '?'),
+        'bus_width': {0: 8, 1: 16, 2: 32, 3: 64}.get(b13 & 0x07, 0),
+        'row_bits': ((b5 >> 3) & 0x07) + 12,
+        'col_bits': (b5 & 0x07) + 9,
+        'bank_groups': {0: 1, 1: 2, 2: 4}.get((b4 >> 4) & 0x03, 0),
+        'banks_per_group': {0: 4, 1: 8, 2: 16}.get((b4 >> 6) & 0x03, 0),
+        'tAA_ns': round(spd[24] * SPD_MTB_PS / 1000, 2),
+        'tRCD_ns': round(spd[26] * SPD_MTB_PS / 1000, 2),
+        'tRPAB_ns': round(spd[27] * SPD_MTB_PS / 1000, 2),
+        'tRPPB_ns': round(spd[28] * SPD_MTB_PS / 1000, 2),
+    }
+
 @dataclass
 class SPDEntry:
     offset_in_apcb: int; offset_in_file: int; spd_bytes: bytes
     module_name: str = ''; manufacturer: str = ''; density_guess: str = ''
     byte6: int = 0; byte12: int = 0; config_id: int = 0; mfr_flag: int = 0; mem_type: str = 'LPDDR5'
     module_name_offset: int = -1; module_name_field_len: int = 0
+    # Decoded SPD fields
+    die_density: str = ''; die_count: int = 0; ranks: int = 0; dev_width: str = ''
+    bus_width: int = 0; row_bits: int = 0; col_bits: int = 0
+    bank_groups: int = 0; banks_per_group: int = 0
+    tAA_ns: float = 0.0; tRCD_ns: float = 0.0; tRPAB_ns: float = 0.0; tRPPB_ns: float = 0.0
 
 @dataclass
 class APCBBlock:
@@ -209,8 +240,14 @@ def parse_spd_entries(data, apcb_offset, apcb_size):
             raw.append((idx, mt)); pos = idx + 1
     raw.sort(key=lambda x: x[0])
     for idx, mt in raw:
-        spd = apcb[idx:idx+16]
-        e = SPDEntry(idx, apcb_offset+idx, spd, byte6=spd[6], byte12=spd[12], mem_type=mt)
+        spd_len = min(128, len(apcb) - idx)
+        spd = apcb[idx:idx+spd_len]
+        e = SPDEntry(idx, apcb_offset+idx, spd, byte6=spd[6] if len(spd) > 6 else 0, byte12=spd[12] if len(spd) > 12 else 0, mem_type=mt)
+        # Decode detailed SPD fields
+        fields = _decode_spd_fields(spd)
+        if fields:
+            for k, v in fields.items():
+                if hasattr(e, k): setattr(e, k, v)
         for j in range(idx, min(idx+0x200, len(apcb)-20)):
             if apcb[j:j+3] in [b'MT6', b'K3K', b'K3L', b'SEC', b'SAM', b'H9H', b'H58']:
                 end = j
@@ -232,13 +269,11 @@ def parse_spd_entries(data, apcb_offset, apcb_size):
     return entries
 
 def detect_current_config(blocks):
+    """Return a factual density label from the first SPD entry (no assumptions)."""
     for b in blocks:
         if b.is_memg and b.spd_entries:
             e = b.spd_entries[0]
-            if e.byte6 == 0xF5 and e.byte12 == 0x49: return "64GB (modified)"
-            elif e.byte6 == 0xB5 and e.byte12 == 0x0A: return "32GB (modified)"
-            elif e.byte6 == 0x95 and e.byte12 == 0x02: return "16GB/24GB (stock)"
-            else: return f"Unknown (0x{e.byte6:02X}/0x{e.byte12:02X})"
+            return density_from_bytes(e.byte6, e.byte12)
     return "No MEMG blocks found"
 
 def density_from_bytes(byte6, byte12):
@@ -757,7 +792,7 @@ class APCBToolGUI:
         first_memg = next((b for b in self.blocks if b.is_memg and b.spd_entries), None)
         self._populate_entries(first_memg.spd_entries if first_memg else [])
         self.current_config = detect_current_config(self.blocks)
-        self.lbl_cf.configure(text=f"Config: {self.current_config}", style='Warn.TLabel' if '32GB' in self.current_config else 'Good.TLabel')
+        self.lbl_cf.configure(text=f"Config: {self.current_config}", style='Good.TLabel')
         self._log(f"Found {len(self.blocks)} blocks ({mc} MEMG, {tc} TOKN)", 'success')
         self._log(f"Config: {self.current_config}", 'cyan')
         for b in self.blocks:
@@ -767,10 +802,11 @@ class APCBToolGUI:
                 ts = ', '.join(filter(None, [f"{lp5} LPDDR5" if lp5 else "", f"{lp5x} LPDDR5X" if lp5x else ""]))
                 self._log(f"\nMEMG @ 0x{b.offset:08X} — {len(b.spd_entries)} SPD entries ({ts}), cksum {'VALID' if b.checksum_valid else 'INVALID'}", 'header')
                 for i,e in enumerate(b.spd_entries):
-                    mk = ""
-                    if e.byte6==0xF5 and e.byte12==0x49: mk = " ◄ 64GB"
-                    elif e.byte6==0xB5 and e.byte12==0x0A: mk = " ◄ 32GB"
-                    self._log(f"  [{i+1}] {e.mem_type:<8} {e.module_name or '(unnamed)':<28} {e.density_guess or '?':<6}  {e.manufacturer or '?':<8}  b6=0x{e.byte6:02X}  b12=0x{e.byte12:02X}{mk}", 'warning' if mk else 'dim')
+                    den = density_from_bytes(e.byte6, e.byte12)
+                    die_info = f"{e.die_count}x{e.die_density}" if e.die_count and e.die_density else '?'
+                    self._log(f"  [{i+1}] {e.mem_type:<8} {e.module_name or '(unnamed)':<24} {den:<6}  "
+                              f"{e.manufacturer or '?':<8}  {die_info:<8} {e.dev_width:<4} {e.ranks}R  "
+                              f"tAA={e.tAA_ns}ns tRCD={e.tRCD_ns}ns", 'dim')
                 break
         self.btn_mod.configure(state='normal'); self.btn_ana.configure(state='normal')
 
@@ -789,14 +825,19 @@ class APCBToolGUI:
             self._log(f"  Offset: 0x{block.offset:08X}  |  Size: 0x{block.data_size:04X}  |  Checksum: 0x{block.checksum_byte:02X} ({'VALID' if block.checksum_valid else 'INVALID'})",
                       'success' if block.checksum_valid else 'error')
             if block.is_memg and block.spd_entries:
-                self._log(f"\n  {'#':<4} {'Type':<8} {'Module':<28} {'Size':<7} {'Mfr':<10} {'b6':<6} {'b12':<6} {'cfg'}", 'accent')
-                self._log(f"  {'─'*72}", 'dim')
+                self._log(f"\n  {'#':<4} {'Type':<8} {'Module':<24} {'Mfr':<9} {'Density':<7} "
+                          f"{'Dies':<8} {'Width':<5} {'Ranks':<6} {'tAA':<8} {'tRCD':<8} {'tRP'}", 'accent')
+                self._log(f"  {'─'*100}", 'dim')
                 for j,e in enumerate(block.spd_entries):
-                    mk = ""
-                    if e.byte6==0xF5 and e.byte12==0x49: mk = "  ◄◄ 64GB CONFIG"
-                    elif e.byte6==0xB5 and e.byte12==0x0A: mk = "  ◄◄ 32GB CONFIG"
-                    self._log(f"  {j+1:<4} {e.mem_type:<8} {e.module_name or '—':<28} {e.density_guess or '?':<7} {e.manufacturer or '?':<10} 0x{e.byte6:02X}   0x{e.byte12:02X}   0x{e.config_id:04X}{mk}",
-                              'warning' if mk else 'info')
+                    den = density_from_bytes(e.byte6, e.byte12)
+                    die_info = f"{e.die_count}x{e.die_density}" if e.die_count and e.die_density else '?'
+                    tAA = f"{e.tAA_ns}ns" if e.tAA_ns else '?'
+                    tRCD = f"{e.tRCD_ns}ns" if e.tRCD_ns else '?'
+                    tRP = f"{e.tRPPB_ns}ns" if e.tRPPB_ns else '?'
+                    self._log(f"  {j+1:<4} {e.mem_type:<8} {e.module_name or '—':<24} "
+                              f"{e.manufacturer or '?':<9} {den:<7} "
+                              f"{die_info:<8} {e.dev_width:<5} {e.ranks}R    "
+                              f"{tAA:<8} {tRCD:<8} {tRP}", 'info')
 
     def _do_modify(self):
         if not self.loaded_data or not self.loaded_file: return
