@@ -2129,23 +2129,51 @@ Supported devices:
         interactive_modify(input_path, output_path)
 
 
+def _is_transient_window() -> bool:
+    """Detect if we're in a transient console window that will close on exit.
+
+    On Windows, double-clicking a .py file (or running via 'start python ...')
+    opens a new console window that disappears the moment the process exits.
+    We detect this by checking whether our console process is the root of its
+    console session -- if so, the window was created just for us.
+    """
+    if sys.platform != 'win32':
+        return False
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        # GetConsoleProcessList returns the number of processes attached
+        # to the current console.  If we're the only one, this is a
+        # transient window that will vanish when we exit.
+        pid_array = (ctypes.c_uint32 * 16)()
+        count = kernel32.GetConsoleProcessList(pid_array, 16)
+        return count <= 1
+    except Exception:
+        # If anything goes wrong, be safe and assume it's transient
+        # when running on Windows with no explicit subcommand
+        return len(sys.argv) <= 1
+
+
+def _pause_before_exit():
+    """Pause so the user can read output before a transient window closes."""
+    try:
+        input("\n  Press Enter to exit...")
+    except (EOFError, KeyboardInterrupt):
+        pass
+
+
 if __name__ == '__main__':
+    _transient = _is_transient_window()
     try:
         main()
     except SystemExit as e:
-        # On Windows double-click, pause so user can read errors before window closes
-        if sys.platform == 'win32' and e.code != 0:
-            try:
-                input("\n  Press Enter to exit...")
-            except (EOFError, KeyboardInterrupt):
-                pass
+        if _transient or (sys.platform == 'win32' and e.code != 0):
+            _pause_before_exit()
         raise
     except Exception as e:
         print(f"\n  ERROR: {e}")
         import traceback
         traceback.print_exc()
-        try:
-            input("\n  Press Enter to exit...")
-        except (EOFError, KeyboardInterrupt):
-            pass
+        if sys.platform == 'win32':
+            _pause_before_exit()
         sys.exit(1)
