@@ -14,7 +14,6 @@ All notable changes to the APCB Memory Mod Tool.
 - **CLI `--screen` flag** -- Batch mode screen patching: `--screen deckhd` or `--screen decksight`
 - **CLI `--deckhd` shortcut** -- Convenience alias for `--screen deckhd`
 - **No-args launch** -- Running `sd_apcb_tool.py` with no arguments prompts for file paths and enters interactive mode
-- **`run.bat` launcher** -- Windows batch file for double-click launch (window stays open)
 - **Windows transient window detection** -- Uses `GetConsoleProcessList` to detect double-clicked windows and pause before exit so output is readable
 - **`?` help shortcut** -- Type `?` at any interactive prompt to show context-sensitive help
 - **K3LK7K70BM density mapping** -- Samsung LPDDR5 16GB module now shows correct density instead of `?`

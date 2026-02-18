@@ -36,7 +36,6 @@ You can also run with no arguments at all -- the tool will prompt you for file p
 python sd_apcb_tool.py
 ```
 
-On Windows, you can also double-click `run.bat` to launch.
 
 ### CLI -- Batch Mode
 
@@ -343,7 +342,6 @@ No special setup required. Run from PowerShell or Command Prompt:
 python sd_apcb_tool.py modify my_bios.fd my_bios_mod.fd
 ```
 
-Or double-click `run.bat` to launch the interactive CLI in a window that stays open.
 
 ## How It Works
 
@@ -489,7 +487,6 @@ The GUI (`sd_apcb_gui.py`) provides the same capabilities as the CLI with a grap
 ```
 sd_apcb_tool.py    -- CLI tool (analysis, modification, interactive editor, signing)
 sd_apcb_gui.py     -- GUI application (same engine, graphical interface)
-run.bat            -- Windows launcher (double-click to start interactive CLI)
 README.md          -- This file
 CHANGELOG.md       -- Version history
 ```
