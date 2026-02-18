@@ -479,6 +479,14 @@ def parse_spd_entries(data: bytes, apcb_offset: int, apcb_size: int) -> List[SPD
 # Analysis / Display
 # ============================================================================
 
+def _density_label(byte6: int, byte12: int) -> str:
+    """Return a factual density label from SPD byte values (no assumptions)."""
+    for gb, cfg in MEMORY_CONFIGS.items():
+        if cfg['byte6'] == byte6 and cfg['byte12'] == byte12:
+            return f"{gb}GB"
+    return f"Unknown (0x{byte6:02X}/0x{byte12:02X})"
+
+
 def analyze_bios(filepath: str, device: str = 'auto') -> List[APCBBlock]:
     """Analyze a BIOS file and display all APCB blocks and SPD entries.
 
@@ -555,28 +563,17 @@ def analyze_bios(filepath: str, device: str = 'auto') -> List[APCBBlock]:
             print(f"    {'-'*78}")
 
             for j, entry in enumerate(block.spd_entries):
-                # Highlight non-stock entries
-                marker = ''
-                if entry.byte6 == 0xB5 and entry.byte12 == 0x0A:
-                    marker = ' ** 32GB **'
-                elif entry.byte6 == 0xF5 and entry.byte12 == 0x49:
-                    marker = ' ** 64GB **'
+                # Determine per-entry density from SPD bytes
+                entry_den = _density_label(entry.byte6, entry.byte12)
 
                 print(f"    {j+1:<3} {entry.mem_type:<8} {entry.module_name:<27} {entry.density_guess:<8} "
                       f"{entry.manufacturer:<10} 0x{entry.byte6:02X}  0x{entry.byte12:02X}  "
-                      f"0x{entry.config_id:04X}{marker}")
+                      f"0x{entry.config_id:04X}  [{entry_den}]")
 
-            # Show current active configuration
+            # Show first-entry SPD config (factual, no assumptions)
             first = block.spd_entries[0]
-            if first.byte6 == 0x95 and first.byte12 == 0x02:
-                config = "16GB/24GB (stock)"
-            elif first.byte6 == 0xB5 and first.byte12 == 0x0A:
-                config = "32GB (modified)"
-            elif first.byte6 == 0xF5 and first.byte12 == 0x49:
-                config = "64GB (modified)"
-            else:
-                config = f"Unknown (byte6=0x{first.byte6:02X}, byte12=0x{first.byte12:02X})"
-            print(f"\n    First entry config: {config}")
+            first_den = _density_label(first.byte6, first.byte12)
+            print(f"\n    First entry SPD config: {first_den}")
     
     return blocks
 
@@ -1405,14 +1402,10 @@ def _print_welcome(state: InteractiveState):
     lp5 = sum(1 for e in state.all_entries if e.mem_type == 'LPDDR5')
     lp5x = sum(1 for e in state.all_entries if e.mem_type == 'LPDDR5X')
     types = ', '.join(filter(None, [f"{lp5} LPDDR5" if lp5 else "", f"{lp5x} LPDDR5X" if lp5x else ""]))
-    # Detect current config from first entry
+    # Detect current config from first entry (factual, no assumptions)
     cur_cfg = "Unknown"
     if state.all_entries:
         cur_cfg = _density_from_bytes(state.all_entries[0].byte6, state.all_entries[0].byte12)
-        if cur_cfg in ('16GB', '??GB'):
-            cur_cfg = "16GB/24GB (stock)"
-        else:
-            cur_cfg = f"{cur_cfg} (modified)"
 
     print(f"\n{c.HEADER}  {'='*72}")
     print(f"    APCB Memory Configuration Tool v{TOOL_VERSION} -- Interactive Mode")
