@@ -1516,7 +1516,7 @@ def _show_help(menu: str, state: InteractiveState):
         print(f"  {c.BOLD}  MAGIC{c.RESET}         Toggle APCB magic byte modification")
         print(f"  {c.BOLD}  STATUS{c.RESET}        Show all pending changes")
         print(f"  {c.BOLD}  APPLY{c.RESET}         Write changes to output file")
-        print(f"  {c.BOLD}  HELP{c.RESET}          Show this help")
+        print(f"  {c.BOLD}  HELP / ?{c.RESET}      Show this help")
         print(f"  {c.BOLD}  EXIT{c.RESET}          Quit without writing\n")
     elif menu == 'spd':
         targets = state.device_profile.get('memory_targets', [16, 32]) if state.device_profile else [16, 32]
@@ -1529,7 +1529,7 @@ def _show_help(menu: str, state: InteractiveState):
         print(f"  {c.BOLD}  SET NAME <prefix> <suffix>{c.RESET}  Set module name (e.g. SET NAME MT6 2F1G32D4DR)")
         print(f"  {c.BOLD}  DESELECT{c.RESET}                   Remove selected entry from modifications")
         print(f"  {c.BOLD}  DESELECT ALL{c.RESET}               Clear all pending modifications")
-        print(f"  {c.BOLD}  HELP{c.RESET}                       Show this help")
+        print(f"  {c.BOLD}  HELP / ?{c.RESET}                   Show this help")
         print(f"  {c.BOLD}  BACK{c.RESET}                       Return to main menu")
         print(f"\n  {c.LABEL}Valid name prefixes:{c.RESET}")
         for pfx, desc in MODULE_NAME_PREFIXES:
@@ -1540,7 +1540,7 @@ def _show_help(menu: str, state: InteractiveState):
         print(f"  {c.BOLD}  LIST{c.RESET}              Show available screen profiles")
         print(f"  {c.BOLD}  SELECT <key>{c.RESET}      Select a screen profile")
         print(f"  {c.BOLD}  CLEAR{c.RESET}             Remove screen patch selection")
-        print(f"  {c.BOLD}  HELP{c.RESET}              Show this help")
+        print(f"  {c.BOLD}  HELP / ?{c.RESET}          Show this help")
         print(f"  {c.BOLD}  BACK{c.RESET}              Return to main menu\n")
 
 
@@ -1703,7 +1703,7 @@ def _handle_main_command(state: InteractiveState, cmd: str, args: list) -> Optio
         _print_status(state)
     elif cmd == 'apply':
         _apply_changes(state)
-    elif cmd == 'help':
+    elif cmd in ('help', '?'):
         _show_help('main', state)
     elif cmd in ('exit', 'quit', 'q'):
         return 'exit'
@@ -1849,7 +1849,7 @@ def _handle_spd_command(state: InteractiveState, cmd: str, args: list):
     elif cmd == 'status':
         _print_status(state)
 
-    elif cmd == 'help':
+    elif cmd in ('help', '?'):
         _show_help('spd', state)
 
     elif cmd in ('back', 'exit', 'quit', 'q'):
@@ -1906,7 +1906,7 @@ def _handle_screen_command(state: InteractiveState, cmd: str, args: list):
         else:
             print(f"  {c.DIM}No screen patch selected.{c.RESET}")
 
-    elif cmd == 'help':
+    elif cmd in ('help', '?'):
         _show_help('screen', state)
 
     elif cmd in ('back', 'exit', 'quit', 'q'):
