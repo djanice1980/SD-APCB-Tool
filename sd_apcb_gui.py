@@ -232,13 +232,11 @@ def parse_spd_entries(data, apcb_offset, apcb_size):
     return entries
 
 def detect_current_config(blocks):
+    """Return a factual density label from the first SPD entry (no assumptions)."""
     for b in blocks:
         if b.is_memg and b.spd_entries:
             e = b.spd_entries[0]
-            if e.byte6 == 0xF5 and e.byte12 == 0x49: return "64GB (modified)"
-            elif e.byte6 == 0xB5 and e.byte12 == 0x0A: return "32GB (modified)"
-            elif e.byte6 == 0x95 and e.byte12 == 0x02: return "16GB/24GB (stock)"
-            else: return f"Unknown (0x{e.byte6:02X}/0x{e.byte12:02X})"
+            return density_from_bytes(e.byte6, e.byte12)
     return "No MEMG blocks found"
 
 def density_from_bytes(byte6, byte12):
@@ -757,7 +755,7 @@ class APCBToolGUI:
         first_memg = next((b for b in self.blocks if b.is_memg and b.spd_entries), None)
         self._populate_entries(first_memg.spd_entries if first_memg else [])
         self.current_config = detect_current_config(self.blocks)
-        self.lbl_cf.configure(text=f"Config: {self.current_config}", style='Warn.TLabel' if '32GB' in self.current_config else 'Good.TLabel')
+        self.lbl_cf.configure(text=f"Config: {self.current_config}", style='Good.TLabel')
         self._log(f"Found {len(self.blocks)} blocks ({mc} MEMG, {tc} TOKN)", 'success')
         self._log(f"Config: {self.current_config}", 'cyan')
         for b in self.blocks:
@@ -767,10 +765,8 @@ class APCBToolGUI:
                 ts = ', '.join(filter(None, [f"{lp5} LPDDR5" if lp5 else "", f"{lp5x} LPDDR5X" if lp5x else ""]))
                 self._log(f"\nMEMG @ 0x{b.offset:08X} — {len(b.spd_entries)} SPD entries ({ts}), cksum {'VALID' if b.checksum_valid else 'INVALID'}", 'header')
                 for i,e in enumerate(b.spd_entries):
-                    mk = ""
-                    if e.byte6==0xF5 and e.byte12==0x49: mk = " ◄ 64GB"
-                    elif e.byte6==0xB5 and e.byte12==0x0A: mk = " ◄ 32GB"
-                    self._log(f"  [{i+1}] {e.mem_type:<8} {e.module_name or '(unnamed)':<28} {e.density_guess or '?':<6}  {e.manufacturer or '?':<8}  b6=0x{e.byte6:02X}  b12=0x{e.byte12:02X}{mk}", 'warning' if mk else 'dim')
+                    den = density_from_bytes(e.byte6, e.byte12)
+                    self._log(f"  [{i+1}] {e.mem_type:<8} {e.module_name or '(unnamed)':<28} {den:<6}  {e.manufacturer or '?':<8}  b6=0x{e.byte6:02X}  b12=0x{e.byte12:02X}", 'dim')
                 break
         self.btn_mod.configure(state='normal'); self.btn_ana.configure(state='normal')
 
@@ -792,11 +788,8 @@ class APCBToolGUI:
                 self._log(f"\n  {'#':<4} {'Type':<8} {'Module':<28} {'Size':<7} {'Mfr':<10} {'b6':<6} {'b12':<6} {'cfg'}", 'accent')
                 self._log(f"  {'─'*72}", 'dim')
                 for j,e in enumerate(block.spd_entries):
-                    mk = ""
-                    if e.byte6==0xF5 and e.byte12==0x49: mk = "  ◄◄ 64GB CONFIG"
-                    elif e.byte6==0xB5 and e.byte12==0x0A: mk = "  ◄◄ 32GB CONFIG"
-                    self._log(f"  {j+1:<4} {e.mem_type:<8} {e.module_name or '—':<28} {e.density_guess or '?':<7} {e.manufacturer or '?':<10} 0x{e.byte6:02X}   0x{e.byte12:02X}   0x{e.config_id:04X}{mk}",
-                              'warning' if mk else 'info')
+                    den = density_from_bytes(e.byte6, e.byte12)
+                    self._log(f"  {j+1:<4} {e.mem_type:<8} {e.module_name or '—':<28} {den:<7} {e.manufacturer or '?':<10} 0x{e.byte6:02X}   0x{e.byte12:02X}   0x{e.config_id:04X}", 'info')
 
     def _do_modify(self):
         if not self.loaded_data or not self.loaded_file: return
