@@ -448,7 +448,9 @@ def _update_ifl_flags(d):
         if idx < 0: break
         for mag, xf in _IFL_FMAP.items():
             if d[idx:idx+len(mag)] == mag:
-                d[idx + 0x0F] = xf(d[idx + 0x0F]); break
+                nf = xf(d[idx + 0x0F]); d[idx + 0x0F] = nf
+                if mag == b'_IFLASH_DRV_IMG': d[idx + 0x13] = nf  # DRV_IMG has second flag
+                break
         pos = idx + 1
 
 def _build_wc(p7):

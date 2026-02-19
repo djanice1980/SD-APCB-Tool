@@ -905,6 +905,7 @@ def _compute_authenticode_hash(data):
 _IFLASH_BIOSCER_MAGIC = b'_IFLASH_BIOSCER'
 _IFLASH_BIOSCR2_MAGIC = b'_IFLASH_BIOSCR2'
 _IFLASH_FLAGS_OFFSET = 0x0F           # Validation mode flag byte
+_IFLASH_DRV_FLAGS2_OFFSET = 0x13     # DRV_IMG has a second flag byte here
 _IFLASH_BIOSCER_HASH_OFFSET = 0x18   # 32-byte SHA-256 hash starts here
 _IFLASH_BIOSCR2_CERT_OFFSET = 0x1F   # WIN_CERTIFICATE starts here
 
@@ -968,6 +969,10 @@ def _update_iflash_flags(data):
                 if old_flag != new_flag:
                     data[idx + _IFLASH_FLAGS_OFFSET] = new_flag
                     updated.append((idx, magic.decode(), old_flag, new_flag))
+                # DRV_IMG has a second flag byte at +0x13 that DeckHD also
+                # sets to the same value as the new primary flag at +0x0F.
+                if magic == b'_IFLASH_DRV_IMG':
+                    data[idx + _IFLASH_DRV_FLAGS2_OFFSET] = new_flag
                 break
         pos = idx + 1
     return updated
