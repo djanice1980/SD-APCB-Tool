@@ -7,7 +7,7 @@ All notable changes to the APCB Memory Mod Tool.
 ### Fixed
 - **3-layer firmware signing for h2offt** -- Steam Deck firmware has three integrity layers that all must be updated for h2offt to accept modified firmware. Previous versions only handled layer 3 (PE Authenticode). Analysis of DeckHD's firmware (CN="QA Certificate.") confirmed h2offt does not check certificate identity:
   - **`_IFLASH` flags bytes** -- All 6 `_IFLASH` structures in the firmware have a flags byte at offset `+0x0F` that controls h2offt's validation mode. DeckHD modifies 5 of 6 flags (verified across 3 firmware versions). Our code now applies the same per-structure transformations: `_IFLASH_DRV_IMG` (`0x80→0x88`), `_IFLASH_BIOSIMG` 2nd (`0x20→0x08`), `_IFLASH_INI_IMG` (`0x80→0x68`), `_IFLASH_BIOSCER` (`0x20→0x08`), `_IFLASH_BIOSCR2` (`0x20→0x08`). The 1st `_IFLASH_BIOSIMG` (`0x00`) is left unchanged.
-  - **`_IFLASH_BIOSCER` (layer 1)** -- Internal SHA-256 hash at firmware body offset. Now recomputed after APCB modification.
+  - **`_IFLASH_BIOSCER` (layer 1)** -- Internal hash at firmware body offset. Hash algorithm is proprietary and unknown; hash is now preserved from stock firmware instead of being recomputed (diagnostic testing confirmed no SHA-256 candidate matched DeckHD's stored hash).
   - **`_IFLASH_BIOSCR2` (layer 2)** -- Internal Authenticode signature (WIN_CERTIFICATE/PKCS#7) embedded in firmware body. Now re-signed with our self-signed certificate. Firmware body resized to maintain layout invariant: `SizeOfImage == SecDir VA == BIOSCR2 WC end` (zero gap between BIOSCR2 and PE cert). Uses the full BIOSCR2 slot size (cert offset to SizeOfImage) rather than the WIN_CERTIFICATE `dwLength` field, which correctly handles OLED firmware that has zero-padding between the BIOSCR2 WC and the PE cert. DeckHD follows the same zero-gap invariant.
   - **PE Security Directory (layer 3)** -- Standard PE Authenticode. Recomputed last so it covers the updated layers 1 and 2.
 - **PE Authenticode signing rewritten** -- Fixed 4 bugs that caused h2offt to reject custom-signed firmware:
@@ -15,11 +15,15 @@ All notable changes to the APCB Memory Mod Tool.
   - **SpcSpOpusInfo encoding** -- Was putting an OID inside the structure; should be an empty SEQUENCE per Authenticode spec.
   - **SPC value EXPLICIT tag** -- Missing `[0] EXPLICIT` wrapper on `SpcAttributeTypeAndOptionalValue.value` field.
   - **PE hash algorithm** -- Replaced linear hash with proper section-based Authenticode hashing (headers, sections sorted by PointerToRawData, trailing data). Produces identical results for contiguous firmware but is now spec-compliant for all PE layouts.
+- **PKCS#7 structure matched to DeckHD** -- ASN.1 comparison of our PKCS#7 output vs DeckHD's revealed structural encoding differences causing h2offt rejection:
+  - **SPC_PE_IMAGE_DATA encoding** -- Our BIT STRING had 2 bytes (`00 00`), DeckHD uses 1 byte (`00`). Our SpcLink was 28 zero bytes, DeckHD uses an empty `[0] PRIMITIVE`. We also had an extra `[0] EXPLICIT` wrapper around the SPC value that DeckHD omits.
+  - **Authenticated attributes** -- We included 4 attributes (contentType, signingTime, opusInfo, messageDigest) in arbitrary order. DeckHD uses only 3 (opusInfo, contentType, messageDigest — no signingTime), DER-sorted by raw byte value as required for SET OF encoding.
+  - **BIOSCER hash preserved** -- Diagnostic testing of 15+ SHA-256 candidates (various regions, zeroing strategies) found zero matches with DeckHD's stored BIOSCER hash. The algorithm is proprietary, so we now preserve the original hash bytes instead of overwriting them.
 - **Signing self-check** -- After signing, the tool re-computes the Authenticode hash on the output and verifies it matches, catching any future regressions.
 
 ### Technical Notes
 - The v1.2.0 "hardware-verified" claim was a false positive: flashing the same BIOS version provided no visible way to confirm the flash actually took effect. Testing with a different version (F7G0110 onto F7G0112) confirmed the old signing never worked.
-- Signing order of operations: strip old PE cert → generate RSA-2048 self-signed cert → set flags to 0x08 → update BIOSCER hash → re-sign BIOSCR2 → compute PE Authenticode hash → build PE PKCS#7 → append WIN_CERTIFICATE → PE checksum → self-check.
+- Signing order of operations: strip old PE cert → generate RSA-2048 self-signed cert → set flags → preserve BIOSCER hash → re-sign BIOSCR2 → compute PE Authenticode hash → build PE PKCS#7 → append WIN_CERTIFICATE → PE checksum → self-check.
 - `_find_iflash_structures()` scans for `_IFLASH_BIOSCER` and `_IFLASH_BIOSCR2` magic bytes. Only Steam Deck `.fd` files have these; ROG Ally firmware uses SPI flash (no signing needed).
 - `_build_win_certificate()` extracted as helper for building 8-byte-aligned WIN_CERTIFICATE from PKCS#7 blob (used for both BIOSCR2 and PE cert).
 - `_build_pkcs7()` extracted as reusable PKCS#7 builder (used for both BIOSCR2 and PE cert).

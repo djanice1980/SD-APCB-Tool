@@ -461,13 +461,16 @@ def _build_p7(ph, cd, k, now):
     from cryptography.hazmat.primitives.asymmetric import padding as P
     from cryptography import x509 as X
     cert = X.load_der_x509_certificate(cd)
-    sf = _dt(0x03, b'\x00\x00'); sl = _dc(0, b'\x00'*28, False); spd = _ds(sf+_dc(0, _dc(2, sl)))
-    sa = _ds(_doid(_SPE)+_dc(0, spd)); da = _ds(_doid(_S256)+_dn()); di = _ds(da+_do(ph))
+    # SPC_PE_IMAGE_DATA: BIT STRING(1B) + empty SpcLink, matching DeckHD encoding
+    sf = _dt(0x03, b'\x00'); sl = _dc(0, b'', False); spd = _ds(sf+_dc(0, _dc(2, sl)))
+    sa = _ds(_doid(_SPE)+spd); da = _ds(_doid(_S256)+_dn()); di = _ds(da+_do(ph))
     spc_inner = sa+di; spc = _ds(spc_inner)
     ci = _ds(_doid(_SID)+_dc(0, spc)); s256a = _ds(_doid(_S256)+_dn())
-    ac = _ds(_doid(_CT)+_dset(_doid(_SID))); at = _ds(_doid(_ST)+_dset(_dut(now)))
+    # Auth attrs: opusInfo, contentType, messageDigest (no signingTime, DER-sorted)
+    ac = _ds(_doid(_CT)+_dset(_doid(_SID)))
     ao = _ds(_doid(_SOP)+_dset(_ds(b''))); ch = hashlib.sha256(spc_inner).digest()
-    am = _ds(_doid(_MD)+_dset(_do(ch))); aa = ac+at+ao+am
+    am = _ds(_doid(_MD)+_dset(_do(ch)))
+    aa = b''.join(sorted([ao, ac, am], key=lambda x: x))
     sig = k.sign(_dset(aa), P.PKCS1v15(), H.SHA256())
     ias = _ds(cert.issuer.public_bytes()+_dint(cert.serial_number))
     ra = _ds(_doid(_RSA)+_dn())
@@ -538,8 +541,7 @@ def sign_firmware(data_in):
         # 2b: Get original BIOSCR2 slot size (full slot to SizeOfImage, not just WC len)
         cr2co = bcr2 + _IFLASH_CC
         old_cr2_slot = len(d) - cr2co
-        # 2b: Update BIOSCER hash (SHA-256 of content up to BIOSCER)
-        d[bcer+_IFLASH_CH:bcer+_IFLASH_CH+32] = hashlib.sha256(bytes(d[:bcer])).digest()
+        # 2b: Preserve BIOSCER hash (proprietary algorithm, leave untouched)
         # 2c: Re-sign BIOSCR2 with our cert
         bd = bytearray(d)
         struct.pack_into('<I', bd, so, 0); struct.pack_into('<I', bd, so+4, 0); struct.pack_into('<I', bd, co, 0)
