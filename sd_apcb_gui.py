@@ -430,6 +430,36 @@ _P7='1.2.840.113549.1.7.2'; _SID='1.3.6.1.4.1.311.2.1.4'; _SPE='1.3.6.1.4.1.311.
 _SOP='1.3.6.1.4.1.311.2.1.12'; _MIC='1.3.6.1.4.1.311.2.1.21'
 _S256='2.16.840.1.101.3.4.2.1'; _RSA='1.2.840.113549.1.1.1'
 _CT='1.2.840.113549.1.9.3'; _ST='1.2.840.113549.1.9.5'; _MD='1.2.840.113549.1.9.4'
+_IFLASH_CER=b'_IFLASH_BIOSCER'; _IFLASH_CR2=b'_IFLASH_BIOSCR2'; _IFLASH_CH=0x18; _IFLASH_CC=0x1F
+
+def _find_iflash(data):
+    """Find _IFLASH_BIOSCER and _IFLASH_BIOSCR2 offsets in firmware."""
+    a, b = data.find(_IFLASH_CER), data.find(_IFLASH_CR2)
+    return (a, b) if a >= 0 and b >= 0 else (None, None)
+
+def _build_wc(p7):
+    """Build WIN_CERTIFICATE from PKCS#7 blob (8-byte aligned)."""
+    wl = (8+len(p7)+7)&~7; wc = struct.pack('<IHH', wl, 0x0200, 0x0002)+p7+b'\x00'*(wl-8-len(p7)); return wc
+
+def _build_p7(ph, cd, k, now):
+    """Build complete PKCS#7 SignedData for Authenticode."""
+    from cryptography.hazmat.primitives import hashes as H
+    from cryptography.hazmat.primitives.asymmetric import padding as P
+    from cryptography import x509 as X
+    cert = X.load_der_x509_certificate(cd)
+    sf = _dt(0x03, b'\x00\x00'); sl = _dc(0, b'\x00'*28, False); spd = _ds(sf+_dc(0, _dc(2, sl)))
+    sa = _ds(_doid(_SPE)+_dc(0, spd)); da = _ds(_doid(_S256)+_dn()); di = _ds(da+_do(ph))
+    spc_inner = sa+di; spc = _ds(spc_inner)
+    ci = _ds(_doid(_SID)+_dc(0, spc)); s256a = _ds(_doid(_S256)+_dn())
+    ac = _ds(_doid(_CT)+_dset(_doid(_SID))); at = _ds(_doid(_ST)+_dset(_dut(now)))
+    ao = _ds(_doid(_SOP)+_dset(_ds(b''))); ch = hashlib.sha256(spc_inner).digest()
+    am = _ds(_doid(_MD)+_dset(_do(ch))); aa = ac+at+ao+am
+    sig = k.sign(_dset(aa), P.PKCS1v15(), H.SHA256())
+    ias = _ds(cert.issuer.public_bytes()+_dint(cert.serial_number))
+    ra = _ds(_doid(_RSA)+_dn())
+    si = _ds(_dint(1)+ias+s256a+_dc(0,aa)+ra+_do(sig))
+    sd = _ds(_dint(1)+_dset(s256a)+ci+_dc(0,cd)+_dset(si))
+    return _ds(_doid(_P7)+_dc(0, sd))
 
 def _pe_cksum(data):
     po = struct.unpack_from('<I', data, 0x3C)[0]; co = po+4+20+64
@@ -468,8 +498,9 @@ def _auth_hash(data):
     return h.digest()
 
 def sign_firmware(data_in):
+    """Sign PE firmware with 3-layer integrity (BIOSCER hash + BIOSCR2 cert + PE Authenticode)."""
     from cryptography.hazmat.primitives import hashes as H
-    from cryptography.hazmat.primitives.asymmetric import rsa as R, padding as P
+    from cryptography.hazmat.primitives.asymmetric import rsa as R
     from cryptography.x509 import CertificateBuilder as CB, Name, NameAttribute, NameOID, random_serial_number
     from cryptography.hazmat.primitives.serialization import Encoding
     d = bytearray(data_in)
@@ -477,39 +508,44 @@ def sign_firmware(data_in):
     po = struct.unpack_from('<I', d, 0x3C)[0]; os_ = po+4+20
     m = struct.unpack_from('<H', d, os_)[0]; co = os_+64
     dd = os_+(112 if m == 0x20B else 96); so = dd+32
+    # Step 1: Strip existing PE cert
     ov = struct.unpack_from('<I', d, so)[0]
     if ov > 0 and ov < len(d): d = d[:ov]
-    struct.pack_into('<I', d, so, 0); struct.pack_into('<I', d, so+4, 0); struct.pack_into('<I', d, co, 0)
-    # Bug 1 fix: section-based Authenticode hash
-    ph = _auth_hash(bytes(d))
+    # Generate self-signed cert (shared by BIOSCR2 + PE cert)
     k = R.generate_private_key(65537, 2048); now = datetime.datetime.now(datetime.timezone.utc)
     subj = Name([NameAttribute(NameOID.COMMON_NAME, "SD APCB Tool")])
     cert = CB().subject_name(subj).issuer_name(subj).public_key(k.public_key()).serial_number(random_serial_number()).not_valid_before(now).not_valid_after(now+datetime.timedelta(days=3650)).sign(k, H.SHA256())
     cd = cert.public_bytes(Encoding.DER)
-    # Build SPC — Bug 4 fix: [0] EXPLICIT on value
-    sf = _dt(0x03, b'\x00\x00'); sl = _dc(0, b'\x00'*28, False); spd = _ds(sf+_dc(0, _dc(2, sl)))
-    sa = _ds(_doid(_SPE)+_dc(0, spd)); da = _ds(_doid(_S256)+_dn()); di = _ds(da+_do(ph))
-    spc_inner = sa+di; spc = _ds(spc_inner)
-    ci = _ds(_doid(_SID)+_dc(0, spc)); s256a = _ds(_doid(_S256)+_dn())
-    # Auth attrs — Bug 2 fix: hash inner content only; Bug 3 fix: empty SpcSpOpusInfo
-    ac = _ds(_doid(_CT)+_dset(_doid(_SID))); at = _ds(_doid(_ST)+_dset(_dut(now)))
-    ao = _ds(_doid(_SOP)+_dset(_ds(b''))); ch = hashlib.sha256(spc_inner).digest()
-    am = _ds(_doid(_MD)+_dset(_do(ch))); aa = ac+at+ao+am
-    sig = k.sign(_dset(aa), P.PKCS1v15(), H.SHA256())
-    ias = _ds(cert.issuer.public_bytes()+_dint(cert.serial_number))
-    ra = _ds(_doid(_RSA)+_dn())
-    si = _ds(_dint(1)+ias+s256a+_dc(0,aa)+ra+_do(sig))
-    sd = _ds(_dint(1)+_dset(s256a)+ci+_dc(0,cd)+_dset(si))
-    p7 = _ds(_doid(_P7)+_dc(0, sd))
-    wl = (8+len(p7)+7)&~7; wc = struct.pack('<IHH', wl, 0x0200, 0x0002)+p7+b'\x00'*(wl-8-len(p7))
-    ct = len(d)
-    struct.pack_into('<I', d, so, ct); struct.pack_into('<I', d, so+4, wl)
+    # Step 2: Handle _IFLASH internal integrity structures
+    bcer, bcr2 = _find_iflash(bytes(d))
+    if bcer is not None and bcr2 is not None:
+        # 2a: Get original BIOSCR2 slot size
+        cr2co = bcr2 + _IFLASH_CC
+        old_cr2_len = struct.unpack_from('<I', d, cr2co)[0]
+        # 2b: Update BIOSCER hash (SHA-256 of content up to BIOSCER)
+        d[bcer+_IFLASH_CH:bcer+_IFLASH_CH+32] = hashlib.sha256(bytes(d[:bcer])).digest()
+        # 2c: Re-sign BIOSCR2 with our cert
+        bd = bytearray(d)
+        struct.pack_into('<I', bd, so, 0); struct.pack_into('<I', bd, so+4, 0); struct.pack_into('<I', bd, co, 0)
+        cr2_p7 = _build_p7(_auth_hash(bytes(bd)), cd, k, now)
+        cr2_wc = _build_wc(cr2_p7)
+        if len(cr2_wc) <= old_cr2_len:
+            padded = cr2_wc + b'\x00' * (old_cr2_len - len(cr2_wc))
+            d[cr2co:cr2co + old_cr2_len] = padded
+        else:
+            d[cr2co:cr2co + old_cr2_len] = cr2_wc[:old_cr2_len]
+    # Step 3: Clear PE header fields
+    struct.pack_into('<I', d, so, 0); struct.pack_into('<I', d, so+4, 0); struct.pack_into('<I', d, co, 0)
+    # Step 4: Compute PE Authenticode hash (includes updated BIOSCER + BIOSCR2)
+    ph = _auth_hash(bytes(d))
+    # Step 5: Build PE PKCS#7 and append WIN_CERTIFICATE
+    p7 = _build_p7(ph, cd, k, now); wc = _build_wc(p7); ct = len(d)
+    struct.pack_into('<I', d, so, ct); struct.pack_into('<I', d, so+4, len(wc))
     d.extend(wc); ck = _pe_cksum(bytes(d)); struct.pack_into('<I', d, co, ck)
     # Self-check
     vd = bytearray(d[:ct])
     struct.pack_into('<I', vd, so, 0); struct.pack_into('<I', vd, so+4, 0); struct.pack_into('<I', vd, co, 0)
-    vh = _auth_hash(bytes(vd))
-    if vh != ph: raise RuntimeError(f"Signing self-check FAILED: hash mismatch")
+    if _auth_hash(bytes(vd)) != ph: raise RuntimeError("Signing self-check FAILED: hash mismatch")
     return bytes(d)
 
 # ── GUI ──
