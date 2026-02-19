@@ -834,28 +834,112 @@ def _compute_pe_checksum(data):
     return (checksum + len(data)) & 0xFFFFFFFF
 
 
+def _compute_authenticode_hash(data):
+    """Compute the Authenticode PE hash per Microsoft's specification.
+
+    The Authenticode hash covers the PE file in a specific order:
+    1. Headers from 0 to SizeOfHeaders, skipping checksum and security dir entry
+    2. Each PE section body, sorted by PointerToRawData
+    3. Any trailing data between the last section and the certificate table
+
+    Args:
+        data: PE file bytes (with security directory already cleared to zero
+              and checksum field zeroed).
+
+    Returns:
+        SHA-256 digest bytes.
+    """
+    pe_offset = struct.unpack_from('<I', data, 0x3C)[0]
+    coff_start = pe_offset + 4
+    num_sections = struct.unpack_from('<H', data, coff_start + 2)[0]
+    opt_header_size = struct.unpack_from('<H', data, coff_start + 16)[0]
+
+    opt_start = coff_start + 20
+    magic = struct.unpack_from('<H', data, opt_start)[0]
+    checksum_offset = opt_start + 64
+    dd_start = opt_start + (112 if magic == 0x20B else 96)
+    secdir_offset = dd_start + 32  # Security directory is data directory index 4
+
+    # SizeOfHeaders from optional header (offset 60 for both PE32 and PE32+)
+    size_of_headers = struct.unpack_from('<I', data, opt_start + 60)[0]
+
+    # Section table starts immediately after the optional header
+    section_table_offset = opt_start + opt_header_size
+
+    h = hashlib.sha256()
+
+    # Step 1: Hash headers from 0 to SizeOfHeaders, skipping checksum (4 bytes)
+    # and security directory entry (8 bytes)
+    h.update(data[:checksum_offset])
+    h.update(data[checksum_offset + 4:secdir_offset])
+    h.update(data[secdir_offset + 8:size_of_headers])
+
+    # Step 2: Hash PE sections sorted by PointerToRawData
+    sections = []
+    for i in range(num_sections):
+        sec_off = section_table_offset + i * 40
+        raw_size = struct.unpack_from('<I', data, sec_off + 16)[0]
+        raw_ptr = struct.unpack_from('<I', data, sec_off + 20)[0]
+        if raw_size > 0:
+            sections.append((raw_ptr, raw_size))
+    sections.sort(key=lambda s: s[0])
+
+    sum_of_bytes_hashed = size_of_headers
+    for ptr, size in sections:
+        h.update(data[ptr:ptr + size])
+        end = ptr + size
+        if end > sum_of_bytes_hashed:
+            sum_of_bytes_hashed = end
+
+    # Step 3: Hash any trailing data after the last section
+    # (between sum_of_bytes_hashed and the certificate table / end of file)
+    file_end = len(data)
+    if sum_of_bytes_hashed < file_end:
+        h.update(data[sum_of_bytes_hashed:file_end])
+
+    return h.digest()
+
+
 def _build_spc_indirect_data(pe_hash):
-    """Build the SPC_INDIRECT_DATA_CONTENT structure."""
+    """Build the SPC_INDIRECT_DATA_CONTENT structure.
+
+    Returns (full_der, inner_content) where inner_content is the raw content
+    octets without the outer SEQUENCE tag/length, needed for messageDigest.
+    """
     spc_flags = _der_tag(0x03, bytes([0x00, 0x00]))
     spc_link = _der_context(0, b'\x00' * 28, constructed=False)
     spc_file = _der_context(2, spc_link)
     spc_pe_data = _der_sequence(spc_flags + _der_context(0, spc_file))
-    spc_attr = _der_sequence(_der_oid(_OID_SPC_PE_IMAGE_DATA) + spc_pe_data)
+    # Bug 4 fix: wrap value in [0] EXPLICIT per Authenticode spec
+    spc_attr = _der_sequence(
+        _der_oid(_OID_SPC_PE_IMAGE_DATA) + _der_context(0, spc_pe_data))
     digest_algo = _der_sequence(_der_oid(_OID_SHA256) + _der_null())
     digest_info = _der_sequence(digest_algo + _der_octet_string(pe_hash))
-    return _der_sequence(spc_attr + digest_info)
+    inner_content = spc_attr + digest_info
+    return _der_sequence(inner_content), inner_content
 
 
-def _build_auth_attrs(spc_content_der, signing_time):
-    """Build authenticated attributes for signer info."""
+def _build_auth_attrs(spc_inner_content, signing_time):
+    """Build authenticated attributes for signer info.
+
+    Args:
+        spc_inner_content: The raw content octets of SPC_INDIRECT_DATA_CONTENT
+            (without the outer SEQUENCE tag/length). Per RFC 2315 Section 9.3,
+            the messageDigest is computed over these content octets only.
+        signing_time: UTC datetime for the signingTime attribute.
+    """
     attr_ct = _der_sequence(
         _der_oid(_OID_CONTENT_TYPE) + _der_set(_der_oid(_OID_SPC_INDIRECT_DATA)))
     attr_st = _der_sequence(
         _der_oid(_OID_SIGNING_TIME) + _der_set(_der_utctime(signing_time)))
+    # Bug 3 fix: SpcSpOpusInfo should be an empty SEQUENCE when no
+    # programName or moreInfo is specified
     attr_opus = _der_sequence(
         _der_oid(_OID_SPC_SP_OPUS_INFO) +
-        _der_set(_der_sequence(_der_oid(_OID_MS_IND_CODE_SIGN))))
-    content_hash = hashlib.sha256(spc_content_der).digest()
+        _der_set(_der_sequence(b'')))
+    # Bug 2 fix: hash the content octets only (without SEQUENCE tag/length),
+    # per RFC 2315 Section 9.3
+    content_hash = hashlib.sha256(spc_inner_content).digest()
     attr_md = _der_sequence(
         _der_oid(_OID_MESSAGE_DIGEST) + _der_set(_der_octet_string(content_hash)))
     return attr_ct + attr_st + attr_opus + attr_md
@@ -871,14 +955,14 @@ def _build_pkcs7(pe_hash, cert_der, private_key, signing_time):
     serial = cert.serial_number
     issuer_der = cert.issuer.public_bytes()
 
-    spc_content = _build_spc_indirect_data(pe_hash)
+    spc_content, spc_inner = _build_spc_indirect_data(pe_hash)
     content_info = _der_sequence(
         _der_oid(_OID_SPC_INDIRECT_DATA) + _der_context(0, spc_content))
     sha256_algo = _der_sequence(_der_oid(_OID_SHA256) + _der_null())
     digest_algos = _der_set(sha256_algo)
     certificates = _der_context(0, cert_der)
 
-    auth_attrs_content = _build_auth_attrs(spc_content, signing_time)
+    auth_attrs_content = _build_auth_attrs(spc_inner, signing_time)
     attrs_for_signing = _der_set(auth_attrs_content)
     signature = private_key.sign(attrs_for_signing, _padding.PKCS1v15(), _hashes.SHA256())
 
@@ -942,12 +1026,8 @@ def sign_firmware(data_in):
     struct.pack_into('<I', data, secdir_offset + 4, 0)
     struct.pack_into('<I', data, checksum_offset, 0)
 
-    # Compute Authenticode hash (excluding checksum, secdir entry, cert table)
-    h = hashlib.sha256()
-    h.update(bytes(data[:checksum_offset]))
-    h.update(bytes(data[checksum_offset + 4:secdir_offset]))
-    h.update(bytes(data[secdir_offset + 8:]))
-    pe_hash = h.digest()
+    # Compute Authenticode hash using proper section-based algorithm
+    pe_hash = _compute_authenticode_hash(bytes(data))
 
     # Generate self-signed certificate
     key = _rsa.generate_private_key(public_exponent=65537, key_size=2048)
@@ -981,6 +1061,18 @@ def sign_firmware(data_in):
     # Compute and write PE checksum
     checksum = _compute_pe_checksum(bytes(data))
     struct.pack_into('<I', data, checksum_offset, checksum)
+
+    # Self-check: verify the Authenticode hash matches what we signed
+    # Strip the signature we just appended, clear fields, and recompute
+    verify_data = bytearray(data[:cert_offset])
+    struct.pack_into('<I', verify_data, secdir_offset, 0)
+    struct.pack_into('<I', verify_data, secdir_offset + 4, 0)
+    struct.pack_into('<I', verify_data, checksum_offset, 0)
+    verify_hash = _compute_authenticode_hash(bytes(verify_data))
+    if verify_hash != pe_hash:
+        raise RuntimeError(
+            "Signing self-check FAILED: Authenticode hash mismatch. "
+            f"Expected {pe_hash.hex()}, got {verify_hash.hex()}")
 
     return bytes(data)
 
