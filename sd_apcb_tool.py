@@ -976,16 +976,23 @@ def _update_iflash_flags(data):
 def _build_spc_indirect_data(pe_hash):
     """Build the SPC_INDIRECT_DATA_CONTENT structure.
 
+    Matches DeckHD's encoding:
+      SpcIndirectDataContent ::= SEQUENCE {
+        data  SpcAttributeTypeAndOptionalValue,   -- OID + SEQUENCE{BIT STRING, [0]{[2]{[0]}}}
+        messageImprint  DigestInfo               -- AlgorithmIdentifier + OCTET STRING
+      }
+
     Returns (full_der, inner_content) where inner_content is the raw content
     octets without the outer SEQUENCE tag/length, needed for messageDigest.
     """
-    spc_flags = _der_tag(0x03, bytes([0x00, 0x00]))
-    spc_link = _der_context(0, b'\x00' * 28, constructed=False)
-    spc_file = _der_context(2, spc_link)
+    # SpcPeImageData: BIT STRING (just unused-bits byte) + SpcLink (empty)
+    # DeckHD uses: BITS len=1 [00], [0](A0) len=4 { [2](A2) len=2 { [0](80) len=0 } }
+    spc_flags = _der_tag(0x03, bytes([0x00]))  # BIT STRING: 0 unused bits, no flags
+    spc_link = _der_context(0, b'', constructed=False)  # [0] PRIMITIVE empty
+    spc_file = _der_context(2, spc_link)  # [2] CONSTRUCTED { [0] empty }
     spc_pe_data = _der_sequence(spc_flags + _der_context(0, spc_file))
-    # Bug 4 fix: wrap value in [0] EXPLICIT per Authenticode spec
-    spc_attr = _der_sequence(
-        _der_oid(_OID_SPC_PE_IMAGE_DATA) + _der_context(0, spc_pe_data))
+    # DeckHD wraps the value in the SPC_ATTR as a direct SEQUENCE, not [0] EXPLICIT
+    spc_attr = _der_sequence(_der_oid(_OID_SPC_PE_IMAGE_DATA) + spc_pe_data)
     digest_algo = _der_sequence(_der_oid(_OID_SHA256) + _der_null())
     digest_info = _der_sequence(digest_algo + _der_octet_string(pe_hash))
     inner_content = spc_attr + digest_info
@@ -995,27 +1002,32 @@ def _build_spc_indirect_data(pe_hash):
 def _build_auth_attrs(spc_inner_content, signing_time):
     """Build authenticated attributes for signer info.
 
+    Matches DeckHD's encoding: opusInfo, contentType, messageDigest.
+    DeckHD omits signingTime. Attributes are DER-sorted (as required for
+    SET OF in DER encoding).
+
     Args:
         spc_inner_content: The raw content octets of SPC_INDIRECT_DATA_CONTENT
             (without the outer SEQUENCE tag/length). Per RFC 2315 Section 9.3,
             the messageDigest is computed over these content octets only.
-        signing_time: UTC datetime for the signingTime attribute.
+        signing_time: UTC datetime (unused — DeckHD omits signingTime).
     """
-    attr_ct = _der_sequence(
-        _der_oid(_OID_CONTENT_TYPE) + _der_set(_der_oid(_OID_SPC_INDIRECT_DATA)))
-    attr_st = _der_sequence(
-        _der_oid(_OID_SIGNING_TIME) + _der_set(_der_utctime(signing_time)))
-    # Bug 3 fix: SpcSpOpusInfo should be an empty SEQUENCE when no
-    # programName or moreInfo is specified
+    # SpcSpOpusInfo: empty SEQUENCE (no programName or moreInfo)
     attr_opus = _der_sequence(
         _der_oid(_OID_SPC_SP_OPUS_INFO) +
         _der_set(_der_sequence(b'')))
-    # Bug 2 fix: hash the content octets only (without SEQUENCE tag/length),
-    # per RFC 2315 Section 9.3
+    # contentType: SPC_INDIRECT_DATA OID
+    attr_ct = _der_sequence(
+        _der_oid(_OID_CONTENT_TYPE) + _der_set(_der_oid(_OID_SPC_INDIRECT_DATA)))
+    # messageDigest: SHA-256 of SPC content octets only (per RFC 2315 Section 9.3)
     content_hash = hashlib.sha256(spc_inner_content).digest()
     attr_md = _der_sequence(
         _der_oid(_OID_MESSAGE_DIGEST) + _der_set(_der_octet_string(content_hash)))
-    return attr_ct + attr_st + attr_opus + attr_md
+    # DER SET OF encoding requires elements sorted by their DER encoding.
+    # DeckHD's order: opusInfo, contentType, messageDigest
+    # Sort by raw DER bytes to ensure correct ordering.
+    attrs = sorted([attr_opus, attr_ct, attr_md], key=lambda x: x)
+    return b''.join(attrs)
 
 
 def _build_pkcs7(pe_hash, cert_der, private_key, signing_time):
@@ -1067,7 +1079,7 @@ def sign_firmware(data_in):
     Sign a PE firmware file with a fresh self-signed certificate.
 
     Handles three integrity layers present in Steam Deck firmware:
-    1. _IFLASH_BIOSCER: Internal SHA-256 hash (updated with placeholder)
+    1. _IFLASH_BIOSCER: Internal hash (preserved — algorithm is proprietary)
     2. _IFLASH_BIOSCR2: Internal Authenticode signature (re-signed with our cert)
     3. PE Security Directory: Standard PE Authenticode (re-signed with our cert)
 
@@ -1137,11 +1149,9 @@ def sign_firmware(data_in):
         bioscr2_cert_off = bioscr2_off + _IFLASH_BIOSCR2_CERT_OFFSET
         old_bioscr2_slot = len(data) - bioscr2_cert_off
 
-        # 2c: Update _IFLASH_BIOSCER hash with SHA-256 of firmware content
-        # up to the BIOSCER structure (placeholder — exact algorithm is proprietary)
-        bioscer_hash_off = bioscer_off + _IFLASH_BIOSCER_HASH_OFFSET
-        content_hash = hashlib.sha256(bytes(data[:bioscer_off])).digest()
-        data[bioscer_hash_off:bioscer_hash_off + 32] = content_hash
+        # 2c: Preserve _IFLASH_BIOSCER hash — the hash algorithm is proprietary
+        # and unknown, so we leave the original hash bytes untouched.  DeckHD
+        # also preserves the stock BIOSCER hash when it re-signs firmware.
 
         # 2d: Re-sign _IFLASH_BIOSCR2 with our self-signed certificate
         # Build a PKCS#7 signature for the BIOSCR2 slot using the same
