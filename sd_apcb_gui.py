@@ -535,9 +535,9 @@ def sign_firmware(data_in):
     if bcer is not None and bcr2 is not None:
         # 2a: Update ALL _IFLASH flags to QA mode (DeckHD pattern)
         _update_ifl_flags(d)
-        # 2b: Get original BIOSCR2 slot size
+        # 2b: Get original BIOSCR2 slot size (full slot to SizeOfImage, not just WC len)
         cr2co = bcr2 + _IFLASH_CC
-        old_cr2_len = struct.unpack_from('<I', d, cr2co)[0]
+        old_cr2_slot = len(d) - cr2co
         # 2b: Update BIOSCER hash (SHA-256 of content up to BIOSCER)
         d[bcer+_IFLASH_CH:bcer+_IFLASH_CH+32] = hashlib.sha256(bytes(d[:bcer])).digest()
         # 2c: Re-sign BIOSCR2 with our cert
@@ -545,11 +545,17 @@ def sign_firmware(data_in):
         struct.pack_into('<I', bd, so, 0); struct.pack_into('<I', bd, so+4, 0); struct.pack_into('<I', bd, co, 0)
         cr2_p7 = _build_p7(_auth_hash(bytes(bd)), cd, k, now)
         cr2_wc = _build_wc(cr2_p7)
-        if len(cr2_wc) <= old_cr2_len:
-            padded = cr2_wc + b'\x00' * (old_cr2_len - len(cr2_wc))
-            d[cr2co:cr2co + old_cr2_len] = padded
+        # Maintain layout invariant: SizeOfImage == bioscr2_wc_end (zero gap)
+        delta = len(cr2_wc) - old_cr2_slot; old_slot_end = cr2co + old_cr2_slot
+        if delta > 0:
+            d[cr2co:old_slot_end] = cr2_wc[:old_cr2_slot]
+            d[old_slot_end:old_slot_end] = cr2_wc[old_cr2_slot:]
+        elif delta < 0:
+            d[cr2co:cr2co+len(cr2_wc)] = cr2_wc; del d[cr2co+len(cr2_wc):old_slot_end]
         else:
-            d[cr2co:cr2co + old_cr2_len] = cr2_wc[:old_cr2_len]
+            d[cr2co:old_slot_end] = cr2_wc
+        if delta != 0:
+            soi_off = os_ + 56; struct.pack_into('<I', d, soi_off, struct.unpack_from('<I', d, soi_off)[0] + delta)
     # Step 3: Clear PE header fields
     struct.pack_into('<I', d, so, 0); struct.pack_into('<I', d, so+4, 0); struct.pack_into('<I', d, co, 0)
     # Step 4: Compute PE Authenticode hash (includes updated BIOSCER + BIOSCR2)
