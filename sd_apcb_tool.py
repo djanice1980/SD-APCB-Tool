@@ -927,6 +927,52 @@ def _find_iflash_structures(data):
     return None, None
 
 
+# DeckHD-proven flag transformations for h2offt QA mode.
+# Each _IFLASH structure has a flags byte at offset +0x0F that controls
+# h2offt's validation behavior. Stock firmware uses values that require
+# Valve's certificate chain; DeckHD changes them to accept self-signed certs.
+# Pattern verified across 3 DeckHD versions (F7A0120, F7A0121, F7A0131).
+_IFLASH_FLAG_MAP = {
+    b'_IFLASH_DRV_IMG': lambda f: f | 0x08,                    # 0x80→0x88, 0xA0→0xA8
+    b'_IFLASH_BIOSIMG': lambda f: 0x08 if f == 0x20 else f,    # 2nd copy (0x20) only
+    b'_IFLASH_INI_IMG': lambda f: 0x68,                         # Always 0x68
+    b'_IFLASH_BIOSCER': lambda f: 0x08,                         # Always 0x08
+    b'_IFLASH_BIOSCR2': lambda f: 0x08,                         # Always 0x08
+}
+
+
+def _update_iflash_flags(data):
+    """Update all _IFLASH structure flags for h2offt QA/self-signed mode.
+
+    Steam Deck .fd firmware contains 6 _IFLASH structures. DeckHD sets specific
+    flag values on each to tell h2offt to accept self-signed certificates instead
+    of requiring Valve's certificate chain. Each structure type has a different
+    transformation rule.
+
+    Args:
+        data: bytearray of the firmware (modified in place).
+
+    Returns:
+        List of (offset, name, old_flag, new_flag) for each updated structure.
+    """
+    pos = 0
+    updated = []
+    while pos < len(data):
+        idx = data.find(b'_IFLASH_', pos)
+        if idx < 0:
+            break
+        for magic, transform in _IFLASH_FLAG_MAP.items():
+            if data[idx:idx + len(magic)] == magic:
+                old_flag = data[idx + _IFLASH_FLAGS_OFFSET]
+                new_flag = transform(old_flag)
+                if old_flag != new_flag:
+                    data[idx + _IFLASH_FLAGS_OFFSET] = new_flag
+                    updated.append((idx, magic.decode(), old_flag, new_flag))
+                break
+        pos = idx + 1
+    return updated
+
+
 def _build_spc_indirect_data(pe_hash):
     """Build the SPC_INDIRECT_DATA_CONTENT structure.
 
@@ -1078,10 +1124,9 @@ def sign_firmware(data_in):
     if bioscer_off is not None and bioscr2_off is not None:
         # Found _IFLASH structures (Steam Deck .fd firmware)
 
-        # 2a: Set flags to QA/modified mode (0x08) so h2offt accepts self-signed certs
-        # Stock firmware uses 0x20 (Valve certificate chain required); DeckHD uses 0x08
-        data[bioscer_off + _IFLASH_FLAGS_OFFSET] = 0x08
-        data[bioscr2_off + _IFLASH_FLAGS_OFFSET] = 0x08
+        # 2a: Update ALL _IFLASH flags to QA/self-signed mode
+        # DeckHD changes flags on 5 of 6 structures (not just BIOSCER/BIOSCR2)
+        _update_iflash_flags(data)
 
         # 2b: Determine the original BIOSCR2 WIN_CERTIFICATE slot size
         bioscr2_cert_off = bioscr2_off + _IFLASH_BIOSCR2_CERT_OFFSET
