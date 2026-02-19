@@ -6,6 +6,7 @@ All notable changes to the APCB Memory Mod Tool.
 
 ### Fixed
 - **3-layer firmware signing for h2offt** -- Steam Deck firmware has three integrity layers that all must be updated for h2offt to accept modified firmware. Previous versions only handled layer 3 (PE Authenticode). Analysis of DeckHD's firmware (CN="QA Certificate.") confirmed h2offt does not check certificate identity:
+  - **`_IFLASH` flags byte (root cause)** -- Both `_IFLASH_BIOSCER` and `_IFLASH_BIOSCR2` have a validation mode flag at offset `+0x0F`. Stock firmware uses `0x20` (Valve certificate chain required); DeckHD uses `0x08` (QA/self-signed mode accepted). Our code was preserving the stock `0x20`, causing h2offt to reject our self-signed certs. Now set to `0x08`.
   - **`_IFLASH_BIOSCER` (layer 1)** -- Internal SHA-256 hash at firmware body offset. Now recomputed after APCB modification.
   - **`_IFLASH_BIOSCR2` (layer 2)** -- Internal Authenticode signature (WIN_CERTIFICATE/PKCS#7) embedded in firmware body. Now re-signed with our self-signed certificate. Padded to fit original slot size.
   - **PE Security Directory (layer 3)** -- Standard PE Authenticode. Recomputed last so it covers the updated layers 1 and 2.
@@ -18,7 +19,7 @@ All notable changes to the APCB Memory Mod Tool.
 
 ### Technical Notes
 - The v1.2.0 "hardware-verified" claim was a false positive: flashing the same BIOS version provided no visible way to confirm the flash actually took effect. Testing with a different version (F7G0110 onto F7G0112) confirmed the old signing never worked.
-- Signing order of operations: strip old PE cert → generate RSA-2048 self-signed cert → update BIOSCER hash → re-sign BIOSCR2 → compute PE Authenticode hash → build PE PKCS#7 → append WIN_CERTIFICATE → PE checksum → self-check.
+- Signing order of operations: strip old PE cert → generate RSA-2048 self-signed cert → set flags to 0x08 → update BIOSCER hash → re-sign BIOSCR2 → compute PE Authenticode hash → build PE PKCS#7 → append WIN_CERTIFICATE → PE checksum → self-check.
 - `_find_iflash_structures()` scans for `_IFLASH_BIOSCER` and `_IFLASH_BIOSCR2` magic bytes. Only Steam Deck `.fd` files have these; ROG Ally firmware uses SPI flash (no signing needed).
 - `_build_win_certificate()` extracted as helper for building 8-byte-aligned WIN_CERTIFICATE from PKCS#7 blob (used for both BIOSCR2 and PE cert).
 - `_build_pkcs7()` extracted as reusable PKCS#7 builder (used for both BIOSCR2 and PE cert).

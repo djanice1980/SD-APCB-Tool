@@ -430,7 +430,7 @@ _P7='1.2.840.113549.1.7.2'; _SID='1.3.6.1.4.1.311.2.1.4'; _SPE='1.3.6.1.4.1.311.
 _SOP='1.3.6.1.4.1.311.2.1.12'; _MIC='1.3.6.1.4.1.311.2.1.21'
 _S256='2.16.840.1.101.3.4.2.1'; _RSA='1.2.840.113549.1.1.1'
 _CT='1.2.840.113549.1.9.3'; _ST='1.2.840.113549.1.9.5'; _MD='1.2.840.113549.1.9.4'
-_IFLASH_CER=b'_IFLASH_BIOSCER'; _IFLASH_CR2=b'_IFLASH_BIOSCR2'; _IFLASH_CH=0x18; _IFLASH_CC=0x1F
+_IFLASH_CER=b'_IFLASH_BIOSCER'; _IFLASH_CR2=b'_IFLASH_BIOSCR2'; _IFLASH_FL=0x0F; _IFLASH_CH=0x18; _IFLASH_CC=0x1F
 
 def _find_iflash(data):
     """Find _IFLASH_BIOSCER and _IFLASH_BIOSCR2 offsets in firmware."""
@@ -519,7 +519,9 @@ def sign_firmware(data_in):
     # Step 2: Handle _IFLASH internal integrity structures
     bcer, bcr2 = _find_iflash(bytes(d))
     if bcer is not None and bcr2 is not None:
-        # 2a: Get original BIOSCR2 slot size
+        # 2a: Set flags to QA mode (0x08) so h2offt accepts self-signed certs
+        d[bcer + _IFLASH_FL] = 0x08; d[bcr2 + _IFLASH_FL] = 0x08
+        # 2b: Get original BIOSCR2 slot size
         cr2co = bcr2 + _IFLASH_CC
         old_cr2_len = struct.unpack_from('<I', d, cr2co)[0]
         # 2b: Update BIOSCER hash (SHA-256 of content up to BIOSCER)

@@ -904,6 +904,7 @@ def _compute_authenticode_hash(data):
 
 _IFLASH_BIOSCER_MAGIC = b'_IFLASH_BIOSCER'
 _IFLASH_BIOSCR2_MAGIC = b'_IFLASH_BIOSCR2'
+_IFLASH_FLAGS_OFFSET = 0x0F           # Validation mode flag byte
 _IFLASH_BIOSCER_HASH_OFFSET = 0x18   # 32-byte SHA-256 hash starts here
 _IFLASH_BIOSCR2_CERT_OFFSET = 0x1F   # WIN_CERTIFICATE starts here
 
@@ -1077,17 +1078,22 @@ def sign_firmware(data_in):
     if bioscer_off is not None and bioscr2_off is not None:
         # Found _IFLASH structures (Steam Deck .fd firmware)
 
-        # 2a: Determine the original BIOSCR2 WIN_CERTIFICATE slot size
+        # 2a: Set flags to QA/modified mode (0x08) so h2offt accepts self-signed certs
+        # Stock firmware uses 0x20 (Valve certificate chain required); DeckHD uses 0x08
+        data[bioscer_off + _IFLASH_FLAGS_OFFSET] = 0x08
+        data[bioscr2_off + _IFLASH_FLAGS_OFFSET] = 0x08
+
+        # 2b: Determine the original BIOSCR2 WIN_CERTIFICATE slot size
         bioscr2_cert_off = bioscr2_off + _IFLASH_BIOSCR2_CERT_OFFSET
         old_bioscr2_len = struct.unpack_from('<I', data, bioscr2_cert_off)[0]
 
-        # 2b: Update _IFLASH_BIOSCER hash with SHA-256 of firmware content
+        # 2c: Update _IFLASH_BIOSCER hash with SHA-256 of firmware content
         # up to the BIOSCER structure (placeholder — exact algorithm is proprietary)
         bioscer_hash_off = bioscer_off + _IFLASH_BIOSCER_HASH_OFFSET
         content_hash = hashlib.sha256(bytes(data[:bioscer_off])).digest()
         data[bioscer_hash_off:bioscer_hash_off + 32] = content_hash
 
-        # 2c: Re-sign _IFLASH_BIOSCR2 with our self-signed certificate
+        # 2d: Re-sign _IFLASH_BIOSCR2 with our self-signed certificate
         # Build a PKCS#7 signature for the BIOSCR2 slot using the same
         # Authenticode hash format. We use the PE hash of the body data
         # (with security dir and checksum zeroed) as the signed content.
