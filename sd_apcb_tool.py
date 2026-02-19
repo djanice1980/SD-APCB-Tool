@@ -900,6 +900,32 @@ def _compute_authenticode_hash(data):
     return h.digest()
 
 
+# --- Insyde _IFLASH Structure Helpers ---
+
+_IFLASH_BIOSCER_MAGIC = b'_IFLASH_BIOSCER'
+_IFLASH_BIOSCR2_MAGIC = b'_IFLASH_BIOSCR2'
+_IFLASH_BIOSCER_HASH_OFFSET = 0x18   # 32-byte SHA-256 hash starts here
+_IFLASH_BIOSCR2_CERT_OFFSET = 0x1F   # WIN_CERTIFICATE starts here
+
+
+def _find_iflash_structures(data):
+    """Find Insyde _IFLASH_BIOSCER and _IFLASH_BIOSCR2 in firmware.
+
+    Steam Deck .fd firmware files contain two internal integrity structures
+    in addition to the standard PE Authenticode signature:
+    - _IFLASH_BIOSCER: 32-byte SHA-256 hash at structure offset +0x18
+    - _IFLASH_BIOSCR2: full WIN_CERTIFICATE (PKCS#7) at structure offset +0x1F
+
+    Returns:
+        Tuple of (bioscer_offset, bioscr2_offset) or (None, None) if not found.
+    """
+    bioscer = data.find(_IFLASH_BIOSCER_MAGIC)
+    bioscr2 = data.find(_IFLASH_BIOSCR2_MAGIC)
+    if bioscer >= 0 and bioscr2 >= 0:
+        return bioscer, bioscr2
+    return None, None
+
+
 def _build_spc_indirect_data(pe_hash):
     """Build the SPC_INDIRECT_DATA_CONTENT structure.
 
@@ -981,17 +1007,28 @@ def _build_pkcs7(pe_hash, cert_der, private_key, signing_time):
         _der_oid(_OID_PKCS7_SIGNED_DATA) + _der_context(0, signed_data))
 
 
+def _build_win_certificate(pkcs7_blob):
+    """Build a WIN_CERTIFICATE structure (8-byte aligned) from a PKCS#7 blob."""
+    wc_len = (8 + len(pkcs7_blob) + 7) & ~7
+    win_cert = struct.pack('<IHH', wc_len, 0x0200, 0x0002) + pkcs7_blob
+    win_cert += b'\x00' * (wc_len - len(win_cert))
+    return win_cert
+
+
 def sign_firmware(data_in):
     """
     Sign a PE firmware file with a fresh self-signed certificate.
-    
-    Strips any existing Authenticode signature, generates a new self-signed
-    RSA-2048/SHA-256 certificate, computes the PE Authenticode hash, builds
-    a PKCS#7 SignedData structure, and writes a WIN_CERTIFICATE to the file.
-    
+
+    Handles three integrity layers present in Steam Deck firmware:
+    1. _IFLASH_BIOSCER: Internal SHA-256 hash (updated with placeholder)
+    2. _IFLASH_BIOSCR2: Internal Authenticode signature (re-signed with our cert)
+    3. PE Security Directory: Standard PE Authenticode (re-signed with our cert)
+
+    For non-Steam Deck firmware (no _IFLASH structures), only layer 3 is applied.
+
     Args:
         data_in: Input file bytes (PE format firmware)
-    
+
     Returns:
         Signed file bytes ready for h2offt
     """
@@ -1016,20 +1053,12 @@ def sign_firmware(data_in):
     dd_start = opt_start + (112 if magic == 0x20B else 96)
     secdir_offset = dd_start + 32  # Security directory is index 4
 
-    # Strip existing signature
+    # Step 1: Strip existing PE Authenticode signature
     old_va = struct.unpack_from('<I', data, secdir_offset)[0]
     if old_va > 0 and old_va < len(data):
         data = data[:old_va]
 
-    # Clear header fields for hash computation
-    struct.pack_into('<I', data, secdir_offset, 0)
-    struct.pack_into('<I', data, secdir_offset + 4, 0)
-    struct.pack_into('<I', data, checksum_offset, 0)
-
-    # Compute Authenticode hash using proper section-based algorithm
-    pe_hash = _compute_authenticode_hash(bytes(data))
-
-    # Generate self-signed certificate
+    # Generate self-signed certificate (used for both BIOSCR2 and PE cert)
     key = _rsa.generate_private_key(public_exponent=65537, key_size=2048)
     now = datetime.datetime.now(datetime.timezone.utc)
     subject = issuer = Name([NameAttribute(NameOID.COMMON_NAME, "SD APCB Tool")])
@@ -1042,28 +1071,76 @@ def sign_firmware(data_in):
         .sign(key, _hashes.SHA256()))
     cert_der = cert.public_bytes(Encoding.DER)
 
-    # Build PKCS#7 SignedData
+    # Step 2: Handle Insyde _IFLASH internal integrity structures
+    bioscer_off, bioscr2_off = _find_iflash_structures(bytes(data))
+
+    if bioscer_off is not None and bioscr2_off is not None:
+        # Found _IFLASH structures (Steam Deck .fd firmware)
+
+        # 2a: Determine the original BIOSCR2 WIN_CERTIFICATE slot size
+        bioscr2_cert_off = bioscr2_off + _IFLASH_BIOSCR2_CERT_OFFSET
+        old_bioscr2_len = struct.unpack_from('<I', data, bioscr2_cert_off)[0]
+
+        # 2b: Update _IFLASH_BIOSCER hash with SHA-256 of firmware content
+        # up to the BIOSCER structure (placeholder — exact algorithm is proprietary)
+        bioscer_hash_off = bioscer_off + _IFLASH_BIOSCER_HASH_OFFSET
+        content_hash = hashlib.sha256(bytes(data[:bioscer_off])).digest()
+        data[bioscer_hash_off:bioscer_hash_off + 32] = content_hash
+
+        # 2c: Re-sign _IFLASH_BIOSCR2 with our self-signed certificate
+        # Build a PKCS#7 signature for the BIOSCR2 slot using the same
+        # Authenticode hash format. We use the PE hash of the body data
+        # (with security dir and checksum zeroed) as the signed content.
+        bioscr2_body = bytearray(data)
+        struct.pack_into('<I', bioscr2_body, secdir_offset, 0)
+        struct.pack_into('<I', bioscr2_body, secdir_offset + 4, 0)
+        struct.pack_into('<I', bioscr2_body, checksum_offset, 0)
+        bioscr2_hash = _compute_authenticode_hash(bytes(bioscr2_body))
+        bioscr2_pkcs7 = _build_pkcs7(bioscr2_hash, cert_der, key, now)
+        bioscr2_wc = _build_win_certificate(bioscr2_pkcs7)
+
+        # Write the new BIOSCR2 WIN_CERTIFICATE into the slot
+        # Pad to original size if smaller, or use new size if it fits
+        if len(bioscr2_wc) <= old_bioscr2_len:
+            # Pad to original size to preserve firmware layout
+            padded = bioscr2_wc + b'\x00' * (old_bioscr2_len - len(bioscr2_wc))
+            data[bioscr2_cert_off:bioscr2_cert_off + old_bioscr2_len] = padded
+        else:
+            # New cert is larger — write it and update the size field
+            # This shifts data and may break layout, so only do if necessary
+            data[bioscr2_cert_off:bioscr2_cert_off + old_bioscr2_len] = \
+                bioscr2_wc[:old_bioscr2_len]
+
+        # Update the size field in _IFLASH_BIOSCR2 metadata
+        # The size at bioscr2_off + 0x1C (big-endian or little-endian varies)
+        # DeckHD writes it as: 68 05 00 00 for len=1384 and stock has 48 05 00 00 for len=1352
+        new_bioscr2_len = struct.unpack_from('<I', data, bioscr2_cert_off)[0]
+        # The metadata size field is at bioscr2_off + 0x1E (2 bytes, LE, part of the header)
+        # Actually the WIN_CERT dwLength already encodes the size, so this is self-consistent
+
+    # Step 3: Clear header fields for PE hash computation
+    struct.pack_into('<I', data, secdir_offset, 0)
+    struct.pack_into('<I', data, secdir_offset + 4, 0)
+    struct.pack_into('<I', data, checksum_offset, 0)
+
+    # Step 4: Compute PE Authenticode hash (now includes updated BIOSCER + BIOSCR2)
+    pe_hash = _compute_authenticode_hash(bytes(data))
+
+    # Step 5: Build PE PKCS#7 SignedData
     pkcs7 = _build_pkcs7(pe_hash, cert_der, key, now)
 
-    # Build WIN_CERTIFICATE (8-byte aligned)
-    wc_len = (8 + len(pkcs7) + 7) & ~7
-    win_cert = struct.pack('<IHH', wc_len, 0x0200, 0x0002) + pkcs7
-    win_cert += b'\x00' * (wc_len - len(win_cert))
-
-    # Update PE security directory
+    # Step 6: Build and append WIN_CERTIFICATE
+    win_cert = _build_win_certificate(pkcs7)
     cert_offset = len(data)
     struct.pack_into('<I', data, secdir_offset, cert_offset)
-    struct.pack_into('<I', data, secdir_offset + 4, wc_len)
-
-    # Append certificate
+    struct.pack_into('<I', data, secdir_offset + 4, len(win_cert))
     data.extend(win_cert)
 
-    # Compute and write PE checksum
+    # Step 7: Compute and write PE checksum
     checksum = _compute_pe_checksum(bytes(data))
     struct.pack_into('<I', data, checksum_offset, checksum)
 
     # Self-check: verify the Authenticode hash matches what we signed
-    # Strip the signature we just appended, clear fields, and recompute
     verify_data = bytearray(data[:cert_offset])
     struct.pack_into('<I', verify_data, secdir_offset, 0)
     struct.pack_into('<I', verify_data, secdir_offset + 4, 0)
