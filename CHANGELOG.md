@@ -2,6 +2,21 @@
 
 All notable changes to the APCB Memory Mod Tool.
 
+## [1.6.1] - 2025-02-19
+
+### Fixed
+- **PE Authenticode signing rewritten** -- Fixed 4 bugs that caused h2offt to reject custom-signed firmware:
+  - **messageDigest hash** -- Was hashing the full DER encoding (with SEQUENCE tag/length) instead of the content octets only per RFC 2315 Section 9.3. This produced a completely wrong hash, causing signature verification to fail.
+  - **SpcSpOpusInfo encoding** -- Was putting an OID inside the structure; should be an empty SEQUENCE per Authenticode spec.
+  - **SPC value EXPLICIT tag** -- Missing `[0] EXPLICIT` wrapper on `SpcAttributeTypeAndOptionalValue.value` field.
+  - **PE hash algorithm** -- Replaced linear hash with proper section-based Authenticode hashing (headers, sections sorted by PointerToRawData, trailing data). Produces identical results for contiguous firmware but is now spec-compliant for all PE layouts.
+- **Signing self-check** -- After signing, the tool re-computes the Authenticode hash on the output and verifies it matches, catching any future regressions.
+
+### Technical Notes
+- The v1.2.0 "hardware-verified" claim was a false positive: flashing the same BIOS version provided no visible way to confirm the flash actually took effect. Testing with a different version (F7G0110 onto F7G0112) confirmed the old signing never worked.
+- Both CLI and GUI signing implementations fixed (GUI had identical minified copy of the buggy code).
+- The messageDigest bug alone was sufficient to cause rejection -- stripping the 2-byte SEQUENCE tag/length from the hash input produces a completely different SHA-256 digest.
+
 ## [1.6.0] - 2025-02-17
 
 ### Added
@@ -76,7 +91,7 @@ All notable changes to the APCB Memory Mod Tool.
 - GUI: "Sign firmware for h2offt" checkbox (enabled by default)
 - GUI: Auto-detects `cryptography` library availability and shows status
 - GUI: PE vs raw SPI dump detection with appropriate signing behavior
-- Hardware-verified: h2offt on OLED Steam Deck accepts custom-signed firmware
+- ~~Hardware-verified: h2offt on OLED Steam Deck accepts custom-signed firmware~~ (corrected in v1.6.1 -- original signing had bugs, see v1.6.1 notes)
 
 ### Changed
 - CLI help text updated with signing examples and h2offt flash command
@@ -87,7 +102,7 @@ All notable changes to the APCB Memory Mod Tool.
 - Signing adds ~1,456 bytes to the firmware file (WIN_CERTIFICATE with PKCS#7 blob)
 - Layer 1 (_BIOSCER) signature from original firmware is preserved intact
 - Layer 2 (PE Authenticode) is replaced with the new custom signature
-- h2offt validates signature structure but not certificate identity -- any self-signed cert works
+- h2offt validates signature structure but not certificate identity -- any self-signed cert works (confirmed in v1.6.1 after signing bugs were fixed)
 
 ## [1.1.0] - 2025-02-12
 

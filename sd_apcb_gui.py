@@ -441,6 +441,32 @@ def _pe_cksum(data):
         v = int.from_bytes(data[-(r):]+b'\x00'*(4-r), 'little'); c = (c&0xFFFFFFFF)+v+(c>>32); c = (c&0xFFFF)+(c>>16)
     c = (c&0xFFFF)+(c>>16); return (c+len(data))&0xFFFFFFFF
 
+def _auth_hash(data):
+    """Compute Authenticode PE hash per Microsoft spec (section-based)."""
+    po = struct.unpack_from('<I', data, 0x3C)[0]
+    ns = struct.unpack_from('<H', data, po+6)[0]
+    ohs = struct.unpack_from('<H', data, po+4+18)[0]
+    os_ = po+4+20; m = struct.unpack_from('<H', data, os_)[0]
+    co = os_+64; dd = os_+(112 if m == 0x20B else 96); so = dd+32
+    soh = struct.unpack_from('<I', data, os_+60)[0]
+    sto = os_+ohs
+    h = hashlib.sha256()
+    # Step 1: headers (skip checksum + secdir)
+    h.update(data[:co]); h.update(data[co+4:so]); h.update(data[so+8:soh])
+    # Step 2: sections sorted by PointerToRawData
+    secs = []
+    for i in range(ns):
+        so2 = sto+i*40; rs = struct.unpack_from('<I', data, so2+16)[0]; rp = struct.unpack_from('<I', data, so2+20)[0]
+        if rs > 0: secs.append((rp, rs))
+    secs.sort(key=lambda s: s[0])
+    sbh = soh
+    for ptr, sz in secs:
+        h.update(data[ptr:ptr+sz])
+        if ptr+sz > sbh: sbh = ptr+sz
+    # Step 3: trailing data
+    if sbh < len(data): h.update(data[sbh:])
+    return h.digest()
+
 def sign_firmware(data_in):
     from cryptography.hazmat.primitives import hashes as H
     from cryptography.hazmat.primitives.asymmetric import rsa as R, padding as P
@@ -454,19 +480,20 @@ def sign_firmware(data_in):
     ov = struct.unpack_from('<I', d, so)[0]
     if ov > 0 and ov < len(d): d = d[:ov]
     struct.pack_into('<I', d, so, 0); struct.pack_into('<I', d, so+4, 0); struct.pack_into('<I', d, co, 0)
-    h = hashlib.sha256(); h.update(bytes(d[:co])); h.update(bytes(d[co+4:so])); h.update(bytes(d[so+8:])); ph = h.digest()
+    # Bug 1 fix: section-based Authenticode hash
+    ph = _auth_hash(bytes(d))
     k = R.generate_private_key(65537, 2048); now = datetime.datetime.now(datetime.timezone.utc)
     subj = Name([NameAttribute(NameOID.COMMON_NAME, "SD APCB Tool")])
     cert = CB().subject_name(subj).issuer_name(subj).public_key(k.public_key()).serial_number(random_serial_number()).not_valid_before(now).not_valid_after(now+datetime.timedelta(days=3650)).sign(k, H.SHA256())
     cd = cert.public_bytes(Encoding.DER)
-    # Build SPC
+    # Build SPC — Bug 4 fix: [0] EXPLICIT on value
     sf = _dt(0x03, b'\x00\x00'); sl = _dc(0, b'\x00'*28, False); spd = _ds(sf+_dc(0, _dc(2, sl)))
-    sa = _ds(_doid(_SPE)+spd); da = _ds(_doid(_S256)+_dn()); di = _ds(da+_do(ph))
-    spc = _ds(sa+di)
+    sa = _ds(_doid(_SPE)+_dc(0, spd)); da = _ds(_doid(_S256)+_dn()); di = _ds(da+_do(ph))
+    spc_inner = sa+di; spc = _ds(spc_inner)
     ci = _ds(_doid(_SID)+_dc(0, spc)); s256a = _ds(_doid(_S256)+_dn())
-    # Auth attrs
+    # Auth attrs — Bug 2 fix: hash inner content only; Bug 3 fix: empty SpcSpOpusInfo
     ac = _ds(_doid(_CT)+_dset(_doid(_SID))); at = _ds(_doid(_ST)+_dset(_dut(now)))
-    ao = _ds(_doid(_SOP)+_dset(_ds(_doid(_MIC)))); ch = hashlib.sha256(spc).digest()
+    ao = _ds(_doid(_SOP)+_dset(_ds(b''))); ch = hashlib.sha256(spc_inner).digest()
     am = _ds(_doid(_MD)+_dset(_do(ch))); aa = ac+at+ao+am
     sig = k.sign(_dset(aa), P.PKCS1v15(), H.SHA256())
     ias = _ds(cert.issuer.public_bytes()+_dint(cert.serial_number))
@@ -475,8 +502,14 @@ def sign_firmware(data_in):
     sd = _ds(_dint(1)+_dset(s256a)+ci+_dc(0,cd)+_dset(si))
     p7 = _ds(_doid(_P7)+_dc(0, sd))
     wl = (8+len(p7)+7)&~7; wc = struct.pack('<IHH', wl, 0x0200, 0x0002)+p7+b'\x00'*(wl-8-len(p7))
-    struct.pack_into('<I', d, so, len(d)); struct.pack_into('<I', d, so+4, wl)
+    ct = len(d)
+    struct.pack_into('<I', d, so, ct); struct.pack_into('<I', d, so+4, wl)
     d.extend(wc); ck = _pe_cksum(bytes(d)); struct.pack_into('<I', d, co, ck)
+    # Self-check
+    vd = bytearray(d[:ct])
+    struct.pack_into('<I', vd, so, 0); struct.pack_into('<I', vd, so+4, 0); struct.pack_into('<I', vd, co, 0)
+    vh = _auth_hash(bytes(vd))
+    if vh != ph: raise RuntimeError(f"Signing self-check FAILED: hash mismatch")
     return bytes(d)
 
 # ── GUI ──
