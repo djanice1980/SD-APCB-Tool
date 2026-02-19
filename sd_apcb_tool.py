@@ -1128,9 +1128,14 @@ def sign_firmware(data_in):
         # DeckHD changes flags on 5 of 6 structures (not just BIOSCER/BIOSCR2)
         _update_iflash_flags(data)
 
-        # 2b: Determine the original BIOSCR2 WIN_CERTIFICATE slot size
+        # 2b: Determine the original BIOSCR2 slot size.
+        # The slot extends from the cert offset to SizeOfImage (len(data) after
+        # Step 1 stripped the PE cert).  This may include zero padding beyond
+        # the WIN_CERTIFICATE's dwLength (OLED stock has 16 bytes of padding).
+        # Using the full slot ensures we resize correctly so our new WC ends
+        # exactly at SizeOfImage with zero gap, matching DeckHD's layout.
         bioscr2_cert_off = bioscr2_off + _IFLASH_BIOSCR2_CERT_OFFSET
-        old_bioscr2_len = struct.unpack_from('<I', data, bioscr2_cert_off)[0]
+        old_bioscr2_slot = len(data) - bioscr2_cert_off
 
         # 2c: Update _IFLASH_BIOSCER hash with SHA-256 of firmware content
         # up to the BIOSCER structure (placeholder — exact algorithm is proprietary)
@@ -1150,24 +1155,32 @@ def sign_firmware(data_in):
         bioscr2_pkcs7 = _build_pkcs7(bioscr2_hash, cert_der, key, now)
         bioscr2_wc = _build_win_certificate(bioscr2_pkcs7)
 
-        # Write the new BIOSCR2 WIN_CERTIFICATE into the slot
-        # Pad to original size if smaller, or use new size if it fits
-        if len(bioscr2_wc) <= old_bioscr2_len:
-            # Pad to original size to preserve firmware layout
-            padded = bioscr2_wc + b'\x00' * (old_bioscr2_len - len(bioscr2_wc))
-            data[bioscr2_cert_off:bioscr2_cert_off + old_bioscr2_len] = padded
-        else:
-            # New cert is larger — write it and update the size field
-            # This shifts data and may break layout, so only do if necessary
-            data[bioscr2_cert_off:bioscr2_cert_off + old_bioscr2_len] = \
-                bioscr2_wc[:old_bioscr2_len]
+        # Write the new BIOSCR2 WIN_CERTIFICATE and maintain layout invariant:
+        #   SizeOfImage == SecDir VA == bioscr2_cert_off + len(bioscr2_wc)
+        # DeckHD follows this rule: BIOSCR2 WC ends exactly at SizeOfImage,
+        # and the PE cert starts right there with zero gap.
+        # We compare against the full slot (which may include padding), not
+        # just the old WC dwLength, to eliminate any stock padding.
+        delta = len(bioscr2_wc) - old_bioscr2_slot
+        old_slot_end = bioscr2_cert_off + old_bioscr2_slot
 
-        # Update the size field in _IFLASH_BIOSCR2 metadata
-        # The size at bioscr2_off + 0x1C (big-endian or little-endian varies)
-        # DeckHD writes it as: 68 05 00 00 for len=1384 and stock has 48 05 00 00 for len=1352
-        new_bioscr2_len = struct.unpack_from('<I', data, bioscr2_cert_off)[0]
-        # The metadata size field is at bioscr2_off + 0x1E (2 bytes, LE, part of the header)
-        # Actually the WIN_CERT dwLength already encodes the size, so this is self-consistent
+        if delta > 0:
+            # New cert is larger than slot — write what fits, insert the rest
+            data[bioscr2_cert_off:old_slot_end] = bioscr2_wc[:old_bioscr2_slot]
+            data[old_slot_end:old_slot_end] = bioscr2_wc[old_bioscr2_slot:]
+        elif delta < 0:
+            # New cert is smaller than slot — write it and remove excess bytes
+            data[bioscr2_cert_off:bioscr2_cert_off + len(bioscr2_wc)] = bioscr2_wc
+            del data[bioscr2_cert_off + len(bioscr2_wc):old_slot_end]
+        else:
+            # Same size as slot — simple overwrite
+            data[bioscr2_cert_off:old_slot_end] = bioscr2_wc
+
+        if delta != 0:
+            # Update SizeOfImage in PE Optional Header to maintain layout invariant
+            soi_offset = opt_start + 56
+            old_soi = struct.unpack_from('<I', data, soi_offset)[0]
+            struct.pack_into('<I', data, soi_offset, old_soi + delta)
 
     # Step 3: Clear header fields for PE hash computation
     struct.pack_into('<I', data, secdir_offset, 0)

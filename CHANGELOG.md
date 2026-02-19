@@ -8,7 +8,7 @@ All notable changes to the APCB Memory Mod Tool.
 - **3-layer firmware signing for h2offt** -- Steam Deck firmware has three integrity layers that all must be updated for h2offt to accept modified firmware. Previous versions only handled layer 3 (PE Authenticode). Analysis of DeckHD's firmware (CN="QA Certificate.") confirmed h2offt does not check certificate identity:
   - **`_IFLASH` flags bytes** -- All 6 `_IFLASH` structures in the firmware have a flags byte at offset `+0x0F` that controls h2offt's validation mode. DeckHD modifies 5 of 6 flags (verified across 3 firmware versions). Our code now applies the same per-structure transformations: `_IFLASH_DRV_IMG` (`0x80→0x88`), `_IFLASH_BIOSIMG` 2nd (`0x20→0x08`), `_IFLASH_INI_IMG` (`0x80→0x68`), `_IFLASH_BIOSCER` (`0x20→0x08`), `_IFLASH_BIOSCR2` (`0x20→0x08`). The 1st `_IFLASH_BIOSIMG` (`0x00`) is left unchanged.
   - **`_IFLASH_BIOSCER` (layer 1)** -- Internal SHA-256 hash at firmware body offset. Now recomputed after APCB modification.
-  - **`_IFLASH_BIOSCR2` (layer 2)** -- Internal Authenticode signature (WIN_CERTIFICATE/PKCS#7) embedded in firmware body. Now re-signed with our self-signed certificate. Padded to fit original slot size.
+  - **`_IFLASH_BIOSCR2` (layer 2)** -- Internal Authenticode signature (WIN_CERTIFICATE/PKCS#7) embedded in firmware body. Now re-signed with our self-signed certificate. Firmware body resized to maintain layout invariant: `SizeOfImage == SecDir VA == BIOSCR2 WC end` (zero gap between BIOSCR2 and PE cert). Uses the full BIOSCR2 slot size (cert offset to SizeOfImage) rather than the WIN_CERTIFICATE `dwLength` field, which correctly handles OLED firmware that has zero-padding between the BIOSCR2 WC and the PE cert. DeckHD follows the same zero-gap invariant.
   - **PE Security Directory (layer 3)** -- Standard PE Authenticode. Recomputed last so it covers the updated layers 1 and 2.
 - **PE Authenticode signing rewritten** -- Fixed 4 bugs that caused h2offt to reject custom-signed firmware:
   - **messageDigest hash** -- Was hashing the full DER encoding (with SEQUENCE tag/length) instead of the content octets only per RFC 2315 Section 9.3. This produced a completely wrong hash, causing signature verification to fail.
@@ -25,6 +25,7 @@ All notable changes to the APCB Memory Mod Tool.
 - `_build_pkcs7()` extracted as reusable PKCS#7 builder (used for both BIOSCR2 and PE cert).
 - Both CLI and GUI signing implementations updated (GUI has minified copy with identical 3-layer logic).
 - The messageDigest bug alone was sufficient to cause rejection -- stripping the 2-byte SEQUENCE tag/length from the hash input produces a completely different SHA-256 digest.
+- OLED stock firmware (F7G) has 16 bytes of zero padding between the BIOSCR2 WIN_CERTIFICATE and SizeOfImage. LCD stock (F7A) has no padding. The resize logic uses `len(data) - bioscr2_cert_off` (the full slot) instead of the WC `dwLength` to ensure both formats collapse to zero-gap after re-signing.
 
 ## [1.6.0] - 2025-02-17
 
