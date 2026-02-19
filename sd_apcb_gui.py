@@ -437,6 +437,20 @@ def _find_iflash(data):
     a, b = data.find(_IFLASH_CER), data.find(_IFLASH_CR2)
     return (a, b) if a >= 0 and b >= 0 else (None, None)
 
+_IFL_FMAP = {b'_IFLASH_DRV_IMG': lambda f: f|0x08, b'_IFLASH_BIOSIMG': lambda f: 0x08 if f==0x20 else f,
+    b'_IFLASH_INI_IMG': lambda f: 0x68, b'_IFLASH_BIOSCER': lambda f: 0x08, b'_IFLASH_BIOSCR2': lambda f: 0x08}
+
+def _update_ifl_flags(d):
+    """Update all _IFLASH flags for h2offt QA mode (DeckHD-proven pattern)."""
+    pos = 0
+    while pos < len(d):
+        idx = d.find(b'_IFLASH_', pos)
+        if idx < 0: break
+        for mag, xf in _IFL_FMAP.items():
+            if d[idx:idx+len(mag)] == mag:
+                d[idx + 0x0F] = xf(d[idx + 0x0F]); break
+        pos = idx + 1
+
 def _build_wc(p7):
     """Build WIN_CERTIFICATE from PKCS#7 blob (8-byte aligned)."""
     wl = (8+len(p7)+7)&~7; wc = struct.pack('<IHH', wl, 0x0200, 0x0002)+p7+b'\x00'*(wl-8-len(p7)); return wc
@@ -519,8 +533,8 @@ def sign_firmware(data_in):
     # Step 2: Handle _IFLASH internal integrity structures
     bcer, bcr2 = _find_iflash(bytes(d))
     if bcer is not None and bcr2 is not None:
-        # 2a: Set flags to QA mode (0x08) so h2offt accepts self-signed certs
-        d[bcer + _IFLASH_FL] = 0x08; d[bcr2 + _IFLASH_FL] = 0x08
+        # 2a: Update ALL _IFLASH flags to QA mode (DeckHD pattern)
+        _update_ifl_flags(d)
         # 2b: Get original BIOSCR2 slot size
         cr2co = bcr2 + _IFLASH_CC
         old_cr2_len = struct.unpack_from('<I', d, cr2co)[0]
