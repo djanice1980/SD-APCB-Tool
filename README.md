@@ -298,36 +298,57 @@ python sd_apcb_tool.py modify my_bios.bin my_bios_mod.bin --target 32 --deckhd
 
 ## DMI Backup & Restore
 
-When a Steam Deck is bricked and recovered with a clean BIOS image via SPI programmer, the device-specific identity data (serial number, UUID, board info) is lost. This tool can export that data from a firmware dump and re-import it into a clean BIOS, automating the hex-editor recovery process.
+When a Steam Deck is bricked and recovered with a clean BIOS image via SPI programmer, the device-specific identity data (serial number, board info, calibration data) is lost. This tool automates the recovery process -- export DMI from your dump, import it into a clean firmware, and flash.
 
-### CLI Usage
+### Unbricking Your Device
 
 ```bash
-# Step 1: Export DMI from your firmware dump (bricked or working)
-python sd_apcb_tool.py dmi-export my_bios_dump.bin my_dmi_backup.json
+# Step 1: Export DMI from your SPI flash dump (works on bricked or working dumps)
+python sd_apcb_tool.py dmi-export my_spi_dump.bin my_dmi_backup.json
 
-# Step 2: Import DMI into a clean BIOS image
-python sd_apcb_tool.py dmi-import clean_bios.bin restored_bios.bin my_dmi_backup.json
+# Step 2: Import DMI into a stock firmware file (.fd or .bin)
+python sd_apcb_tool.py dmi-import F7G0112_sign.fd restored.bin my_dmi_backup.json
 
-# Step 3: Flash the restored BIOS via SPI programmer
-flashrom -p ch341a_spi -w restored_bios.bin
+# Step 3: Flash the restored firmware via SPI programmer
+flashrom -p ch341a_spi -w restored.bin
 ```
 
-The export produces a human-readable JSON file containing the AMI DmiEdit `$DMI` store records plus raw hex data for exact byte-level restoration. Requires a raw SPI flash dump (16MB), not a `.fd` update file.
+### Preventive Backup (Before You Need It)
+
+If your device is still working, back up your DMI data now:
+
+```bash
+# Dump your SPI flash (16MB)
+flashrom -p ch341a_spi -r my_backup.bin
+
+# Export DMI to a JSON file -- store this safely!
+python sd_apcb_tool.py dmi-export my_backup.bin my_dmi_backup.json
+```
 
 ### GUI Usage
 
-1. Open a raw SPI flash dump (16MB `.bin` file)
-2. Click **"Export DMI"** to save device identity to a JSON file
-3. To restore: open the clean BIOS dump, click **"Import DMI"**, select the JSON, and save the output
+**Export:** Open your SPI flash dump → click **"Export DMI"** → save the JSON file safely
 
-### What It Backs Up
+**Import:** Open the target firmware (stock `.fd` or dump `.bin`) → click **"Import DMI"** → select the JSON → save the output
 
-The tool exports all records from the AMI DmiEdit `$DMI` store in the firmware, including:
+### What Gets Restored
 
-- **Type 1 (System Information)** -- Serial number (e.g. `FYZZ54203BBD`)
-- **Type 2 (Baseboard Information)** -- Board serial number (e.g. `MEFC53901051`)
-- **Type 11 (OEM Strings)** -- Device-specific calibration data (display, joystick)
+- **System serial number** -- needed for Steam/Valve account association
+- **Board serial number** -- hardware identifier
+- **OEM calibration strings** -- display and joystick calibration data
+
+### What Rebuilds Automatically
+
+UEFI settings (boot order, Secure Boot state, etc.) are stored in NVRAM, which recreates with defaults on first boot. Wi-Fi and Bluetooth re-pair on first connection. You don't need to worry about these.
+
+### Supported Target Files
+
+| File Type | Export From | Import Into |
+|-----------|-----------|-------------|
+| Raw SPI dump (`.bin`, 16MB) | ✅ | ✅ |
+| Firmware update (`.fd`) | ❌ (no DMI data) | ✅ (blank $DMI store) |
+
+Stock `.fd` files ship with an empty `$DMI` store -- the tool writes your DMI data into it.
 
 ## Requirements
 

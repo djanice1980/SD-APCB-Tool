@@ -26,7 +26,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 
 APP_TITLE = "SD APCB Memory Mod Tool"
-APP_VERSION = "1.7.0"
+APP_VERSION = "1.7.1"
 APCB_MAGIC = b'APCB'
 APCB_MAGIC_MOD = b'QPCB'
 APCB_CHECKSUM_OFFSET = 16
@@ -596,7 +596,7 @@ class DmiRecord:
     @property
     def type_name(self): return SMBIOS_TYPE_NAMES.get(self.smbios_type, f'Type {self.smbios_type}')
 
-def find_dmi_store(data):
+def find_dmi_store(data, allow_empty=False):
     pos, candidates = 0, []
     while pos < len(data) - 8:
         idx = data.find(AMI_DMI_MAGIC, pos)
@@ -614,6 +614,16 @@ def find_dmi_store(data):
                     scan += rrl
                 candidates.append((idx, scan))
         pos = idx + 1
+    # Fallback: accept blank $DMI stores (stock .fd firmware files)
+    if not candidates and allow_empty:
+        pos = 0
+        while pos < len(data) - 4:
+            idx = data.find(AMI_DMI_MAGIC, pos)
+            if idx < 0: break
+            scan, end = idx + 4, min(idx + 8192, len(data))
+            while scan < end and data[scan] == 0xFF: scan += 1
+            if scan > idx + 4: candidates.append((idx, scan))
+            pos = idx + 1
     return max(candidates, key=lambda c: c[1]-c[0]) if candidates else None
 
 def parse_dmi_records(data, store_start, store_end):
@@ -629,9 +639,9 @@ def parse_dmi_records(data, store_start, store_end):
 def export_dmi(data):
     result = find_dmi_store(data)
     if result is None:
-        raise ValueError("No AMI $DMI store found in firmware.\n"
-            "This feature requires a raw SPI flash dump (16MB), not a .fd update file.\n"
-            "Use a SPI programmer (CH341A) to dump the full flash first.")
+        raise ValueError("No DMI data found in firmware.\n"
+            "Export requires a firmware dump with populated DMI records.\n"
+            "Use a raw SPI flash dump from a working (or bricked) device.")
     ss, se = result
     records = parse_dmi_records(data, ss, se)
     export = {'tool_version': APP_VERSION, 'format': 'ami_dmi_store',
@@ -654,9 +664,11 @@ def export_dmi(data):
     return export
 
 def import_dmi(firmware_data, dmi_json):
-    result = find_dmi_store(bytes(firmware_data))
+    result = find_dmi_store(bytes(firmware_data), allow_empty=True)
     if result is None:
-        raise ValueError("No AMI $DMI store found in target firmware.")
+        raise ValueError("No AMI $DMI store found in target firmware.\n"
+            "The target file must contain a '$DMI' signature.\n"
+            "Supported: raw SPI dumps (.bin) and firmware update files (.fd)")
     ts, te = result; target_size = te - ts
     source_raw = bytes.fromhex(dmi_json['raw_store_hex'])
     # Find available space (including 0xFF padding after store)
@@ -1172,15 +1184,14 @@ class APCBToolGUI:
         import json
         with open(op, 'w') as f: json.dump(dmi_data, f, indent=2)
         self._log(f"\nDMI exported: {os.path.basename(op)}", 'success')
-        self._log(f"  Region: {dmi_data['dmi_region_offset']} ({dmi_data['dmi_region_size']} bytes)", 'dim')
-        self._log(f"  Tables: {len(dmi_data['tables'])}", 'dim')
-        if si.get('manufacturer'): self._log(f"  System:  {si.get('manufacturer','')} {si.get('product_name','')}", 'cyan')
-        if si.get('serial_number'): self._log(f"  Serial:  {si['serial_number']}", 'cyan')
-        if si.get('uuid'): self._log(f"  UUID:    {si['uuid']}", 'cyan')
-        if bi.get('serial_number'): self._log(f"  Board:   {bi.get('manufacturer','')} {bi.get('product','')} SN={bi['serial_number']}", 'cyan')
-        summary = f"Tables: {len(dmi_data['tables'])}"
-        if si.get('serial_number'): summary += f"\nSerial: {si['serial_number']}"
-        if si.get('uuid'): summary += f"\nUUID: {si['uuid']}"
+        self._log(f"  Store: {dmi_data['dmi_store_offset']} ({dmi_data['dmi_store_size']} bytes)", 'dim')
+        self._log(f"  Records: {len(dmi_data['records'])}", 'dim')
+        if si.get('serial_number'): self._log(f"  System Serial:  {si['serial_number']}", 'cyan')
+        if bi.get('serial_number'): self._log(f"  Board Serial:   {bi['serial_number']}", 'cyan')
+        self._log(f"  Store this file safely -- it contains your device identity.", 'dim')
+        summary = f"Records: {len(dmi_data['records'])}"
+        if si.get('serial_number'): summary += f"\nSystem Serial: {si['serial_number']}"
+        if bi.get('serial_number'): summary += f"\nBoard Serial: {bi['serial_number']}"
         messagebox.showinfo("DMI Export", f"DMI data exported successfully.\n\n{summary}\n\nSaved to:\n{op}")
 
     def _import_dmi(self):
@@ -1218,8 +1229,9 @@ class APCBToolGUI:
             self._log(f"\nDMI imported into: {os.path.basename(op)}", 'success')
             for off, desc in patches:
                 self._log(f"  0x{off:08X}: {desc}", 'dim')
-            self._log(f"  Ready for SPI flash.", 'success')
-            messagebox.showinfo("DMI Import", f"DMI data restored successfully.\n\nOutput: {op}")
+            self._log(f"  Flash this file to your device via SPI programmer.", 'success')
+            self._log(f"  UEFI settings will recreate automatically on first boot.", 'dim')
+            messagebox.showinfo("DMI Import", f"DMI data restored successfully.\n\nOutput: {op}\n\nFlash via SPI programmer.\nUEFI settings recreate on first boot.")
         except Exception as e:
             self._log(f"DMI import error: {e}", 'error')
             messagebox.showerror("DMI Import Error", str(e))
