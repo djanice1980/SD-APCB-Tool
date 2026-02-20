@@ -2,10 +2,50 @@
 
 All notable changes to the APCB Memory Mod Tool.
 
+## [1.7.0] - 2025-02-19
+
+### Added
+- **DMI/SMBIOS backup & restore** -- New `dmi-export` and `dmi-import` CLI commands for brick recovery. Exports device identity (serial number, board serial, OEM calibration strings) from an SPI flash dump to JSON, and imports it back into a clean BIOS image. Automates the hex-editor recovery process documented at stanto.com.
+  - Parses AMI DmiEdit `$DMI` store format (the actual format used in Steam Deck SPI flash)
+  - Decodes SMBIOS Type 1 (System Serial), Type 2 (Board Serial), Type 11 (OEM Strings/calibration data)
+  - Human-readable JSON export with raw hex for exact byte-level restoration
+  - GUI: "Export DMI" and "Import DMI" buttons in the file toolbar
+- **GUI two-column layout** -- Settings (file selection, target config, SPD entries, action buttons) on the left, log output on the right. Resizable divider between columns. Fixes issue where Apply/Analyze buttons were hidden below the visible window on smaller screens.
+- **GUI dark theme combobox fix** -- Screen patch, density, and module prefix dropdowns now render correctly in dark theme on Windows (readonly and disabled states show proper dark background with light text)
+
+### Removed
+- **`--sign` CLI flag removed** -- PE Authenticode signing is no longer available as a user-facing feature. Hardware testing on OLED Steam Deck (F7G0110 onto F7G0112) conclusively proved that h2offt performs full cryptographic validation against Insyde's QA Certificate. Four test variants were flashed:
+  - **T4 (unmodified stock):** Passed -- confirms the test methodology works
+  - **T3 (only _IFLASH flags changed):** Failed -- even single-byte flag changes break validation
+  - **T1 (re-signed with self-signed cert):** Failed -- h2offt rejects unknown certificate identities
+  - **T2 (re-signed with DeckHD's QA cert, mismatched RSA key):** Failed -- h2offt verifies the actual RSA signature, not just cert identity
+- **GUI signing checkbox removed** -- No longer shown in the interface
+- **`supports_signing` removed from device profiles** -- All devices now show SPI programmer as the flash method
+- **`cryptography` package no longer required** -- The tool runs on Python standard library only
+
+### Changed
+- **Default output extension is now `.bin`** -- since signing is removed and all flashing is via SPI programmer, output files default to `.bin` instead of preserving the input extension. File dialogs accept both `.bin` and `.fd` for input.
+- GUI window default size: 1100x720 (was 920x800), minimum 900x550 (was 700x600)
+- GUI mouse wheel scrolling scoped to SPD canvas only (was global, interfered with log scrolling)
+- All devices (including Steam Deck) now show "Flash via SPI programmer" as the flash method
+- Success messages say "Ready for SPI flash" instead of showing h2offt commands
+- README updated: removed all signing references, added "Why no h2offt signing?" and "DMI Backup & Restore" sections
+- SteamOS setup simplified (no venv or pip install needed)
+
+### Technical Notes
+- DMI functions (`find_dmi_store`, `parse_dmi_records`, `export_dmi`, `import_dmi`) added to both CLI and GUI files (following the existing single-file-script pattern)
+- `DmiRecord` dataclass stores smbios_type, field_offset, flag (current/default), data bytes, and file offset per record
+- Steam Deck firmware uses AMI DmiEdit `$DMI` store format (NOT standard SMBIOS entry points). Standard `_SM_`/`_SM3_`/`_DMI_` entry points don't exist in SPI flash — SMBIOS tables are generated at runtime by UEFI. The `$DMI` store at ~0x6A4000 holds the per-field overrides that DXE drivers read to populate runtime tables.
+- DMI record format: type(1) + field_offset(1) + flag(1, 0x00=current, 0xFF=factory_default) + length(2, little-endian) + data(variable). Each field stored twice (current + default).
+- DMI export requires raw SPI flash dump (16MB), not `.fd` update files
+- All signing functions (`sign_firmware`, `_build_pkcs7`, `_update_iflash_flags`, etc.) are **preserved in the codebase** for future use if a QA.pfx becomes available. They work correctly -- the problem is the key, not the code.
+- DeckHD succeeds with h2offt because they possess Insyde's QA private key (`QA.pfx`), used with `iEFIFlashSigner.exe`. This key is not publicly available.
+- The QA Certificate: CN="QA Certificate.", RSA-2048, sha256WithRSA, self-signed, created 2012-04-13, valid until 2039-12-31.
+
 ## [1.6.1] - 2025-02-19
 
 ### Fixed
-- **3-layer firmware signing for h2offt** -- Steam Deck firmware has three integrity layers that all must be updated for h2offt to accept modified firmware. Previous versions only handled layer 3 (PE Authenticode). Analysis of DeckHD's firmware (CN="QA Certificate.") confirmed h2offt does not check certificate identity:
+- **3-layer firmware signing for h2offt** -- Steam Deck firmware has three integrity layers that all must be updated for h2offt to accept modified firmware. Previous versions only handled layer 3 (PE Authenticode). Analysis of DeckHD's firmware revealed that it uses Insyde's QA Certificate (CN="QA Certificate."), a pre-trusted key in h2offt's validation chain:
   - **`_IFLASH` flags bytes** -- All 6 `_IFLASH` structures in the firmware have a flags byte at offset `+0x0F` that controls h2offt's validation mode. DeckHD modifies 5 of 6 flags (verified across 3 firmware versions). Our code now applies the same per-structure transformations: `_IFLASH_DRV_IMG` (`0x80→0x88`), `_IFLASH_BIOSIMG` 2nd (`0x20→0x08`), `_IFLASH_INI_IMG` (`0x80→0x68`), `_IFLASH_BIOSCER` (`0x20→0x08`), `_IFLASH_BIOSCR2` (`0x20→0x08`). The 1st `_IFLASH_BIOSIMG` (`0x00`) is left unchanged. Additionally, `_IFLASH_DRV_IMG` has a **second flag byte at `+0x13`** that DeckHD also sets to match the new `+0x0F` value (`0x68→0x88` on LCD, `0x78→0xA8` on OLED). Byte-level comparison confirmed this is the only non-signing difference between our output and DeckHD in `_IFLASH` headers.
   - **`_IFLASH_BIOSCER` (layer 1)** -- Internal hash at firmware body offset. Hash algorithm is proprietary and unknown; hash is now preserved from stock firmware instead of being recomputed (diagnostic testing confirmed no SHA-256 candidate matched DeckHD's stored hash).
   - **`_IFLASH_BIOSCR2` (layer 2)** -- Internal Authenticode signature (WIN_CERTIFICATE/PKCS#7) embedded in firmware body. Now re-signed with our self-signed certificate. Firmware body resized to maintain layout invariant: `SizeOfImage == SecDir VA == BIOSCR2 WC end` (zero gap between BIOSCR2 and PE cert). Uses the full BIOSCR2 slot size (cert offset to SizeOfImage) rather than the WIN_CERTIFICATE `dwLength` field, which correctly handles OLED firmware that has zero-padding between the BIOSCR2 WC and the PE cert. DeckHD follows the same zero-gap invariant.
@@ -105,7 +145,7 @@ All notable changes to the APCB Memory Mod Tool.
 - GUI: "Sign firmware for h2offt" checkbox (enabled by default)
 - GUI: Auto-detects `cryptography` library availability and shows status
 - GUI: PE vs raw SPI dump detection with appropriate signing behavior
-- ~~Hardware-verified: h2offt on OLED Steam Deck accepts custom-signed firmware~~ (corrected in v1.6.1 -- original signing had bugs, see v1.6.1 notes)
+- ~~Hardware-verified: h2offt on OLED Steam Deck accepts custom-signed firmware~~ (disproved -- h2offt requires a trusted certificate, not just structural correctness; see v1.6.1 notes)
 
 ### Changed
 - CLI help text updated with signing examples and h2offt flash command
@@ -116,7 +156,7 @@ All notable changes to the APCB Memory Mod Tool.
 - Signing adds ~1,456 bytes to the firmware file (WIN_CERTIFICATE with PKCS#7 blob)
 - Layer 1 (_BIOSCER) signature from original firmware is preserved intact
 - Layer 2 (PE Authenticode) is replaced with the new custom signature
-- h2offt validates signature structure but not certificate identity -- any self-signed cert works (confirmed in v1.6.1 after signing bugs were fixed)
+- ~~h2offt validates signature structure but not certificate identity -- any self-signed cert works~~ (disproved -- h2offt appears to require a specific trusted certificate; DeckHD uses Insyde's QA Certificate)
 
 ## [1.1.0] - 2025-02-12
 

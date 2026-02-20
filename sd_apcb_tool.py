@@ -18,23 +18,20 @@ Core modification: patches LPDDR5/LPDDR5X SPD density bytes in APCB MEMG blocks
 
 Flashing Paths:
   - SPI programmer (CH341A + SOIC8 clip): Writes raw image directly to the
-    flash chip. No signing required. Supported by all devices.
-  - h2offt (software flash, Steam Deck only): Requires a validly signed PE
-    Authenticode capsule. Use --sign to automatically re-sign the modified
-    firmware for h2offt. Requires 'cryptography' (pip install cryptography).
+    flash chip. Supported by all devices. No signing required.
+  - Steam Deck: h2offt software flash requires Insyde's QA private key
+    (QA.pfx), which is not publicly available. Use SPI programmer instead.
 
 Supports:
   - Analysis mode: scans BIOS and reports all APCB blocks and SPD entries
   - Modify mode: patches SPD parameters for target memory configuration
   - Automatic device detection (Steam Deck vs ROG Ally)
-  - Automatic PE Authenticode re-signing (--sign) for h2offt software flash
   - Validates checksums before and after modification
 
 Usage:
   python sd_apcb_tool.py analyze <bios_file>
   python sd_apcb_tool.py analyze <bios_file> --device rog_ally
   python sd_apcb_tool.py modify <bios_in> <bios_out> --target 32
-  python sd_apcb_tool.py modify <bios_in> <bios_out> --target 32 --sign
   python sd_apcb_tool.py modify <bios_in> <bios_out> --target 16  (restore stock)
 """
 
@@ -52,7 +49,7 @@ from typing import List, Optional, Tuple
 # Constants
 # ============================================================================
 
-TOOL_VERSION = "1.4.0"
+TOOL_VERSION = "1.7.0"
 
 APCB_MAGIC = b'APCB'                         # APCB header signature (stock)
 APCB_MAGIC_MOD = b'QPCB'                     # APCB header signature (one modder's marker - cosmetic only)
@@ -181,21 +178,18 @@ DEVICE_PROFILES = {
     'steam_deck': {
         'name': 'Steam Deck',
         'memg_offset': MEMG_OFFSET_STANDARD,
-        'supports_signing': True,
         'memory_targets': [16, 32],
-        'flash_instructions': 'sudo /usr/share/jupiter_bios_updater/h2offt {filename}',
+        'flash_instructions': 'Flash via SPI programmer (CH341A + SOIC8 clip)',
     },
     'rog_ally': {
         'name': 'ROG Ally',
         'memg_offsets': MEMG_OFFSET_ALLY,
-        'supports_signing': False,
         'memory_targets': [16, 32, 64],
         'flash_instructions': 'Flash via SPI programmer (CH341A + SOIC8 clip)',
     },
     'rog_ally_x': {
         'name': 'ROG Ally X',
         'memg_offsets': MEMG_OFFSET_ALLY_X,
-        'supports_signing': False,
         'memory_targets': [16, 32, 64],
         'flash_instructions': 'Flash via SPI programmer (CH341A + SOIC8 clip)',
     },
@@ -713,6 +707,308 @@ def analyze_bios(filepath: str, device: str = 'auto') -> List[APCBBlock]:
 
 
 # ============================================================================
+# DMI / SMBIOS Backup & Restore (AMI DmiEdit $DMI Store)
+# ============================================================================
+
+# AMI DmiEdit store signature
+AMI_DMI_MAGIC = b'$DMI'  # 4 bytes: 0x24 0x44 0x4D 0x49
+
+# SMBIOS type names for display
+SMBIOS_TYPE_NAMES = {
+    0: 'BIOS Information', 1: 'System Information', 2: 'Baseboard Information',
+    3: 'System Enclosure', 4: 'Processor', 11: 'OEM Strings',
+    127: 'End-of-Table',
+}
+
+# SMBIOS field names by (type, offset) for human-readable display
+SMBIOS_FIELD_NAMES = {
+    (1, 0x04): 'Manufacturer',
+    (1, 0x05): 'Product Name',
+    (1, 0x06): 'Version',
+    (1, 0x07): 'Serial Number',
+    (1, 0x08): 'UUID',
+    (1, 0x19): 'SKU Number',
+    (1, 0x1A): 'Family',
+    (2, 0x04): 'Manufacturer',
+    (2, 0x05): 'Product',
+    (2, 0x06): 'Version',
+    (2, 0x07): 'Serial Number',
+    (2, 0x08): 'Asset Tag',
+    (3, 0x04): 'Manufacturer',
+    (3, 0x06): 'Version',
+    (3, 0x07): 'Serial Number',
+    (3, 0x08): 'Asset Tag',
+}
+
+
+@dataclass
+class DmiRecord:
+    """A single record from the AMI $DMI store.
+
+    AMI DmiEdit record format:
+      byte[0]:    SMBIOS type number
+      byte[1]:    Field offset within the SMBIOS structure
+      byte[2]:    Flag (0x00 = current value, 0xFF = factory default)
+      byte[3:5]:  Total record length (uint16 LE, includes 5-byte header)
+      byte[5+]:   Data (ASCII string or raw bytes)
+    """
+    smbios_type: int
+    field_offset: int
+    flag: int           # 0x00 = current, 0xFF = factory default
+    record_length: int
+    data: bytes         # The payload after the 5-byte header
+    offset_in_file: int # Absolute offset in firmware
+    raw_bytes: bytes    # Full record including header
+
+    @property
+    def is_current(self) -> bool:
+        return self.flag == 0x00
+
+    @property
+    def is_default(self) -> bool:
+        return self.flag == 0xFF
+
+    @property
+    def data_str(self) -> str:
+        """Decode data as ASCII string (strips trailing nulls)."""
+        return self.data.rstrip(b'\x00').decode('ascii', errors='replace')
+
+    @property
+    def field_name(self) -> str:
+        """Human-readable field name, or 'Field 0xNN'."""
+        name = SMBIOS_FIELD_NAMES.get((self.smbios_type, self.field_offset))
+        if name:
+            return name
+        return f'Field 0x{self.field_offset:02X}'
+
+    @property
+    def type_name(self) -> str:
+        return SMBIOS_TYPE_NAMES.get(self.smbios_type, f'Type {self.smbios_type}')
+
+
+def find_dmi_store(data: bytes) -> Optional[Tuple[int, int]]:
+    """Find the AMI $DMI store region in firmware.
+
+    The $DMI store contains device identity records (serial numbers, UUIDs, etc.)
+    written by AMI DmiEdit. Located by scanning for the '$DMI' magic signature.
+
+    Returns:
+        Tuple of (store_start, store_end) or None if not found.
+        store_start is the offset of '$DMI' magic.
+        store_end is where 0xFF padding begins (end of record data).
+    """
+    pos = 0
+    candidates = []
+    while pos < len(data) - 8:
+        idx = data.find(AMI_DMI_MAGIC, pos)
+        if idx < 0:
+            break
+        # Verify: next bytes after $DMI should be a valid record header
+        # (SMBIOS type 0-127, field offset, flag 0x00 or 0xFF)
+        rec_start = idx + 4
+        if rec_start + 5 <= len(data):
+            stype = data[rec_start]
+            flag = data[rec_start + 2]
+            rec_len = struct.unpack_from('<H', data, rec_start + 3)[0]
+            if stype <= 127 and flag in (0x00, 0xFF) and 5 < rec_len < 256:
+                # Find end of records: scan until we hit 0xFF padding
+                scan = rec_start
+                end = min(idx + 8192, len(data))  # Safety limit
+                while scan < end - 5:
+                    rt = data[scan]
+                    rf = data[scan + 2]
+                    rl = struct.unpack_from('<H', data, scan + 3)[0]
+                    if rt > 127 or rf not in (0x00, 0xFF) or rl < 5 or rl > 256:
+                        break
+                    scan += rl
+                candidates.append((idx, scan))
+        pos = idx + 1
+
+    if not candidates:
+        return None
+
+    # Return the largest (most records) $DMI store found
+    best = max(candidates, key=lambda c: c[1] - c[0])
+    return best
+
+
+def parse_dmi_records(data: bytes, store_start: int, store_end: int) -> List[DmiRecord]:
+    """Parse all records from an AMI $DMI store.
+
+    Args:
+        data: Full firmware data
+        store_start: Offset of '$DMI' magic
+        store_end: End of record data
+
+    Returns:
+        List of DmiRecord structures
+    """
+    records = []
+    pos = store_start + 4  # Skip '$DMI' magic
+
+    while pos < store_end - 5:
+        stype = data[pos]
+        foff = data[pos + 1]
+        flag = data[pos + 2]
+        rec_len = struct.unpack_from('<H', data, pos + 3)[0]
+
+        if stype > 127 or flag not in (0x00, 0xFF) or rec_len < 5 or rec_len > 256:
+            break
+
+        payload = data[pos + 5:pos + rec_len]
+        raw = data[pos:pos + rec_len]
+
+        records.append(DmiRecord(
+            smbios_type=stype, field_offset=foff, flag=flag,
+            record_length=rec_len, data=payload,
+            offset_in_file=pos, raw_bytes=raw
+        ))
+        pos += rec_len
+
+    return records
+
+
+def export_dmi(data: bytes) -> dict:
+    """Export DMI/SMBIOS identity data from firmware to a JSON-serializable dict.
+
+    Finds the AMI $DMI store, parses all records, and returns structured data
+    suitable for backup and later restoration.
+
+    Args:
+        data: Full firmware file contents (raw SPI dump)
+
+    Returns:
+        Dict with tool version, region info, raw data, and decoded identity fields
+
+    Raises:
+        ValueError: If no $DMI store found in firmware
+    """
+    result = find_dmi_store(data)
+    if result is None:
+        raise ValueError(
+            "No AMI $DMI store found in firmware.\n"
+            "This feature requires a raw SPI flash dump (16MB), not a .fd update file.\n"
+            "Use a SPI programmer (CH341A) to dump the full flash first.")
+
+    store_start, store_end = result
+    records = parse_dmi_records(data, store_start, store_end)
+
+    # Extract the full region including $DMI magic through end of records
+    region_size = store_end - store_start
+
+    export = {
+        'tool_version': TOOL_VERSION,
+        'format': 'ami_dmi_store',
+        'dmi_store_offset': f'0x{store_start:08X}',
+        'dmi_store_size': region_size,
+        'raw_store_hex': data[store_start:store_end].hex(),
+        'records': [],
+        'system_info': {},
+        'board_info': {},
+    }
+
+    for r in records:
+        entry = {
+            'smbios_type': r.smbios_type,
+            'type_name': r.type_name,
+            'field_offset': f'0x{r.field_offset:02X}',
+            'field_name': r.field_name,
+            'flag': 'current' if r.is_current else 'default',
+            'record_length': r.record_length,
+            'offset': f'0x{r.offset_in_file:08X}',
+            'raw_hex': r.raw_bytes.hex(),
+            'data_ascii': r.data_str,
+        }
+        export['records'].append(entry)
+
+        # Build human-readable identity summaries from current-value records
+        if r.is_current:
+            if r.smbios_type == 1:  # System Information
+                if r.field_offset == 0x07:
+                    export['system_info']['serial_number'] = r.data_str
+                elif r.field_offset == 0x04:
+                    export['system_info']['manufacturer'] = r.data_str
+                elif r.field_offset == 0x05:
+                    export['system_info']['product_name'] = r.data_str
+                elif r.field_offset == 0x08:
+                    export['system_info']['uuid'] = r.data.hex()
+            elif r.smbios_type == 2:  # Baseboard
+                if r.field_offset == 0x07:
+                    export['board_info']['serial_number'] = r.data_str
+                elif r.field_offset == 0x04:
+                    export['board_info']['manufacturer'] = r.data_str
+                elif r.field_offset == 0x05:
+                    export['board_info']['product'] = r.data_str
+
+    return export
+
+
+def import_dmi(firmware_data: bytearray, dmi_json: dict) -> List[Tuple[int, str]]:
+    """Import DMI identity data from a JSON export into firmware.
+
+    Overwrites the $DMI store region in firmware_data with the exported raw data.
+
+    Args:
+        firmware_data: Mutable firmware data (modified in-place)
+        dmi_json: DMI export dict (from export_dmi)
+
+    Returns:
+        List of (offset, description) patches applied
+
+    Raises:
+        ValueError: If $DMI store not found or sizes incompatible
+    """
+    target_result = find_dmi_store(bytes(firmware_data))
+    if target_result is None:
+        raise ValueError(
+            "No AMI $DMI store found in target firmware.\n"
+            "Ensure you are using a raw SPI flash dump (16MB).")
+
+    target_start, target_end = target_result
+    target_size = target_end - target_start
+
+    # Get source data from export
+    source_raw = bytes.fromhex(dmi_json['raw_store_hex'])
+    source_size = len(source_raw)
+
+    # Find the available space: from $DMI magic to start of next non-FF data
+    # The $DMI store sits in a gap between firmware volumes, padded with 0xFF
+    available = target_size
+    # Scan forward from target_end to find how much 0xFF padding exists
+    scan = target_end
+    while scan < len(firmware_data) and firmware_data[scan] == 0xFF:
+        scan += 1
+    available = scan - target_start
+
+    if source_size > available:
+        raise ValueError(
+            f"Source $DMI store ({source_size} bytes) is larger than "
+            f"available space ({available} bytes). Cannot import.")
+
+    patches = []
+
+    # Write source data, pad remaining with 0xFF
+    write_size = min(source_size, available)
+    firmware_data[target_start:target_start + write_size] = source_raw[:write_size]
+    # Fill any remaining space with 0xFF
+    if write_size < available:
+        firmware_data[target_start + write_size:target_start + available] = b'\xFF' * (available - write_size)
+
+    patches.append((target_start,
+        f"$DMI store overwritten ({source_size} bytes from export)"))
+
+    # Log identity info
+    si = dmi_json.get('system_info', {})
+    bi = dmi_json.get('board_info', {})
+    if si.get('serial_number'):
+        patches.append((target_start, f"System Serial: {si['serial_number']}"))
+    if bi.get('serial_number'):
+        patches.append((target_start, f"Board Serial: {bi['serial_number']}"))
+
+    return patches
+
+
+# ============================================================================
 # PE Authenticode Signing (Pure Python, no external tools)
 # ============================================================================
 
@@ -1083,6 +1379,12 @@ def sign_firmware(data_in):
     """
     Sign a PE firmware file with a fresh self-signed certificate.
 
+    NOTE: This function is currently unused. Hardware testing confirmed that
+    h2offt requires Insyde's QA private key (QA.pfx) for signature validation.
+    Self-signed certificates are rejected. This code is preserved for future
+    use if a QA.pfx becomes available. The signing logic itself is correct —
+    the issue is purely the certificate trust chain.
+
     Handles three integrity layers present in Steam Deck firmware:
     1. _IFLASH_BIOSCER: Internal hash (preserved — algorithm is proprietary)
     2. _IFLASH_BIOSCR2: Internal Authenticode signature (re-signed with our cert)
@@ -1331,8 +1633,7 @@ def patch_screen(data: bytearray, screen_key: str) -> List[Tuple[int, str]]:
 
 def modify_bios(input_path: str, output_path: str, target_gb: int,
                 modify_magic_byte: bool = False, entry_indices: Optional[List[int]] = None,
-                sign_output: bool = False, device: str = 'auto',
-                screen: Optional[str] = None):
+                device: str = 'auto', screen: Optional[str] = None):
     """
     Modify BIOS file for target memory configuration.
 
@@ -1342,7 +1643,6 @@ def modify_bios(input_path: str, output_path: str, target_gb: int,
         target_gb: Target memory size in GB (16, 32, or 64)
         modify_magic_byte: If True, change APCB byte[0] from 0x41 to 0x51 (cosmetic only)
         entry_indices: Which SPD entries to modify (0-based). None = first entry only.
-        sign_output: If True, re-sign the firmware with PE Authenticode for h2offt
         device: Device type ('auto', 'steam_deck', 'rog_ally', 'rog_ally_x')
     """
 
@@ -1369,12 +1669,6 @@ def modify_bios(input_path: str, output_path: str, target_gb: int,
         print(f"  Validated targets: {', '.join(f'{t}GB' for t in device_profile['memory_targets'])}")
         print(f"  Proceeding anyway — use at your own risk.")
 
-    # Check signing compatibility
-    if sign_output and device_profile and not device_profile['supports_signing']:
-        print(f"\n  WARNING: {device_name} does not support firmware signing.")
-        print(f"  The --sign flag will be ignored. Use SPI flash instead.")
-        sign_output = False
-
     print(f"\n{'='*78}")
     print(f"  APCB Memory Modification Tool v{TOOL_VERSION}")
     print(f"{'='*78}")
@@ -1383,8 +1677,6 @@ def modify_bios(input_path: str, output_path: str, target_gb: int,
     print(f"  Output: {os.path.basename(output_path)}")
     print(f"  Target: {config['name']}")
     print(f"  {config['description']}")
-    if sign_output:
-        print(f"  Signing: ENABLED (PE Authenticode for h2offt)")
 
     print(f"\n  File size: {len(data):,} bytes")
 
@@ -1508,46 +1800,8 @@ def modify_bios(input_path: str, output_path: str, target_gb: int,
         for offset, old, new in modifications:
             print(f"    0x{offset:08X}: 0x{old:02X} -> 0x{new:02X}")
     
-    # Sign if requested
     output_data = bytes(data)
-    
-    if sign_output:
-        print(f"\n  {'-'*74}")
-        print(f"  PE AUTHENTICODE SIGNING")
-        print(f"  {'-'*74}")
-        
-        if not _check_signing_available():
-            print(f"\n  ERROR: Signing requires the 'cryptography' Python package.")
-            print(f"  Install it with: pip install cryptography")
-            print(f"\n  On SteamOS, use a virtual environment:")
-            print(f"    python -m venv --system-site-packages ~/sd-apcb-venv")
-            print(f"    source ~/sd-apcb-venv/bin/activate")
-            print(f"    pip install cryptography")
-            print(f"    python sd_apcb_tool.py modify ...")
-            sys.exit(1)
-        
-        # Check if this is actually a PE file
-        if data[:2] != b'MZ':
-            print(f"\n  WARNING: File does not appear to be a PE firmware file.")
-            print(f"  Signing is only applicable to .fd firmware update files,")
-            print(f"  not raw SPI dumps. Skipping signing.")
-        else:
-            print(f"  Stripping existing Authenticode signature...")
-            print(f"  Generating self-signed RSA-2048 certificate (CN=SD APCB Tool)...")
-            print(f"  Computing PE Authenticode SHA-256 hash...")
-            print(f"  Building PKCS#7 SignedData...")
-            
-            try:
-                output_data = sign_firmware(bytes(data))
-                print(f"  Signing complete [OK]")
-                print(f"  Signed file size: {len(output_data):,} bytes")
-            except Exception as e:
-                print(f"\n  ERROR: Signing failed: {e}")
-                print(f"  The unsigned modified file will still be written.")
-                print(f"  You can use it with SPI flash, or sign manually with osslsigncode.")
-                output_data = bytes(data)
-                sign_output = False
-    
+
     # Write output
     with open(output_path, 'wb') as f:
         f.write(output_data)
@@ -1585,19 +1839,12 @@ def modify_bios(input_path: str, output_path: str, target_gb: int,
     
     if all_ok:
         print(f"\n  *** MODIFICATION SUCCESSFUL ***")
-        if sign_output:
-            print(f"  Output is signed and ready for h2offt software flash.")
-            flash_cmd = device_profile['flash_instructions'].format(filename=os.path.basename(output_path)) if device_profile else ''
-            if flash_cmd:
-                print(f"  Flash with: {flash_cmd}")
-        else:
-            if device_profile and device_profile['supports_signing']:
-                print(f"  Output file is ready for SPI flash.")
-                print(f"  NOTE: For h2offt software flash, re-run with --sign flag.")
-            else:
-                print(f"  Output file is ready for SPI flash.")
-                flash_instr = device_profile['flash_instructions'] if device_profile else 'Flash via SPI programmer'
-                print(f"  {flash_instr}")
+        print(f"  Output file is ready for SPI flash.")
+        if device_profile:
+            flash_instr = device_profile.get('flash_instructions', 'Flash via SPI programmer')
+            if isinstance(flash_instr, str) and '{filename}' in flash_instr:
+                flash_instr = flash_instr.format(filename=os.path.basename(output_path))
+            print(f"  {flash_instr}")
     else:
         print(f"\n  *** VERIFICATION FAILED ***")
         print(f"  DO NOT flash this file! Check for errors above.")
@@ -1671,7 +1918,6 @@ class InteractiveState:
     blocks: List[APCBBlock]
     all_entries: List[SPDEntry]
     entry_mods: dict                       # index -> PendingEntryMod
-    sign_enabled: bool = False
     magic_enabled: bool = False
     screen_patch: Optional[str] = None
     selected_entry: Optional[int] = None   # 0-based index, None = no selection
@@ -1799,8 +2045,6 @@ def _print_welcome(state: InteractiveState):
     print(f"\n  {c.LABEL}APCB Blocks:{c.RESET} {len(state.blocks)} total ({mc} MEMG, {tc} TOKN)")
     print(f"  {c.LABEL}SPD Entries:{c.RESET}  {len(state.all_entries)} ({types})")
     print(f"  {c.LABEL}Current:{c.RESET}     {cur_cfg}")
-    if state.sign_enabled:
-        print(f"  {c.LABEL}Signing:{c.RESET}     {c.OK}ENABLED{c.RESET}")
     if state.screen_patch:
         sn = SCREEN_PROFILES[state.screen_patch]['name']
         print(f"  {c.LABEL}Screen:{c.RESET}      {c.VALUE}{sn}{c.RESET}")
@@ -1854,8 +2098,6 @@ def _print_status(state: InteractiveState):
     print(f"\n  {c.LABEL}Device:{c.RESET}   {dev}")
     print(f"  {c.LABEL}Input:{c.RESET}    {os.path.basename(state.input_path)}")
     print(f"  {c.LABEL}Output:{c.RESET}   {os.path.basename(state.output_path)}")
-    sign_str = f"{c.OK}ENABLED{c.RESET}" if state.sign_enabled else f"{c.DIM}disabled{c.RESET}"
-    print(f"  {c.LABEL}Signing:{c.RESET}  {sign_str}")
     magic_str = f"{c.OK}ENABLED{c.RESET}" if state.magic_enabled else f"{c.DIM}disabled{c.RESET}"
     print(f"  {c.LABEL}Magic:{c.RESET}    {magic_str}")
     if state.screen_patch:
@@ -1889,7 +2131,6 @@ def _show_help(menu: str, state: InteractiveState):
         print(f"  {c.BOLD}  LIST{c.RESET}          Show all SPD entries")
         print(f"  {c.BOLD}  SPD{c.RESET}           Enter SPD entry editor")
         print(f"  {c.BOLD}  SCREEN{c.RESET}        Enter screen patch selector (Steam Deck LCD only)")
-        print(f"  {c.BOLD}  SIGN{c.RESET}          Toggle PE Authenticode signing")
         print(f"  {c.BOLD}  MAGIC{c.RESET}         Toggle APCB magic byte modification")
         print(f"  {c.BOLD}  STATUS{c.RESET}        Show all pending changes")
         print(f"  {c.BOLD}  APPLY{c.RESET}         Write changes to output file")
@@ -1936,8 +2177,6 @@ def _apply_changes(state: InteractiveState) -> bool:
         print(f"    {len(state.entry_mods)} SPD entry modification(s) ({target_str})")
     if state.screen_patch:
         print(f"    Screen: {SCREEN_PROFILES[state.screen_patch]['name']}")
-    if state.sign_enabled:
-        print(f"    Signing: ENABLED")
     print(f"    Output: {os.path.basename(state.output_path)}")
 
     try:
@@ -1980,28 +2219,14 @@ def _apply_changes(state: InteractiveState) -> bool:
         for off, old, new in mods:
             print(f"    0x{off:08X}: 0x{old:02X} -> 0x{new:02X}")
 
-    # 3. Sign if enabled
     output_data = bytes(data)
-    if state.sign_enabled:
-        if data[:2] != b'MZ':
-            print(f"\n  {c.WARN}Not a PE file -- signing skipped.{c.RESET}")
-        elif not _check_signing_available():
-            print(f"\n  {c.ERR}Signing requires 'cryptography' package. Skipping.{c.RESET}")
-        else:
-            print(f"\n  {c.CYAN}Signing firmware (PE Authenticode RSA-2048/SHA-256)...{c.RESET}")
-            try:
-                output_data = sign_firmware(bytes(data))
-                print(f"  {c.OK}Signed ({len(output_data):,} bytes){c.RESET}")
-            except Exception as e:
-                print(f"  {c.ERR}Sign failed: {e}{c.RESET}")
-                output_data = bytes(data)
 
-    # 4. Write output
+    # 3. Write output
     with open(state.output_path, 'wb') as f:
         f.write(output_data)
     print(f"\n  {c.OK}Output written:{c.RESET} {state.output_path} ({len(output_data):,} bytes)")
 
-    # 5. Verify
+    # 4. Verify
     print(f"\n  {c.CYAN}Verifying output...{c.RESET}")
     with open(state.output_path, 'rb') as f:
         verify_data = f.read()
@@ -2028,13 +2253,7 @@ def _apply_changes(state: InteractiveState) -> bool:
 
     if all_ok:
         print(f"\n  {c.OK}{c.BOLD}*** MODIFICATION SUCCESSFUL ***{c.RESET}")
-        if state.sign_enabled and data[:2] == b'MZ':
-            flash_cmd = state.device_profile.get('flash_instructions', '').format(
-                filename=os.path.basename(state.output_path)) if state.device_profile else ''
-            if flash_cmd:
-                print(f"  Flash with: {flash_cmd}")
-        else:
-            print(f"  Ready for SPI flash.")
+        print(f"  Ready for SPI flash.")
     else:
         print(f"\n  {c.ERR}{c.BOLD}*** VERIFICATION FAILED ***{c.RESET}")
         print(f"  {c.ERR}DO NOT flash this file!{c.RESET}")
@@ -2063,15 +2282,6 @@ def _handle_main_command(state: InteractiveState, cmd: str, args: list) -> Optio
             print(f"  {c.LABEL}Current selection:{c.RESET} {c.VALUE}{sn}{c.RESET}")
         else:
             print(f"  {c.LABEL}Current selection:{c.RESET} {c.DIM}(none){c.RESET}")
-    elif cmd == 'sign':
-        if state.device_profile and not state.device_profile['supports_signing']:
-            dev = state.device_profile['name'] if state.device_profile else 'Unknown'
-            print(f"  {c.WARN}{dev} does not support firmware signing.{c.RESET}")
-            print(f"  {c.LABEL}Use SPI flash for this device.{c.RESET}")
-            return None
-        state.sign_enabled = not state.sign_enabled
-        status = f"{c.OK}ENABLED{c.RESET}" if state.sign_enabled else f"{c.DIM}DISABLED{c.RESET}"
-        print(f"  PE Authenticode signing: {status}")
     elif cmd == 'magic':
         state.magic_enabled = not state.magic_enabled
         status = f"{c.OK}ENABLED{c.RESET}" if state.magic_enabled else f"{c.DIM}DISABLED{c.RESET}"
@@ -2307,8 +2517,7 @@ def _handle_screen_command(state: InteractiveState, cmd: str, args: list):
 
 
 def interactive_modify(input_path: str, output_path: str, device: str = 'auto',
-                       sign_output: bool = False, magic: bool = False,
-                       screen: Optional[str] = None):
+                       magic: bool = False, screen: Optional[str] = None):
     """Launch interactive DiskPart-style REPL for BIOS modification."""
     _enable_ansi_colors()
     c = _C
@@ -2340,7 +2549,6 @@ def interactive_modify(input_path: str, output_path: str, device: str = 'auto',
         blocks=blocks,
         all_entries=all_entries,
         entry_mods={},
-        sign_enabled=sign_output,
         magic_enabled=magic,
         screen_patch=screen,
     )
@@ -2382,28 +2590,31 @@ Examples:
     python sd_apcb_tool.py analyze my_bios_dump.bin
 
   Interactive mode (DiskPart-style per-entry editor):
-    python sd_apcb_tool.py modify my_bios.fd my_bios_mod.fd
+    python sd_apcb_tool.py modify my_bios.bin my_bios_mod.bin
 
-  Interactive with signing and screen patch pre-set:
-    python sd_apcb_tool.py modify my_bios.fd my_bios_mod.fd --sign --screen deckhd
+  Interactive with screen patch pre-set:
+    python sd_apcb_tool.py modify my_bios.bin my_bios_mod.bin --screen deckhd
 
-  Batch: modify for 32GB (SPI flash ready, no signing):
-    python sd_apcb_tool.py modify my_bios.fd my_bios_32gb.fd --target 32
-
-  Batch: modify for 32GB with signing (Steam Deck h2offt):
-    python sd_apcb_tool.py modify my_bios.fd my_bios_32gb.fd --target 32 --sign
+  Batch: modify for 32GB:
+    python sd_apcb_tool.py modify my_bios.bin my_bios_32gb.bin --target 32
 
   Batch: modify for 64GB (ROG Ally X):
     python sd_apcb_tool.py modify my_bios.bin my_bios_64gb.bin --target 64
 
   Batch: restore to stock 16GB:
-    python sd_apcb_tool.py modify my_bios_32gb.fd my_bios_stock.fd --target 16
+    python sd_apcb_tool.py modify my_bios_32gb.bin my_bios_stock.bin --target 16
+
+  DMI backup (for brick recovery):
+    python sd_apcb_tool.py dmi-export my_bios_dump.bin my_dmi_backup.json
+
+  DMI restore into clean BIOS:
+    python sd_apcb_tool.py dmi-import clean_bios.bin restored.bin my_dmi_backup.json
 
 Supported devices:
-  Steam Deck (LCD & OLED): 16GB/32GB, SPI flash or h2offt (--sign)
-  ROG Ally / Ally X: 16GB/32GB/64GB, SPI flash only (signing not supported)
+  Steam Deck (LCD & OLED): 16GB/32GB, SPI flash
+  ROG Ally / Ally X: 16GB/32GB/64GB, SPI flash
 
-  Omit --target for interactive mode. The --sign flag requires: pip install cryptography
+  Omit --target for interactive mode.
         """
     )
     
@@ -2421,9 +2632,6 @@ Supported devices:
     modify_parser.add_argument('bios_out', help='Output BIOS file')
     modify_parser.add_argument('--target', type=int, default=None, choices=[16, 32, 64],
                               help='Target memory size in GB (omit for interactive mode)')
-    modify_parser.add_argument('--sign', action='store_true',
-                              help='Re-sign firmware with PE Authenticode for h2offt software flash. '
-                                   'Requires: pip install cryptography')
     modify_parser.add_argument('--magic', action='store_true',
                               help='Modify APCB magic byte[0] (0x41->0x51). Cosmetic marker only, '
                                    'not required for the mod. LCD known-good mods do NOT change this.')
@@ -2441,6 +2649,23 @@ Supported devices:
     # Keep --deckhd as a convenience alias
     modify_parser.add_argument('--deckhd', action='store_true',
                               help='Shortcut for --screen deckhd')
+
+    # DMI export command
+    dmi_export_parser = subparsers.add_parser('dmi-export',
+        help='Export DMI/SMBIOS data from firmware to JSON file (for brick recovery)')
+    dmi_export_parser.add_argument('bios_file', help='Input BIOS/firmware file')
+    dmi_export_parser.add_argument('output_json', help='Output JSON file for DMI data')
+    dmi_export_parser.add_argument('--device', choices=['auto', 'steam_deck', 'rog_ally', 'rog_ally_x'],
+                                   default='auto', help='Device type (default: auto-detect)')
+
+    # DMI import command
+    dmi_import_parser = subparsers.add_parser('dmi-import',
+        help='Import DMI/SMBIOS data from JSON into firmware (for brick recovery)')
+    dmi_import_parser.add_argument('bios_in', help='Input BIOS/firmware file (clean image)')
+    dmi_import_parser.add_argument('bios_out', help='Output BIOS file with DMI data restored')
+    dmi_import_parser.add_argument('dmi_json', help='DMI JSON file (from dmi-export)')
+    dmi_import_parser.add_argument('--device', choices=['auto', 'steam_deck', 'rog_ally', 'rog_ally_x'],
+                                   default='auto', help='Device type (default: auto-detect)')
 
     args = parser.parse_args()
     
@@ -2471,7 +2696,6 @@ Supported devices:
                 args.target,
                 modify_magic_byte=args.magic,
                 entry_indices=entry_indices,
-                sign_output=args.sign,
                 device=args.device,
                 screen=screen,
             )
@@ -2481,10 +2705,102 @@ Supported devices:
                 args.bios_in,
                 args.bios_out,
                 device=args.device,
-                sign_output=args.sign,
                 magic=args.magic,
                 screen=screen,
             )
+
+    elif args.command == 'dmi-export':
+        _enable_ansi_colors()
+        c = _C
+        with open(args.bios_file, 'rb') as f:
+            data = f.read()
+        device = args.device
+        if device == 'auto':
+            device = detect_device(data)
+        device_name = DEVICE_PROFILES.get(device, {}).get('name', 'Unknown')
+
+        print(f"\n{'='*70}")
+        print(f"  DMI/SMBIOS Export -- {device_name}")
+        print(f"{'='*70}")
+
+        try:
+            dmi_data = export_dmi(data)
+        except ValueError as e:
+            print(f"\n  {c.ERR}ERROR: {e}{c.RESET}")
+            sys.exit(1)
+
+        # Display summary
+        si = dmi_data.get('system_info', {})
+        bi = dmi_data.get('board_info', {})
+        print(f"\n  Store:   {dmi_data['dmi_store_offset']} ({dmi_data['dmi_store_size']} bytes)")
+        print(f"  Records: {len(dmi_data['records'])}")
+        if si:
+            print(f"\n  {c.CYAN}System Information:{c.RESET}")
+            if si.get('manufacturer'):
+                print(f"    Manufacturer:  {si['manufacturer']}")
+            if si.get('product_name'):
+                print(f"    Product:       {si['product_name']}")
+            if si.get('serial_number'):
+                print(f"    Serial:        {si['serial_number']}")
+            if si.get('uuid'):
+                print(f"    UUID:          {si['uuid']}")
+        if bi:
+            print(f"\n  {c.CYAN}Board Information:{c.RESET}")
+            if bi.get('manufacturer'):
+                print(f"    Manufacturer:  {bi['manufacturer']}")
+            if bi.get('product'):
+                print(f"    Product:       {bi['product']}")
+            if bi.get('serial_number'):
+                print(f"    Serial:        {bi['serial_number']}")
+
+        import json
+        with open(args.output_json, 'w') as f:
+            json.dump(dmi_data, f, indent=2)
+        print(f"\n  {c.GREEN}Exported to: {args.output_json}{c.RESET}")
+
+    elif args.command == 'dmi-import':
+        _enable_ansi_colors()
+        c = _C
+        if os.path.abspath(args.bios_in) == os.path.abspath(args.bios_out):
+            print(f"\n  {c.ERR}ERROR: Input and output must be different files (safety measure){c.RESET}")
+            sys.exit(1)
+
+        import json
+        with open(args.bios_in, 'rb') as f:
+            data = bytearray(f.read())
+        with open(args.dmi_json, 'r') as f:
+            dmi_json = json.load(f)
+
+        device = args.device
+        if device == 'auto':
+            device = detect_device(bytes(data))
+        device_name = DEVICE_PROFILES.get(device, {}).get('name', 'Unknown')
+
+        print(f"\n{'='*70}")
+        print(f"  DMI/SMBIOS Import -- {device_name}")
+        print(f"{'='*70}")
+
+        si = dmi_json.get('system_info', {})
+        if si:
+            print(f"\n  Restoring from: {os.path.basename(args.dmi_json)}")
+            if si.get('serial_number'):
+                print(f"    Serial:  {si['serial_number']}")
+            if si.get('uuid'):
+                print(f"    UUID:    {si['uuid']}")
+
+        try:
+            patches = import_dmi(data, dmi_json)
+            for off, desc in patches:
+                print(f"    0x{off:08X}: {desc}")
+
+            with open(args.bios_out, 'wb') as f:
+                f.write(bytes(data))
+            print(f"\n  {c.GREEN}Output written: {args.bios_out}{c.RESET}")
+            print(f"  Ready for SPI flash.")
+        except ValueError as e:
+            print(f"\n  {c.ERR}ERROR: {e}{c.RESET}")
+            sys.exit(1)
+
     else:
         # No subcommand — prompt for file paths and enter interactive mode
         _enable_ansi_colors()
@@ -2502,7 +2818,7 @@ Supported devices:
             # Generate default output name
             from pathlib import Path
             p = Path(input_path)
-            default_out = str(p.parent / f"{p.stem}_modified{p.suffix}")
+            default_out = str(p.parent / f"{p.stem}_modified.bin")
             output_path = input(f"  {c.PROMPT}Output file path [{os.path.basename(default_out)}]: {c.RESET}").strip().strip('"').strip("'")
             if not output_path:
                 output_path = default_out
