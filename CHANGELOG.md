@@ -2,6 +2,19 @@
 
 All notable changes to the APCB Memory Mod Tool.
 
+## [1.7.1] - 2025-02-19
+
+### Fixed
+- **DMI import now works with stock `.fd` firmware files** -- Stock firmware ships with an empty `$DMI` store (all 0xFF after magic). `find_dmi_store()` now accepts blank stores when importing, so users can import DMI data directly into a stock `.fd` file without needing a second SPI dump.
+- **GUI DMI export** fixed key references (`dmi_region_offset` → `dmi_store_offset`, `tables` → `records`)
+
+### Improved
+- CLI `dmi-export` now shows guidance: "Store this file safely" and "Use dmi-import to restore"
+- CLI `dmi-import` now says "Flash this file via SPI programmer" and "UEFI settings recreate on first boot"
+- GUI export/import messages improved with same guidance
+- README DMI section rewritten with clear unbricking workflow, preventive backup guide, and supported file type table
+- Error messages now clarify that both `.bin` and `.fd` files work as import targets
+
 ## [1.7.0] - 2025-02-19
 
 ### Added

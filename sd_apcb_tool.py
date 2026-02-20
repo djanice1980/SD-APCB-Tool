@@ -49,7 +49,7 @@ from typing import List, Optional, Tuple
 # Constants
 # ============================================================================
 
-TOOL_VERSION = "1.7.0"
+TOOL_VERSION = "1.7.1"
 
 APCB_MAGIC = b'APCB'                         # APCB header signature (stock)
 APCB_MAGIC_MOD = b'QPCB'                     # APCB header signature (one modder's marker - cosmetic only)
@@ -786,16 +786,22 @@ class DmiRecord:
         return SMBIOS_TYPE_NAMES.get(self.smbios_type, f'Type {self.smbios_type}')
 
 
-def find_dmi_store(data: bytes) -> Optional[Tuple[int, int]]:
+def find_dmi_store(data: bytes, allow_empty: bool = False) -> Optional[Tuple[int, int]]:
     """Find the AMI $DMI store region in firmware.
 
     The $DMI store contains device identity records (serial numbers, UUIDs, etc.)
     written by AMI DmiEdit. Located by scanning for the '$DMI' magic signature.
 
+    Args:
+        data: Firmware data to scan
+        allow_empty: If True, accept blank $DMI stores (all 0xFF after magic).
+            Used by import_dmi() to write into stock firmware files (.fd) that
+            ship with an empty $DMI store.
+
     Returns:
         Tuple of (store_start, store_end) or None if not found.
         store_start is the offset of '$DMI' magic.
-        store_end is where 0xFF padding begins (end of record data).
+        store_end is end of record data, or end of 0xFF region for blank stores.
     """
     pos = 0
     candidates = []
@@ -811,7 +817,7 @@ def find_dmi_store(data: bytes) -> Optional[Tuple[int, int]]:
             flag = data[rec_start + 2]
             rec_len = struct.unpack_from('<H', data, rec_start + 3)[0]
             if stype <= 127 and flag in (0x00, 0xFF) and 5 < rec_len < 256:
-                # Find end of records: scan until we hit 0xFF padding
+                # Find end of records: scan until we hit invalid header
                 scan = rec_start
                 end = min(idx + 8192, len(data))  # Safety limit
                 while scan < end - 5:
@@ -824,10 +830,27 @@ def find_dmi_store(data: bytes) -> Optional[Tuple[int, int]]:
                 candidates.append((idx, scan))
         pos = idx + 1
 
+    # Fallback: accept blank $DMI stores (stock .fd firmware files)
+    # These have $DMI magic followed by all 0xFF -- no records yet
+    if not candidates and allow_empty:
+        pos = 0
+        while pos < len(data) - 4:
+            idx = data.find(AMI_DMI_MAGIC, pos)
+            if idx < 0:
+                break
+            # Scan forward to find end of 0xFF region after magic
+            scan = idx + 4
+            end = min(idx + 8192, len(data))
+            while scan < end and data[scan] == 0xFF:
+                scan += 1
+            if scan > idx + 4:  # At least some 0xFF space exists
+                candidates.append((idx, scan))
+            pos = idx + 1
+
     if not candidates:
         return None
 
-    # Return the largest (most records) $DMI store found
+    # Return the largest (most records / most space) $DMI store found
     best = max(candidates, key=lambda c: c[1] - c[0])
     return best
 
@@ -886,9 +909,9 @@ def export_dmi(data: bytes) -> dict:
     result = find_dmi_store(data)
     if result is None:
         raise ValueError(
-            "No AMI $DMI store found in firmware.\n"
-            "This feature requires a raw SPI flash dump (16MB), not a .fd update file.\n"
-            "Use a SPI programmer (CH341A) to dump the full flash first.")
+            "No DMI data found in firmware.\n"
+            "Export requires a firmware dump with populated DMI records.\n"
+            "Use a raw SPI flash dump from a working (or bricked) device.")
 
     store_start, store_end = result
     records = parse_dmi_records(data, store_start, store_end)
@@ -958,11 +981,12 @@ def import_dmi(firmware_data: bytearray, dmi_json: dict) -> List[Tuple[int, str]
     Raises:
         ValueError: If $DMI store not found or sizes incompatible
     """
-    target_result = find_dmi_store(bytes(firmware_data))
+    target_result = find_dmi_store(bytes(firmware_data), allow_empty=True)
     if target_result is None:
         raise ValueError(
             "No AMI $DMI store found in target firmware.\n"
-            "Ensure you are using a raw SPI flash dump (16MB).")
+            "The target file must contain a '$DMI' signature.\n"
+            "Supported: raw SPI flash dumps (.bin) and firmware update files (.fd)")
 
     target_start, target_end = target_result
     target_size = target_end - target_start
@@ -2757,6 +2781,8 @@ Supported devices:
         with open(args.output_json, 'w') as f:
             json.dump(dmi_data, f, indent=2)
         print(f"\n  {c.GREEN}Exported to: {args.output_json}{c.RESET}")
+        print(f"  Store this file safely -- it contains your device identity.")
+        print(f"  Use 'dmi-import' to restore into a clean firmware for brick recovery.")
 
     elif args.command == 'dmi-import':
         _enable_ansi_colors()
@@ -2796,7 +2822,8 @@ Supported devices:
             with open(args.bios_out, 'wb') as f:
                 f.write(bytes(data))
             print(f"\n  {c.GREEN}Output written: {args.bios_out}{c.RESET}")
-            print(f"  Ready for SPI flash.")
+            print(f"  Flash this file to your device via SPI programmer.")
+            print(f"  UEFI settings will recreate automatically on first boot.")
         except ValueError as e:
             print(f"\n  {c.ERR}ERROR: {e}{c.RESET}")
             sys.exit(1)
