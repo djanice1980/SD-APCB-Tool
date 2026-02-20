@@ -7,16 +7,16 @@ Patches the APCB (AMD Platform Configuration Block) SPD entries in firmware to r
 ## Features
 
 - **Analyze** -- Scan any supported BIOS and display all APCB blocks, SPD entries, and memory configuration
-- **Interactive CLI** -- DiskPart-style nested menus for per-entry SPD editing, module renaming, screen patching, and signing
+- **Interactive CLI** -- DiskPart-style nested menus for per-entry SPD editing, module renaming, and screen patching
 - **Batch Mode** -- One-command patching with `--target` for scripting and automation
 - **Per-Entry Control** -- Select individual SPD entries to modify with custom density and module names
 - **Screen Patching** -- Replace EDID and version tag for aftermarket screens (DeckHD 1200p, DeckSight OLED)
-- **Sign** -- Built-in PE Authenticode re-signing for Steam Deck h2offt software flash (no external tools required)
 - **Restore** -- Revert a modified BIOS back to stock configuration
 - **Multi-device** -- Auto-detects Steam Deck, ROG Ally, and ROG Ally X from firmware contents
 - **All Chip Brands** -- Patches all SPD entries by default (Micron, Samsung, SK Hynix, etc.)
+- **DMI Backup & Restore** -- Export/import device identity (serial, UUID) for brick recovery
 - **Cross-platform** -- Works on Windows, Linux, macOS, and Steam Deck itself
-- **GUI** -- Full graphical interface with per-entry checkboxes, density dropdowns, screen patch selector, and dark theme
+- **GUI** -- Two-column layout with per-entry checkboxes, density dropdowns, screen patch selector, DMI tools, and dark theme
 
 ## Quick Start
 
@@ -25,7 +25,7 @@ Patches the APCB (AMD Platform Configuration Block) SPD entries in firmware to r
 The recommended way to use the CLI. Run `modify` without `--target` to enter the interactive editor:
 
 ```bash
-python sd_apcb_tool.py modify my_bios.fd my_bios_mod.fd
+python sd_apcb_tool.py modify my_bios.bin my_bios_mod.bin
 ```
 
 This opens a DiskPart-style REPL where you can inspect entries, select which ones to modify, set densities, rename modules, configure screen patches, and apply all changes at once.
@@ -43,22 +43,22 @@ For scripting or one-shot modifications, use `--target` to skip interactive mode
 
 ```bash
 # Analyze a BIOS file (auto-detects device)
-python sd_apcb_tool.py analyze F7G0112_sign.fd
+python sd_apcb_tool.py analyze my_bios_dump.bin
 
-# Steam Deck: Modify for 32GB + sign for h2offt
-python sd_apcb_tool.py modify F7G0112_sign.fd F7G0112_32GB.fd --target 32 --sign
+# Steam Deck: Modify for 32GB
+python sd_apcb_tool.py modify my_bios_dump.bin my_bios_32GB.bin --target 32
 
-# Steam Deck: Modify for 32GB + sign + DeckHD screen patch
-python sd_apcb_tool.py modify F7G0112_sign.fd F7G0112_32GB.fd --target 32 --sign --screen deckhd
+# Steam Deck: Modify for 32GB + DeckHD screen patch
+python sd_apcb_tool.py modify my_bios_dump.bin my_bios_32GB.bin --target 32 --screen deckhd
 
-# ROG Ally / Ally X: Modify for 32GB (no signing needed)
+# ROG Ally / Ally X: Modify for 32GB
 python sd_apcb_tool.py modify RC71L.342 RC71L_32GB.342 --target 32
 
 # ROG Ally X: Modify for 64GB
 python sd_apcb_tool.py modify RC72LA.312 RC72LA_64GB.312 --target 64
 
 # Restore to stock
-python sd_apcb_tool.py modify modified.fd stock.fd --target 16 --sign
+python sd_apcb_tool.py modify modified.bin stock.bin --target 16
 ```
 
 ### GUI
@@ -79,12 +79,12 @@ When you enter interactive mode, you'll see a summary of the loaded firmware:
 
 ```
   ========================================================================
-    APCB Memory Configuration Tool v1.4.0 -- Interactive Mode
+    APCB Memory Configuration Tool v1.7.0 -- Interactive Mode
   ========================================================================
 
   Device:  Steam Deck (auto-detected)
-  Input:   F7G0112_sign.fd (17,825,792 bytes)
-  Output:  F7G0112_32GB.fd
+  Input:   my_bios_dump.bin (16,777,216 bytes)
+  Output:  my_bios_dump_modified.bin
 
   APCB Blocks: 6 total (2 MEMG, 4 TOKN)
   SPD Entries:  12 (12 LPDDR5)
@@ -102,7 +102,6 @@ Main menu commands:
 | `LIST`      | Show all SPD entries with current density and type     |
 | `SPD`       | Enter the SPD entry editor submenu                     |
 | `SCREEN`    | Enter the screen patch selector (Steam Deck LCD only)  |
-| `SIGN`      | Toggle PE Authenticode signing on/off                  |
 | `MAGIC`     | Toggle APCB magic byte modification                    |
 | `STATUS`    | Show all pending changes before applying               |
 | `APPLY`     | Write all changes to the output file                   |
@@ -179,7 +178,7 @@ Available screen profiles:
 Here's a complete walkthrough modifying a Steam Deck BIOS for 32GB with a DeckHD screen patch:
 
 ```
-$ python sd_apcb_tool.py modify F7G0112_sign.fd F7G0112_mod.fd
+$ python sd_apcb_tool.py modify my_bios_dump.bin my_bios_mod.bin
 
   [Welcome banner with device info...]
 
@@ -223,9 +222,6 @@ APCB [Steam Deck] SCREEN > select deckhd
 
 APCB [Steam Deck] SCREEN > back
 
-APCB [Steam Deck] > sign
-  PE Authenticode signing: ENABLED
-
 APCB [Steam Deck] > status
 
   Pending SPD modifications:
@@ -233,26 +229,24 @@ APCB [Steam Deck] > status
     [2] K3LKCKC0BM             16GB -> 32GB
     ...
   Screen patch: DeckHD 1200p
-  Signing: ENABLED
 
 APCB [Steam Deck] > apply
 
   Ready to apply:
     12 SPD entry modification(s) (32GB)
     Screen: DeckHD 1200p
-    Signing: ENABLED
-    Output: F7G0112_mod.fd
+    Output: my_bios_mod.bin
 
   Proceed? [y/N]: y
 
   Applying DeckHD 1200p screen patch...
   Modifying 12 SPD entries...
-  Signing firmware...
   Writing output...
   Verifying...
 
   *** MODIFICATION SUCCESSFUL ***
-  Flash with: sudo /usr/share/jupiter_bios_updater/h2offt F7G0112_mod.fd
+  Output written to: my_bios_mod.bin
+  Ready for SPI flash.
 ```
 
 ## Screen Replacement Patching
@@ -263,7 +257,7 @@ The tool supports patching Steam Deck LCD firmware for aftermarket screen replac
 
 1. **EDID Replacement** -- Locates the stock BOE EDID block (identified by manufacturer ID) and replaces it with the aftermarket screen's EDID. This tells the system the display resolution, timing, and capabilities.
 2. **Version Tag** -- Appends a tag (e.g. "DeckHD" or "DeckSight") to every `$BVDT$` version string in the firmware so you can identify a patched BIOS.
-3. **No Certificate Concerns** -- The patching process is identical to what the screen vendors do. The vendors themselves use self-signed certificates, so custom signing works the same way.
+3. **Same Process as Vendors** -- The patching process is identical to what the screen vendors do.
 
 ### Supported Screens
 
@@ -277,21 +271,21 @@ The tool supports patching Steam Deck LCD firmware for aftermarket screen replac
 **Interactive mode** (recommended):
 
 ```bash
-python sd_apcb_tool.py modify my_bios.fd my_bios_mod.fd
+python sd_apcb_tool.py modify my_bios.bin my_bios_mod.bin
 # Then: SCREEN > SELECT deckhd > BACK > APPLY
 ```
 
 **Batch mode:**
 
 ```bash
-# DeckHD screen patch + 32GB + signing
-python sd_apcb_tool.py modify my_bios.fd my_bios_mod.fd --target 32 --sign --screen deckhd
+# DeckHD screen patch + 32GB
+python sd_apcb_tool.py modify my_bios.bin my_bios_mod.bin --target 32 --screen deckhd
 
-# DeckSight screen patch + 32GB + signing
-python sd_apcb_tool.py modify my_bios.fd my_bios_mod.fd --target 32 --sign --screen decksight
+# DeckSight screen patch + 32GB
+python sd_apcb_tool.py modify my_bios.bin my_bios_mod.bin --target 32 --screen decksight
 
 # Shortcut: --deckhd is an alias for --screen deckhd
-python sd_apcb_tool.py modify my_bios.fd my_bios_mod.fd --target 32 --sign --deckhd
+python sd_apcb_tool.py modify my_bios.bin my_bios_mod.bin --target 32 --deckhd
 ```
 
 ### GUI Usage
@@ -302,44 +296,61 @@ python sd_apcb_tool.py modify my_bios.fd my_bios_mod.fd --target 32 --sign --dec
 4. Configure memory settings as usual
 5. Click "Apply Modification"
 
+## DMI Backup & Restore
+
+When a Steam Deck is bricked and recovered with a clean BIOS image via SPI programmer, the device-specific identity data (serial number, UUID, board info) is lost. This tool can export that data from a firmware dump and re-import it into a clean BIOS, automating the hex-editor recovery process.
+
+### CLI Usage
+
+```bash
+# Step 1: Export DMI from your firmware dump (bricked or working)
+python sd_apcb_tool.py dmi-export my_bios_dump.bin my_dmi_backup.json
+
+# Step 2: Import DMI into a clean BIOS image
+python sd_apcb_tool.py dmi-import clean_bios.bin restored_bios.bin my_dmi_backup.json
+
+# Step 3: Flash the restored BIOS via SPI programmer
+flashrom -p ch341a_spi -w restored_bios.bin
+```
+
+The export produces a human-readable JSON file containing the AMI DmiEdit `$DMI` store records plus raw hex data for exact byte-level restoration. Requires a raw SPI flash dump (16MB), not a `.fd` update file.
+
+### GUI Usage
+
+1. Open a raw SPI flash dump (16MB `.bin` file)
+2. Click **"Export DMI"** to save device identity to a JSON file
+3. To restore: open the clean BIOS dump, click **"Import DMI"**, select the JSON, and save the output
+
+### What It Backs Up
+
+The tool exports all records from the AMI DmiEdit `$DMI` store in the firmware, including:
+
+- **Type 1 (System Information)** -- Serial number (e.g. `FYZZ54203BBD`)
+- **Type 2 (Baseboard Information)** -- Board serial number (e.g. `MEFC53901051`)
+- **Type 11 (OEM Strings)** -- Device-specific calibration data (display, joystick)
+
 ## Requirements
 
-- **Python 3.8+**
-- **For signing** (optional, Steam Deck only): `pip install cryptography`
-- Signing is needed for h2offt software flash. Not needed for SPI programmer flash.
+- **Python 3.8+** (standard library only, no additional packages needed)
 
 ### SteamOS Setup (Steam Deck)
 
-SteamOS is Arch-based with a read-only filesystem -- avoid `sudo pip install`.
+SteamOS is Arch-based with a read-only filesystem. Switch to Desktop Mode and open Konsole (Terminal):
 
 ```bash
-# 1. Switch to Desktop Mode and open Konsole (Terminal)
-
-# 2. Create a virtual environment with system site-packages
-python -m venv --system-site-packages ~/sd-apcb-venv
-
-# 3. Activate it
-source ~/sd-apcb-venv/bin/activate
-
-# 4. Upgrade pip and install cryptography
-pip install -U pip
-pip install cryptography
-
-# 5. Run the tool (while venv is active)
-python sd_apcb_tool.py modify <input> <output> --target 32 --sign
+# Run the tool directly -- no venv or pip install needed
+python sd_apcb_tool.py modify <input> <output> --target 32
 
 # or
 python sd_apcb_gui.py
 ```
-
-You must activate the venv (`source ~/sd-apcb-venv/bin/activate`) each time before running the tool.
 
 ### Windows
 
 No special setup required. Run from PowerShell or Command Prompt:
 
 ```powershell
-python sd_apcb_tool.py modify my_bios.fd my_bios_mod.fd
+python sd_apcb_tool.py modify my_bios.bin my_bios_mod.bin
 ```
 
 
@@ -360,40 +371,18 @@ After patching, the APCB block checksum is recalculated to maintain validity.
 
 Firmware typically contains two identical APCB MEMG blocks (primary + backup). Both are patched.
 
-### Signing
+### Why no h2offt signing?
 
-Steam Deck firmware files (`.fd`) are PE executables with Authenticode signatures. The `h2offt` flash tool validates this signature before writing.
-
-When you use `--sign` (CLI), toggle signing in interactive mode, or check the signing box (GUI), the tool:
-
-1. Strips the existing Valve Authenticode signature
-2. Generates a fresh self-signed RSA-2048 / SHA-256 certificate
-3. Computes the PE Authenticode hash of the modified firmware
-4. Builds a PKCS#7 SignedData structure and attaches it as a WIN_CERTIFICATE
-
-This is implemented entirely in Python using the `cryptography` library -- no external tools like `osslsigncode` or `signtool` needed.
-
-> **Verified on hardware:** h2offt accepts custom-signed firmware. It validates internal signature consistency but does not check specific certificate identities or trust chains.
+Steam Deck firmware files (`.fd`) are PE executables with Authenticode signatures. The `h2offt` flash tool performs full cryptographic validation -- it verifies the RSA signature against Insyde's QA Certificate (CN="QA Certificate."), a pre-trusted key in h2offt's validation chain. Hardware testing confirmed that even single-byte changes to the firmware break validation without the QA private key (`QA.pfx`). Self-signed certificates are rejected regardless of structural correctness. DeckHD succeeds because they possess this key; it is not publicly available.
 
 ## Flashing
 
-### Steam Deck -- Software flash (h2offt)
-
-Use a signed output file:
-
-```bash
-# On the Steam Deck itself
-sudo /usr/share/jupiter_bios_updater/h2offt F7G0112_32GB.fd
-```
-
-The Deck will reboot and apply the firmware update.
-
 ### Steam Deck -- SPI programmer (CH341A)
 
-For SPI flash, signing is not required. The output can be written directly:
+Steam Deck requires an SPI programmer to flash modified firmware (h2offt rejects unsigned modifications):
 
 ```bash
-# Modify without signing
+# Modify the BIOS
 python sd_apcb_tool.py modify dump.bin dump_32gb.bin --target 32
 
 # Flash with your SPI programmer tool (e.g., flashrom)
@@ -402,20 +391,16 @@ flashrom -p ch341a_spi -w dump_32gb.bin
 
 ### ROG Ally / Ally X -- SPI programmer
 
-ROG Ally devices require an SPI programmer (CH341A + SOIC8 clip) to flash modified firmware. ASUS uses UEFI capsule updates which validate signatures -- signing is not supported for these devices.
-
-### Crisis recovery
-
-InsydeH2O crisis mode bypasses signature verification entirely. Useful as a recovery path if something goes wrong.
+ROG Ally devices also require an SPI programmer (CH341A + SOIC8 clip) to flash modified firmware.
 
 ## Supported Devices & Firmware
 
-| Device | Firmware | RAM Targets | Screen Patches | Signing | Status |
-|--------|----------|-------------|----------------|---------|--------|
-| Steam Deck LCD | F7A0110, F7A0113, F7A0131 | 16/32GB | DeckHD, DeckSight | Supported | Tested |
-| Steam Deck OLED | F7G0005, F7G0112 | 16/32GB | -- | Supported | Hardware verified |
-| ROG Ally | RC71L series | 16/32/64GB | -- | N/A (SPI only) | Tested |
-| ROG Ally X | RC72LA series | 16/32/64GB | -- | N/A (SPI only) | Tested |
+| Device | Firmware | RAM Targets | Screen Patches | Flash Method | Status |
+|--------|----------|-------------|----------------|--------------|--------|
+| Steam Deck LCD | F7A0110, F7A0113, F7A0131 | 16/32GB | DeckHD, DeckSight | SPI programmer | Tested |
+| Steam Deck OLED | F7G0005, F7G0112 | 16/32GB | -- | SPI programmer | Tested |
+| ROG Ally | RC71L series | 16/32/64GB | -- | SPI programmer | Tested |
+| ROG Ally X | RC72LA series | 16/32/64GB | -- | SPI programmer | Tested |
 
 Should work on any firmware using the standard APCB/MEMG structure with LPDDR5/LPDDR5X SPD entries. Device type is auto-detected from firmware contents.
 
@@ -433,11 +418,13 @@ Any LPDDR5/LPDDR5X module with the appropriate density should work with these SP
 ### Commands
 
 ```
-usage: sd_apcb_tool.py {analyze,modify} ...
+usage: sd_apcb_tool.py {analyze,modify,dmi-export,dmi-import} ...
 
 Commands:
   analyze              Scan BIOS and display APCB/SPD information
   modify               Patch BIOS for target memory configuration
+  dmi-export           Export DMI/SMBIOS data to JSON file (brick recovery)
+  dmi-import           Import DMI/SMBIOS data from JSON into firmware
   (no command)         Prompt for file paths and enter interactive mode
 ```
 
@@ -454,13 +441,29 @@ Commands:
   bios_in              Input BIOS file
   bios_out             Output BIOS file (must be different from input)
   --target {16,32,64}  Target memory size in GB (omit for interactive mode)
-  --sign               Re-sign firmware for h2offt software flash (Steam Deck only)
   --screen PROFILE     Apply screen replacement patch: deckhd, decksight (Steam Deck LCD only)
   --deckhd             Shortcut for --screen deckhd
   --device TYPE        Force device type: auto, steam_deck, rog_ally, rog_ally_x
   --magic              Modify APCB magic byte (cosmetic, not required)
   --all-entries        Modify all SPD entries (this is now the default)
   --entry N            Modify only specific entry index (0-based, repeatable)
+```
+
+### DMI Export Options
+
+```
+  bios_file            BIOS/firmware file to read DMI from
+  output_json          Output JSON file for DMI data
+  --device TYPE        Force device type: auto, steam_deck, rog_ally, rog_ally_x
+```
+
+### DMI Import Options
+
+```
+  bios_in              Input BIOS/firmware file (clean image)
+  bios_out             Output BIOS file with DMI data restored
+  dmi_json             DMI JSON file (from dmi-export)
+  --device TYPE        Force device type: auto, steam_deck, rog_ally, rog_ally_x
 ```
 
 ### Behavior
@@ -478,14 +481,15 @@ The GUI (`sd_apcb_gui.py`) provides the same capabilities as the CLI with a grap
 - **Memory Target** -- Radio buttons for 16GB/32GB/64GB (device-appropriate options enabled)
 - **SPD Entry List** -- Scrollable list with per-entry checkboxes, density dropdowns, and editable module names
 - **Screen Replacement** -- Dropdown selector: None, DeckHD 1200p, DeckSight OLED (enabled for Steam Deck LCD only)
-- **Signing Toggle** -- Checkbox for PE Authenticode signing (enabled for Steam Deck only)
+- **DMI Export/Import** -- Backup and restore device identity (serial, UUID) for brick recovery
 - **Select All** -- Toggle all SPD entry checkboxes on/off
+- **Two-Column Layout** -- Settings on the left, log output on the right (resizable divider)
 - **Log Output** -- Scrollable log with Clear and Copy buttons
 
 ## Project Structure
 
 ```
-sd_apcb_tool.py    -- CLI tool (analysis, modification, interactive editor, signing)
+sd_apcb_tool.py    -- CLI tool (analysis, modification, interactive editor)
 sd_apcb_gui.py     -- GUI application (same engine, graphical interface)
 README.md          -- This file
 CHANGELOG.md       -- Version history
@@ -501,15 +505,6 @@ The AMD Platform Configuration Block (APCB) contains memory training parameters 
 - Content type marker: `MEMG` for memory (Steam Deck at offset 0x80; ROG Ally at 0xC0; Ally X at 0xC8), `TOKN` for tokens
 - For MEMG blocks: multiple SPD entries each starting with magic `23 11 13 0E` (LPDDR5) or `23 11 15 0E` (LPDDR5X)
 
-### Signing Architecture
-
-Steam Deck firmware has a two-layer signing structure:
-
-- **Layer 1 (_BIOSCER)** -- InsydeH2O internal signature embedded in the PE body. This tool preserves it from the original firmware.
-- **Layer 2 (Authenticode)** -- Standard PE WIN_CERTIFICATE at the security directory. This tool replaces it with a fresh signature.
-
-h2offt validates Layer 2 for structural integrity but accepts any certificate identity.
-
 ### Screen Patch Architecture
 
 Screen replacement patching modifies two things in the firmware:
@@ -523,7 +518,6 @@ Screen replacement patching modifies two things in the firmware:
 - All SPD entries patched by default for broad chip compatibility
 - All APCB checksums are recalculated and verified after modification
 - The output file is re-scanned to confirm correct byte values per entry
-- Signing failures fall back gracefully to unsigned output
 - Stock configuration can be restored at any time with `--target 16`
 - Interactive mode requires explicit `APPLY` + confirmation before any file is written
 
@@ -543,6 +537,6 @@ This tool modifies BIOS firmware. Incorrect use can brick your device. Always:
 ## Acknowledgments
 
 - The Steam Deck modding community for documenting the 32GB RAM upgrade process
-- DeckHD for demonstrating that h2offt accepts non-Valve certificates
+- DeckHD for their open-source BiosMaker and firmware analysis reference
 - DeckSight for the AMOLED screen replacement
-- InsydeH2O documentation for the APCB and signing architecture details
+- InsydeH2O documentation for the APCB architecture details

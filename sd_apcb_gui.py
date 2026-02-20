@@ -10,11 +10,10 @@ Supported devices:
   - ASUS ROG Ally / Ally X — 16GB/32GB/64GB
 
 Auto-detects device type from firmware contents.
-Supports both SPI flash output and signed h2offt-ready firmware (Steam Deck only).
+Outputs ready for SPI flash programming.
 
 Requirements:
   - Python 3.8+ (tkinter included with standard Python on Windows)
-  - For h2offt signing (Steam Deck only): pip install cryptography
 
 Usage: python sd_apcb_gui.py
 """
@@ -27,7 +26,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 
 APP_TITLE = "SD APCB Memory Mod Tool"
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.7.0"
 APCB_MAGIC = b'APCB'
 APCB_MAGIC_MOD = b'QPCB'
 APCB_CHECKSUM_OFFSET = 16
@@ -113,9 +112,9 @@ SCREEN_MFR_IDS = [p['mfr_id'] for p in SCREEN_PROFILES.values()]
 
 # Device profiles
 DEVICE_PROFILES = {
-    'steam_deck': {'name': 'Steam Deck', 'supports_signing': True, 'memory_targets': [16, 32]},
-    'rog_ally': {'name': 'ROG Ally', 'supports_signing': False, 'memory_targets': [16, 32, 64]},
-    'rog_ally_x': {'name': 'ROG Ally X', 'supports_signing': False, 'memory_targets': [16, 32, 64]},
+    'steam_deck': {'name': 'Steam Deck', 'memory_targets': [16, 32]},
+    'rog_ally': {'name': 'ROG Ally', 'memory_targets': [16, 32, 64]},
+    'rog_ally_x': {'name': 'ROG Ally X', 'memory_targets': [16, 32, 64]},
 }
 
 def detect_device(data):
@@ -574,6 +573,107 @@ def sign_firmware(data_in):
     if _auth_hash(bytes(vd)) != ph: raise RuntimeError("Signing self-check FAILED: hash mismatch")
     return bytes(d)
 
+# ── DMI / SMBIOS (AMI DmiEdit $DMI Store) ──
+AMI_DMI_MAGIC = b'$DMI'
+SMBIOS_FIELD_NAMES = {
+    (1,0x04):'Manufacturer',(1,0x05):'Product Name',(1,0x06):'Version',(1,0x07):'Serial Number',
+    (1,0x08):'UUID',(2,0x04):'Manufacturer',(2,0x05):'Product',(2,0x06):'Version',
+    (2,0x07):'Serial Number',(2,0x08):'Asset Tag',(3,0x04):'Manufacturer',(3,0x07):'Serial Number',
+}
+SMBIOS_TYPE_NAMES = {0:'BIOS Information',1:'System Information',2:'Baseboard Information',
+    3:'System Enclosure',4:'Processor',11:'OEM Strings',127:'End-of-Table'}
+
+@dataclass
+class DmiRecord:
+    smbios_type: int; field_offset: int; flag: int; record_length: int
+    data: bytes; offset_in_file: int; raw_bytes: bytes
+    @property
+    def is_current(self): return self.flag == 0x00
+    @property
+    def data_str(self): return self.data.rstrip(b'\x00').decode('ascii', errors='replace')
+    @property
+    def field_name(self): return SMBIOS_FIELD_NAMES.get((self.smbios_type, self.field_offset), f'Field 0x{self.field_offset:02X}')
+    @property
+    def type_name(self): return SMBIOS_TYPE_NAMES.get(self.smbios_type, f'Type {self.smbios_type}')
+
+def find_dmi_store(data):
+    pos, candidates = 0, []
+    while pos < len(data) - 8:
+        idx = data.find(AMI_DMI_MAGIC, pos)
+        if idx < 0: break
+        rs = idx + 4
+        if rs + 5 <= len(data):
+            st, fl = data[rs], data[rs+2]
+            rl = struct.unpack_from('<H', data, rs+3)[0]
+            if st <= 127 and fl in (0x00,0xFF) and 5 < rl < 256:
+                scan, end = rs, min(idx+8192, len(data))
+                while scan < end - 5:
+                    rt, rf = data[scan], data[scan+2]
+                    rrl = struct.unpack_from('<H', data, scan+3)[0]
+                    if rt > 127 or rf not in (0x00,0xFF) or rrl < 5 or rrl > 256: break
+                    scan += rrl
+                candidates.append((idx, scan))
+        pos = idx + 1
+    return max(candidates, key=lambda c: c[1]-c[0]) if candidates else None
+
+def parse_dmi_records(data, store_start, store_end):
+    records, pos = [], store_start + 4
+    while pos < store_end - 5:
+        st, fo, fl = data[pos], data[pos+1], data[pos+2]
+        rl = struct.unpack_from('<H', data, pos+3)[0]
+        if st > 127 or fl not in (0x00,0xFF) or rl < 5 or rl > 256: break
+        records.append(DmiRecord(st, fo, fl, rl, data[pos+5:pos+rl], pos, data[pos:pos+rl]))
+        pos += rl
+    return records
+
+def export_dmi(data):
+    result = find_dmi_store(data)
+    if result is None:
+        raise ValueError("No AMI $DMI store found in firmware.\n"
+            "This feature requires a raw SPI flash dump (16MB), not a .fd update file.\n"
+            "Use a SPI programmer (CH341A) to dump the full flash first.")
+    ss, se = result
+    records = parse_dmi_records(data, ss, se)
+    export = {'tool_version': APP_VERSION, 'format': 'ami_dmi_store',
+              'dmi_store_offset': f'0x{ss:08X}', 'dmi_store_size': se-ss,
+              'raw_store_hex': data[ss:se].hex(), 'records': [], 'system_info': {}, 'board_info': {}}
+    for r in records:
+        export['records'].append({'smbios_type': r.smbios_type, 'type_name': r.type_name,
+            'field_offset': f'0x{r.field_offset:02X}', 'field_name': r.field_name,
+            'flag': 'current' if r.is_current else 'default', 'record_length': r.record_length,
+            'offset': f'0x{r.offset_in_file:08X}', 'raw_hex': r.raw_bytes.hex(), 'data_ascii': r.data_str})
+        if r.is_current:
+            if r.smbios_type == 1:
+                if r.field_offset == 0x07: export['system_info']['serial_number'] = r.data_str
+                elif r.field_offset == 0x04: export['system_info']['manufacturer'] = r.data_str
+                elif r.field_offset == 0x05: export['system_info']['product_name'] = r.data_str
+            elif r.smbios_type == 2:
+                if r.field_offset == 0x07: export['board_info']['serial_number'] = r.data_str
+                elif r.field_offset == 0x04: export['board_info']['manufacturer'] = r.data_str
+                elif r.field_offset == 0x05: export['board_info']['product'] = r.data_str
+    return export
+
+def import_dmi(firmware_data, dmi_json):
+    result = find_dmi_store(bytes(firmware_data))
+    if result is None:
+        raise ValueError("No AMI $DMI store found in target firmware.")
+    ts, te = result; target_size = te - ts
+    source_raw = bytes.fromhex(dmi_json['raw_store_hex'])
+    # Find available space (including 0xFF padding after store)
+    scan = te
+    while scan < len(firmware_data) and firmware_data[scan] == 0xFF: scan += 1
+    available = scan - ts
+    if len(source_raw) > available:
+        raise ValueError(f"Source $DMI store ({len(source_raw)}B) larger than available space ({available}B)")
+    firmware_data[ts:ts+len(source_raw)] = source_raw
+    if len(source_raw) < available:
+        firmware_data[ts+len(source_raw):ts+available] = b'\xFF' * (available - len(source_raw))
+    patches = [(ts, f"$DMI store overwritten ({len(source_raw)} bytes)")]
+    si, bi = dmi_json.get('system_info', {}), dmi_json.get('board_info', {})
+    if si.get('serial_number'): patches.append((ts, f"System Serial: {si['serial_number']}"))
+    if bi.get('serial_number'): patches.append((ts, f"Board Serial: {bi['serial_number']}"))
+    return patches
+
 # ── GUI ──
 C_BG='#1a1b26'; C_BGL='#24283b'; C_BGE='#1f2335'; C_FG='#c0caf5'; C_FGD='#565f89'; C_FGB='#e0e6ff'
 C_ACC='#7aa2f7'; C_GRN='#9ece6a'; C_RED='#f7768e'; C_ORG='#ff9e64'; C_CYN='#7dcfff'; C_BDR='#3b4261'
@@ -584,7 +684,11 @@ class APCBToolGUI:
         self.root = root; root.title(APP_TITLE); root.geometry("820x720"); root.minsize(700,600); root.configure(bg=C_BG)
         self.loaded_file = None; self.loaded_data = None; self.blocks = []; self.current_config = ""
         self.detected_device = 'unknown'; self.device_profile = None
-        self.signing_available = _check_signing_available()
+        # Fix combobox popup list colors (must be before any Combobox creation)
+        root.option_add('*TCombobox*Listbox.background', C_BGE)
+        root.option_add('*TCombobox*Listbox.foreground', C_FG)
+        root.option_add('*TCombobox*Listbox.selectBackground', C_ACC)
+        root.option_add('*TCombobox*Listbox.selectForeground', C_BG)
         self._setup_styles(); self._build_ui()
 
     def _setup_styles(self):
@@ -605,47 +709,64 @@ class APCBToolGUI:
         s.map('TButton', background=[('active',C_BTH),('disabled',C_BGL)], foreground=[('disabled',C_FGD)])
         s.configure('Action.TButton', font=('Segoe UI',11,'bold'), padding=(24,10), background=C_GRN, foreground=C_BG)
         s.map('Action.TButton', background=[('active','#b5e685'),('disabled',C_BGL)], foreground=[('disabled',C_FGD)])
+        s.configure('TCombobox', fieldbackground=C_BGE, background=C_BGL, foreground=C_FG,
+                    arrowcolor=C_FG, selectbackground=C_ACC, selectforeground=C_BG)
+        s.map('TCombobox',
+              fieldbackground=[('readonly',C_BGE),('disabled',C_BGL),('focus',C_BGE)],
+              foreground=[('readonly',C_FG),('disabled',C_FGD),('focus',C_FG)],
+              background=[('readonly',C_BGL),('disabled',C_BG)],
+              selectbackground=[('readonly',C_ACC)], selectforeground=[('readonly',C_BG)],
+              arrowcolor=[('disabled',C_FGD)])
+        s.configure('TPanedwindow', background=C_BG)
+        s.configure('Sash', sashthickness=6, gripcount=0, sashrelief='flat')
         for w in ['TRadiobutton','TCheckbutton']:
             s.configure(w, background=C_BGL, foreground=C_FG, font=('Segoe UI',10), focuscolor=C_BGL, indicatorcolor=C_BGE)
             s.map(w, indicatorcolor=[('selected',C_ACC)], background=[('active',C_BGL)])
 
     def _build_ui(self):
-        m = ttk.Frame(self.root, padding=16); m.pack(fill='both', expand=True)
-        h = ttk.Frame(m); h.pack(fill='x', pady=(0,12))
-        ttk.Label(h, text="⚡ SD Memory Mod Tool", style='Title.TLabel').pack(side='left')
+        # Header (above the paned split)
+        top = ttk.Frame(self.root, padding=(16,12,16,0)); top.pack(fill='x')
+        h = ttk.Frame(top); h.pack(fill='x')
+        ttk.Label(h, text="SD Memory Mod Tool", style='Title.TLabel').pack(side='left')
         ttk.Label(h, text=f"v{APP_VERSION}", style='Subtitle.TLabel').pack(side='left', padx=(8,0), pady=(4,0))
-        ff = ttk.Frame(m); ff.pack(fill='x', pady=(0,8))
+        # Two-column paned layout
+        paned = ttk.PanedWindow(self.root, orient='horizontal')
+        paned.pack(fill='both', expand=True, padx=16, pady=(4,4))
+        self._paned = paned
+        # LEFT COLUMN — settings + buttons
+        left = ttk.Frame(paned); paned.add(left, weight=0)
+        # File selection row
+        ff = ttk.Frame(left); ff.pack(fill='x', pady=(8,8))
         ttk.Button(ff, text="Open BIOS File", command=self._open_file).pack(side='left')
+        self.btn_dmi_export = ttk.Button(ff, text="Export DMI", command=self._export_dmi, state='disabled')
+        self.btn_dmi_export.pack(side='left', padx=(8,0))
+        self.btn_dmi_import = ttk.Button(ff, text="Import DMI", command=self._import_dmi, state='disabled')
+        self.btn_dmi_import.pack(side='left', padx=(8,0))
         self.file_label = ttk.Label(ff, text="No file loaded", style='Subtitle.TLabel'); self.file_label.pack(side='left', padx=(12,0))
-        ic = tk.Frame(m, bg=C_BGL, padx=16, pady=12, highlightbackground=C_BDR, highlightthickness=1); ic.pack(fill='x', pady=(0,10))
+        # File info panel
+        ic = tk.Frame(left, bg=C_BGL, padx=16, pady=12, highlightbackground=C_BDR, highlightthickness=1); ic.pack(fill='x', pady=(0,10))
         r1 = tk.Frame(ic, bg=C_BGL); r1.pack(fill='x')
-        self.lbl_fn = ttk.Label(r1, text="—", style='Info.TLabel'); self.lbl_fn.pack(side='left')
+        self.lbl_fn = ttk.Label(r1, text="--", style='Info.TLabel'); self.lbl_fn.pack(side='left')
         self.lbl_fs = ttk.Label(r1, text="", style='Status.TLabel'); self.lbl_fs.pack(side='right')
         r1b = tk.Frame(ic, bg=C_BGL); r1b.pack(fill='x', pady=(4,0))
         self.lbl_dev = ttk.Label(r1b, text="", style='Status.TLabel'); self.lbl_dev.pack(side='left')
         r2 = tk.Frame(ic, bg=C_BGL); r2.pack(fill='x', pady=(4,0))
         self.lbl_bl = ttk.Label(r2, text="", style='Status.TLabel'); self.lbl_bl.pack(side='left')
         self.lbl_cf = ttk.Label(r2, text="", style='Status.TLabel'); self.lbl_cf.pack(side='right')
-        ttk.Label(m, text="Target Configuration", style='Section.TLabel').pack(anchor='w', pady=(4,0))
-        ttk.Label(m, text="Sets density for all checked entries below", style='Subtitle.TLabel').pack(anchor='w', pady=(0,4))
-        tc = tk.Frame(m, bg=C_BGL, padx=16, pady=12, highlightbackground=C_BDR, highlightthickness=1); tc.pack(fill='x', pady=(0,10))
+        # Target configuration
+        ttk.Label(left, text="Target Configuration", style='Section.TLabel').pack(anchor='w', pady=(4,0))
+        ttk.Label(left, text="Sets density for all checked entries below", style='Subtitle.TLabel').pack(anchor='w', pady=(0,4))
+        tc = tk.Frame(left, bg=C_BGL, padx=16, pady=12, highlightbackground=C_BDR, highlightthickness=1); tc.pack(fill='x', pady=(0,10))
         self.target_var = tk.IntVar(value=32)
         self.target_radios = {}
         for val, txt, desc in [(32,"32GB Upgrade","Patches SPD for 32GB"),(64,"64GB Upgrade","Patches SPD for 64GB (ROG Ally series)"),(16,"16GB Restore","Restores stock configuration")]:
             rf = tk.Frame(tc, bg=C_BGL); rf.pack(fill='x', pady=(0,4))
             rb = ttk.Radiobutton(rf, text=txt, variable=self.target_var, value=val); rb.pack(side='left')
             self.target_radios[val] = rb
-            ttk.Label(rf, text=f"— {desc}", style='Status.TLabel').pack(side='left', padx=(8,0))
+            ttk.Label(rf, text=f"-- {desc}", style='Status.TLabel').pack(side='left', padx=(8,0))
         of = tk.Frame(tc, bg=C_BGL); of.pack(fill='x', pady=(6,0))
         self.magic_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(of, text="Modify APCB magic byte (cosmetic, not required)", variable=self.magic_var).pack(side='left')
-        sf = tk.Frame(tc, bg=C_BGL); sf.pack(fill='x', pady=(4,0))
-        self.sign_var = tk.BooleanVar(value=True)
-        self.sign_chk = ttk.Checkbutton(sf, text="Sign firmware for h2offt software flash (PE Authenticode)", variable=self.sign_var)
-        self.sign_chk.pack(side='left')
-        st = "✓ cryptography installed" if self.signing_available else "⚠ pip install cryptography (venv required on SteamOS)"
-        ttk.Label(sf, text=st, style='Status.TLabel').pack(side='left', padx=(12,0))
-        if not self.signing_available: self.sign_var.set(False)
         df = tk.Frame(tc, bg=C_BGL); df.pack(fill='x', pady=(4,0))
         tk.Label(df, text="Screen patch:", bg=C_BGL, fg=C_FG, font=('Segoe UI', 10)).pack(side='left')
         self.screen_var = tk.StringVar(value="None")
@@ -654,9 +775,17 @@ class APCBToolGUI:
             state='disabled', width=20, font=('Segoe UI', 9))
         self.screen_combo.pack(side='left', padx=(8,0))
         tk.Label(df, text="(Steam Deck LCD only)", bg=C_BGL, fg=C_FGD, font=('Segoe UI', 9)).pack(side='left', padx=(8,0))
-        # SPD entry selection section
-        ttk.Label(m, text="SPD Entries to Modify", style='Section.TLabel').pack(anchor='w', pady=(4,4))
-        self.entry_outer = tk.Frame(m, bg=C_BDR, padx=1, pady=1); self.entry_outer.pack(fill='x', pady=(0,10))
+        # SPD entry section label
+        ttk.Label(left, text="SPD Entries to Modify", style='Section.TLabel').pack(anchor='w', pady=(4,4))
+        # Button row — pack BEFORE canvas so buttons always visible at bottom
+        br = ttk.Frame(left); br.pack(side='bottom', fill='x', pady=(8,4))
+        self.btn_mod = ttk.Button(br, text="Apply Modification", style='Action.TButton', command=self._do_modify, state='disabled'); self.btn_mod.pack(side='left')
+        self.btn_ana = ttk.Button(br, text="Analyze Only", command=self._do_analyze, state='disabled'); self.btn_ana.pack(side='left', padx=(8,0))
+        # Footer warning — pack BEFORE canvas
+        ft = ttk.Frame(left); ft.pack(side='bottom', fill='x', pady=(4,0))
+        ttk.Label(ft, text="Always back up your original BIOS before modifying.", style='Subtitle.TLabel').pack(side='left')
+        # SPD entry canvas — fills remaining space
+        self.entry_outer = tk.Frame(left, bg=C_BDR, padx=1, pady=1); self.entry_outer.pack(fill='both', expand=True, pady=(0,4))
         self.entry_canvas = tk.Canvas(self.entry_outer, bg=C_BGL, highlightthickness=0, height=100)
         self.entry_scrollbar = ttk.Scrollbar(self.entry_outer, orient='vertical', command=self.entry_canvas.yview)
         self.entry_inner = tk.Frame(self.entry_canvas, bg=C_BGL)
@@ -665,9 +794,14 @@ class APCBToolGUI:
         self.entry_canvas.configure(yscrollcommand=self.entry_scrollbar.set)
         self.entry_canvas.pack(side='left', fill='both', expand=True)
         self.entry_scrollbar.pack(side='right', fill='y')
-        # Mouse wheel scrolling
-        def _on_mousewheel(event): self.entry_canvas.yview_scroll(-1 * (event.delta // 120), 'units')
-        self.entry_canvas.bind_all('<MouseWheel>', _on_mousewheel)
+        # Mouse wheel scrolling — only for SPD canvas area (not global)
+        def _on_canvas_mousewheel(event): self.entry_canvas.yview_scroll(-1 * (event.delta // 120), 'units')
+        self.entry_canvas.bind('<MouseWheel>', _on_canvas_mousewheel)
+        self.entry_inner.bind('<MouseWheel>', _on_canvas_mousewheel)
+        def _bind_mousewheel_recursive(widget):
+            widget.bind('<MouseWheel>', _on_canvas_mousewheel)
+            for child in widget.winfo_children(): _bind_mousewheel_recursive(child)
+        self._bind_mw = _bind_mousewheel_recursive
         # Placeholder
         self.entry_placeholder = ttk.Label(self.entry_inner, text="  Load a BIOS file to see SPD entries", style='Status.TLabel')
         self.entry_placeholder.pack(anchor='w', padx=8, pady=8)
@@ -675,22 +809,21 @@ class APCBToolGUI:
         self.select_all_var = tk.BooleanVar(value=True)
         # Wire global target radio to sync per-entry dropdowns
         self.target_var.trace_add('write', self._sync_target_to_entries)
-        br = ttk.Frame(m); br.pack(fill='x', pady=(0,8))
-        self.btn_mod = ttk.Button(br, text="Apply Modification", style='Action.TButton', command=self._do_modify, state='disabled'); self.btn_mod.pack(side='left')
-        self.btn_ana = ttk.Button(br, text="Analyze Only", command=self._do_analyze, state='disabled'); self.btn_ana.pack(side='left', padx=(8,0))
-        lh = ttk.Frame(m); lh.pack(fill='x', pady=(4,4))
+        # RIGHT COLUMN — log output
+        right = ttk.Frame(paned); paned.add(right, weight=1)
+        lh = ttk.Frame(right); lh.pack(fill='x', pady=(8,4))
         ttk.Label(lh, text="Log Output", style='Section.TLabel').pack(side='left')
         ttk.Button(lh, text="Copy Log", command=self._copy_log).pack(side='right', padx=(4,0))
         ttk.Button(lh, text="Clear Log", command=self._log_clear).pack(side='right')
-        lf = tk.Frame(m, bg=C_BDR, padx=1, pady=1); lf.pack(fill='both', expand=True)
+        lf = tk.Frame(right, bg=C_BDR, padx=1, pady=1); lf.pack(fill='both', expand=True)
         self.log = scrolledtext.ScrolledText(lf, wrap='word', font=('Consolas',9), bg=C_BGE, fg=C_FG, insertbackground=C_FG,
             selectbackground=C_ACC, selectforeground=C_BG, relief='flat', borderwidth=0, padx=8, pady=8, state='disabled')
         self.log.pack(fill='both', expand=True)
         for t,c in [('info',C_FG),('success',C_GRN),('warning',C_ORG),('error',C_RED),('accent',C_ACC),('cyan',C_CYN),('dim',C_FGD)]:
             self.log.tag_configure(t, foreground=c)
         self.log.tag_configure('header', foreground=C_FGB, font=('Consolas',9,'bold'))
-        ft = ttk.Frame(m); ft.pack(fill='x', pady=(6,0))
-        ttk.Label(ft, text="⚠ Always back up your original BIOS before modifying.", style='Subtitle.TLabel').pack(side='left')
+        # Set initial sash position after layout
+        self.root.after(50, lambda: paned.sashpos(0, 500))
 
     def _log(self, text, tag='info'):
         self.log.configure(state='normal'); self.log.insert('end', text+'\n', tag); self.log.see('end'); self.log.configure(state='disabled')
@@ -800,7 +933,7 @@ class APCBToolGUI:
                 if var.get():
                     if hn:
                         pw.configure(state='readonly')
-                        sw.configure(state='normal', fg='#4a4a5a', insertbackground='#4a4a5a')
+                        sw.configure(state='normal', fg=C_FG, insertbackground=C_FG)
                     cw.configure(state='readonly')
                     # Set density to current global target when entry is checked
                     dv.set(f"{self.target_var.get()}GB")
@@ -809,9 +942,9 @@ class APCBToolGUI:
                     sw.configure(state='disabled', fg=C_FG, insertbackground=C_FG)
                     cw.configure(state='disabled')
             cb.configure(command=_on_toggle)
-        # Adjust canvas height based on entry count (cap at 250px)
-        h = min(250, 50 + len(entries) * 26)
-        self.entry_canvas.configure(height=h)
+        # Bind mousewheel to all child widgets for scrolling
+        if hasattr(self, '_bind_mw'):
+            self._bind_mw(self.entry_inner)
 
     def _toggle_all(self):
         """Toggle all entry checkboxes and enable/disable widgets."""
@@ -822,7 +955,7 @@ class APCBToolGUI:
             if val:
                 if row['has_name_field']:
                     row['prefix_widget'].configure(state='readonly')
-                    row['suffix_widget'].configure(state='normal', fg='#4a4a5a', insertbackground='#4a4a5a')
+                    row['suffix_widget'].configure(state='normal', fg=C_FG, insertbackground=C_FG)
                 row['combo_widget'].configure(state='readonly')
                 row['density_var'].set(density_str)
             else:
@@ -839,7 +972,7 @@ class APCBToolGUI:
                 row['density_var'].set(density_str)
 
     def _open_file(self):
-        fp = filedialog.askopenfilename(title="Open BIOS File", filetypes=[("All files","*.*"),("BIOS Files","*.fd *.bin *.rom")])
+        fp = filedialog.askopenfilename(title="Open BIOS File", filetypes=[("All files","*.*"),("BIOS Files","*.bin *.fd *.rom")])
         if not fp: return
         self._log_clear(); self._log(f"Loading: {fp}", 'accent')
         try:
@@ -861,13 +994,6 @@ class APCBToolGUI:
         else:
             self.target_radios[64].configure(state='disabled')
             if self.target_var.get() == 64: self.target_var.set(32)
-        # Handle signing availability per device
-        if self.device_profile and not self.device_profile['supports_signing']:
-            self.sign_var.set(False)
-            self.sign_chk.configure(state='disabled')
-            self._log(f"Signing: Not applicable — {device_name} requires SPI flash", 'dim')
-        else:
-            self.sign_chk.configure(state='normal')
         # Enable screen patch dropdown only for Steam Deck LCD
         if self.detected_device == 'steam_deck':
             self.screen_combo.configure(state='readonly')
@@ -882,7 +1008,8 @@ class APCBToolGUI:
         if mc == 0:
             self.lbl_cf.configure(text="No MEMG!", style='Bad.TLabel'); self._log("No APCB MEMG blocks found.", 'warning')
             self._populate_entries([])
-            self.btn_mod.configure(state='disabled'); self.btn_ana.configure(state='normal'); return
+            self.btn_mod.configure(state='disabled'); self.btn_ana.configure(state='normal')
+            self.btn_dmi_export.configure(state='normal'); self.btn_dmi_import.configure(state='normal'); return
         # Populate entry checkboxes from first MEMG block
         first_memg = next((b for b in self.blocks if b.is_memg and b.spd_entries), None)
         self._populate_entries(first_memg.spd_entries if first_memg else [])
@@ -904,6 +1031,7 @@ class APCBToolGUI:
                               f"tAA={e.tAA_ns}ns tRCD={e.tRCD_ns}ns", 'dim')
                 break
         self.btn_mod.configure(state='normal'); self.btn_ana.configure(state='normal')
+        self.btn_dmi_export.configure(state='normal'); self.btn_dmi_import.configure(state='normal')
 
     def _do_analyze(self):
         if not self.loaded_data: return
@@ -936,13 +1064,6 @@ class APCBToolGUI:
 
     def _do_modify(self):
         if not self.loaded_data or not self.loaded_file: return
-        do_sign = self.sign_var.get()
-        if do_sign and self.device_profile and not self.device_profile['supports_signing']:
-            messagebox.showinfo("Signing Not Supported", f"{self.device_profile['name']} does not support firmware signing.\n\nUse SPI flash instead."); do_sign = False
-        if do_sign and not self.signing_available:
-            messagebox.showwarning("Signing Unavailable", "Install: pip install cryptography\n\nOn SteamOS, use a virtual environment:\npython -m venv --system-site-packages ~/sd-apcb-venv\nsource ~/sd-apcb-venv/bin/activate\npip install cryptography\n\nContinuing unsigned."); do_sign = False
-        if do_sign and self.loaded_data[:2] != b'MZ':
-            messagebox.showinfo("Signing Skipped", "Raw SPI dump — signing not applicable."); do_sign = False
         # Gather per-entry modifications from editor rows
         entry_mods = []
         for row in self.entry_rows:
@@ -959,9 +1080,9 @@ class APCBToolGUI:
         targets = [m['target_gb'] for m in entry_mods]
         primary_target = max(set(targets), key=targets.count)
         config = MEMORY_CONFIGS[primary_target]
-        sp = Path(self.loaded_file); dn = f"{sp.stem}{'_64GB' if primary_target==64 else '_32GB' if primary_target==32 else '_stock'}{sp.suffix}"
+        sp = Path(self.loaded_file); dn = f"{sp.stem}{'_64GB' if primary_target==64 else '_32GB' if primary_target==32 else '_stock'}.bin"
         op = filedialog.asksaveasfilename(title="Save Modified BIOS As", initialfile=dn, initialdir=str(sp.parent),
-            filetypes=[("All files","*.*"),("BIOS Files","*.fd *.bin *.rom")])
+            filetypes=[("BIN files","*.bin"),("BIOS Files","*.fd *.rom"),("All files","*.*")])
         if not op: return
         if os.path.abspath(op) == os.path.abspath(self.loaded_file): messagebox.showerror("Error","Cannot overwrite input."); return
         self._log_clear()
@@ -975,7 +1096,7 @@ class APCBToolGUI:
         for mod in entry_mods:
             name_note = f" → '{mod['new_name']}'" if mod['new_name'] else ''
             self._log(f"    [{mod['index']+1}] → {mod['target_gb']}GB{name_note}", 'dim')
-        self._log(f"  Signing: {'Yes (PE Authenticode)' if do_sign else 'No'}", 'dim')
+        self._log(f"  Output: SPI flash ready", 'dim')
         # Resolve screen selection to profile key
         screen_selection = self.screen_var.get()
         screen_key = None
@@ -1002,10 +1123,6 @@ class APCBToolGUI:
             self._log(f"\n  Byte changes: {len(mods)}", 'success')
             for off,old,new in mods: self._log(f"    0x{off:08X}: 0x{old:02X} → 0x{new:02X}", 'dim')
             od = bytes(data)
-            if do_sign:
-                self._log(f"\n  Signing...", 'accent')
-                try: od = sign_firmware(bytes(data)); self._log(f"  Signed ✓ ({len(od):,} bytes)", 'success')
-                except Exception as e: self._log(f"  Sign failed: {e}", 'error'); od = bytes(data); do_sign = False
             with open(op,'wb') as f: f.write(od)
             self._log(f"\n  Verifying...", 'dim')
             vb = find_apcb_blocks(open(op,'rb').read()); ok = True
@@ -1024,11 +1141,10 @@ class APCBToolGUI:
             if ok:
                 self._log(f"\n  ✓ MODIFICATION SUCCESSFUL", 'success')
                 dev_name = self.device_profile['name'] if self.device_profile else 'device'
-                if do_sign: self._log(f"  Ready for h2offt: sudo h2offt {os.path.basename(op)}", 'cyan')
-                else: self._log(f"  Ready for SPI flash.", 'success')
+                self._log(f"  Ready for SPI flash.", 'success')
                 msg = f"Modified {len(entry_mods)} entries ({target_summary})!\n\nDevice: {dev_name}\n{op}\n\n{len(mods)} bytes changed."
                 if screen_key: msg += f"\n{SCREEN_PROFILES[screen_key]['name']} screen patch applied."
-                msg += f"\n\n{'Signed for h2offt.' if do_sign else 'Ready for SPI flash.'}"
+                msg += f"\n\nReady for SPI flash."
                 messagebox.showinfo("Success", msg)
             else:
                 self._log(f"\n  ✗ VERIFICATION FAILED", 'error'); messagebox.showerror("Failed","DO NOT flash this file.")
@@ -1036,9 +1152,82 @@ class APCBToolGUI:
             self._log(f"\n  ERROR: {e}", 'error'); messagebox.showerror("Error", str(e))
             import traceback; self._log(traceback.format_exc(), 'error')
 
+    def _export_dmi(self):
+        """Export DMI/SMBIOS data from loaded firmware to JSON file."""
+        if not self.loaded_data: return
+        try:
+            dmi_data = export_dmi(self.loaded_data)
+        except ValueError as e:
+            self._log(f"DMI Export Error: {e}", 'error')
+            messagebox.showerror("DMI Export Error", str(e)); return
+        si = dmi_data.get('system_info', {})
+        bi = dmi_data.get('board_info', {})
+        # Ask for save location
+        sp = Path(self.loaded_file)
+        default_name = f"{sp.stem}_dmi.json"
+        op = filedialog.asksaveasfilename(title="Save DMI Export",
+            initialfile=default_name, initialdir=str(sp.parent),
+            filetypes=[("JSON files","*.json"),("All files","*.*")])
+        if not op: return
+        import json
+        with open(op, 'w') as f: json.dump(dmi_data, f, indent=2)
+        self._log(f"\nDMI exported: {os.path.basename(op)}", 'success')
+        self._log(f"  Region: {dmi_data['dmi_region_offset']} ({dmi_data['dmi_region_size']} bytes)", 'dim')
+        self._log(f"  Tables: {len(dmi_data['tables'])}", 'dim')
+        if si.get('manufacturer'): self._log(f"  System:  {si.get('manufacturer','')} {si.get('product_name','')}", 'cyan')
+        if si.get('serial_number'): self._log(f"  Serial:  {si['serial_number']}", 'cyan')
+        if si.get('uuid'): self._log(f"  UUID:    {si['uuid']}", 'cyan')
+        if bi.get('serial_number'): self._log(f"  Board:   {bi.get('manufacturer','')} {bi.get('product','')} SN={bi['serial_number']}", 'cyan')
+        summary = f"Tables: {len(dmi_data['tables'])}"
+        if si.get('serial_number'): summary += f"\nSerial: {si['serial_number']}"
+        if si.get('uuid'): summary += f"\nUUID: {si['uuid']}"
+        messagebox.showinfo("DMI Export", f"DMI data exported successfully.\n\n{summary}\n\nSaved to:\n{op}")
+
+    def _import_dmi(self):
+        """Import DMI/SMBIOS data from JSON into loaded firmware."""
+        if not self.loaded_data or not self.loaded_file: return
+        # Open DMI JSON
+        json_path = filedialog.askopenfilename(title="Open DMI JSON File",
+            filetypes=[("JSON files","*.json"),("All files","*.*")])
+        if not json_path: return
+        import json
+        try:
+            with open(json_path, 'r') as f: dmi_json = json.load(f)
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to read DMI JSON:\n{e}"); return
+        # Show what we're importing and confirm
+        si = dmi_json.get('system_info', {})
+        details = f"Source: {os.path.basename(json_path)}"
+        if si.get('serial_number'): details += f"\nSerial: {si['serial_number']}"
+        if si.get('uuid'): details += f"\nUUID: {si['uuid']}"
+        if not messagebox.askyesno("Confirm DMI Import",
+                f"Import DMI data into firmware?\n\n{details}"): return
+        # Ask for output path (never modify input)
+        sp = Path(self.loaded_file)
+        default_name = f"{sp.stem}_dmi_restored.bin"
+        op = filedialog.asksaveasfilename(title="Save Firmware with DMI Restored",
+            initialfile=default_name, initialdir=str(sp.parent),
+            filetypes=[("BIN files","*.bin"),("BIOS Files","*.fd *.rom"),("All files","*.*")])
+        if not op: return
+        if os.path.abspath(op) == os.path.abspath(self.loaded_file):
+            messagebox.showerror("Error", "Cannot overwrite input file."); return
+        try:
+            data = bytearray(self.loaded_data)
+            patches = import_dmi(data, dmi_json)
+            with open(op, 'wb') as f: f.write(bytes(data))
+            self._log(f"\nDMI imported into: {os.path.basename(op)}", 'success')
+            for off, desc in patches:
+                self._log(f"  0x{off:08X}: {desc}", 'dim')
+            self._log(f"  Ready for SPI flash.", 'success')
+            messagebox.showinfo("DMI Import", f"DMI data restored successfully.\n\nOutput: {op}")
+        except Exception as e:
+            self._log(f"DMI import error: {e}", 'error')
+            messagebox.showerror("DMI Import Error", str(e))
+
 def main():
     root = tk.Tk(); root.update_idletasks()
-    w,h = 920,800; root.geometry(f"{w}x{h}+{(root.winfo_screenwidth()//2)-(w//2)}+{(root.winfo_screenheight()//2)-(h//2)}")
+    w,h = 1100,720; root.geometry(f"{w}x{h}+{(root.winfo_screenwidth()//2)-(w//2)}+{(root.winfo_screenheight()//2)-(h//2)}")
+    root.minsize(900, 550)
     APCBToolGUI(root); root.mainloop()
 
 if __name__ == '__main__':
