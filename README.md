@@ -9,14 +9,14 @@ Patches the APCB (AMD Platform Configuration Block) SPD entries in firmware to r
 - **Analyze** -- Scan any supported BIOS and display all APCB blocks, SPD entries, and memory configuration
 - **Interactive CLI** -- DiskPart-style nested menus for per-entry SPD editing, module renaming, and screen patching
 - **Batch Mode** -- One-command patching with `--target` for scripting and automation
-- **Per-Entry Control** -- Select individual SPD entries to modify with custom density and module names
+- **Per-Entry Control** -- Select individual SPD entries to modify with custom capacity and module names
 - **Screen Patching** -- Replace EDID and version tag for aftermarket screens (DeckHD 1200p, DeckSight OLED)
 - **Restore** -- Revert a modified BIOS back to stock configuration
 - **Multi-device** -- Auto-detects Steam Deck, ROG Ally, and ROG Ally X from firmware contents
 - **All Chip Brands** -- Patches all SPD entries by default (Micron, Samsung, SK Hynix, etc.)
 - **DMI Backup & Restore** -- Export/import device identity (serial, UUID) for brick recovery
 - **Cross-platform** -- Works on Windows, Linux, macOS, and Steam Deck itself
-- **GUI** -- Two-column layout with per-entry checkboxes, density dropdowns, screen patch selector, DMI tools, and dark theme
+- **GUI** -- Two-column layout with per-entry checkboxes, capacity dropdowns, screen patch selector, DMI tools, and dark theme
 
 ## Quick Start
 
@@ -67,7 +67,7 @@ python sd_apcb_tool.py modify modified.bin stock.bin --target 16
 python sd_apcb_gui.py
 ```
 
-Open your BIOS file, select your target memory size per entry via density dropdowns, optionally select a screen replacement from the dropdown, and click "Apply Modification".
+Open your BIOS file, select your target memory size per entry via capacity dropdowns, optionally select a screen replacement from the dropdown, and click "Apply Modification".
 
 ## Interactive CLI Guide
 
@@ -99,7 +99,7 @@ Main menu commands:
 
 | Command     | Description                                           |
 |-------------|-------------------------------------------------------|
-| `LIST`      | Show all SPD entries with current density and type     |
+| `LIST`      | Show all SPD entries with current capacity and type    |
 | `SPD`       | Enter the SPD entry editor submenu                     |
 | `SCREEN`    | Enter the screen patch selector (Steam Deck LCD only)  |
 | `MAGIC`     | Toggle APCB magic byte modification                    |
@@ -129,7 +129,7 @@ SPD commands:
 | `LIST`                      | Show all entries with pending changes highlighted          |
 | `SELECT <N>`               | Select entry N (1-based) for modification                   |
 | `SELECT ALL`               | Mark all entries for modification                           |
-| `SET DENSITY <16/32/64>`   | Set target density for the selected entry                   |
+| `SET DENSITY <16/32/64>`   | Set target capacity for the selected entry                  |
 | `SET NAME <prefix> <rest>` | Set module name (e.g. `SET NAME MT6 2F1G32D4DR`)           |
 | `DESELECT`                 | Remove the selected entry from pending modifications        |
 | `DESELECT ALL`             | Clear all pending modifications                             |
@@ -184,7 +184,7 @@ $ python sd_apcb_tool.py modify my_bios_dump.bin my_bios_mod.bin
 
 APCB [Steam Deck] > spd
 
-  # | Type    | Module Name               | Density | Pending
+  # | Type    | Module Name               | Capacity        | Pending
   --+---------|---------------------------+---------+--------
   1 | LPDDR5  | MT62F768M32D2DR-031W      | 16GB    |
   2 | LPDDR5  | K3LKCKC0BM                | 16GB    |
@@ -195,7 +195,7 @@ APCB [Steam Deck] SPD > select all
 
 APCB [Steam Deck] SPD > list
 
-  # | Type    | Module Name               | Density | Pending
+  # | Type    | Module Name               | Capacity        | Pending
   --+---------|---------------------------+---------+--------
   1 | LPDDR5  | MT62F768M32D2DR-031W      | 16GB    | -> 32GB
   2 | LPDDR5  | K3LKCKC0BM                | 16GB    | -> 32GB
@@ -383,7 +383,7 @@ The tool patches two bytes in each SPD (Serial Presence Detect) entry of every A
 
 | Byte | Offset | 16GB (stock) | 32GB | 64GB | Purpose |
 |------|--------|-------------|------|------|---------|
-| byte[6] | SPD+6 | `0x95` | `0xB5` | `0xF5` | Density / package type |
+| byte[6] | SPD+6 | `0x95` | `0xB5` | `0xF5` | Package type (SPD_BYTE_PKG_TYPE) |
 | byte[12] | SPD+12 | `0x02` | `0x0A` | `0x49` | Configuration |
 
 All SPD entries are patched by default, covering every memory manufacturer (Micron, Samsung, SK Hynix, etc.). Both the CLI (interactive and batch) and GUI provide per-entry control if you want to be selective.
@@ -432,7 +432,7 @@ The mod has been confirmed working with:
 - **Micron MT62F2G64D8AJ-023 WT:B** -- 16GB/pkg LPDDR5X, 8-die (Steam Deck OLED)
 - **Samsung K3LKCKC0BM** -- 8GB/pkg LPDDR5X (Steam Deck LCD)
 
-Any LPDDR5/LPDDR5X module with the appropriate density should work with these SPD values.
+Any LPDDR5/LPDDR5X module with the appropriate capacity should work with these SPD values.
 
 ## CLI Reference
 
@@ -500,7 +500,7 @@ The GUI (`sd_apcb_gui.py`) provides the same capabilities as the CLI with a grap
 - **File Selection** -- Browse for input BIOS file, auto-generates output filename
 - **Device Detection** -- Auto-detects device type and displays it
 - **Memory Target** -- Radio buttons for 16GB/32GB/64GB (device-appropriate options enabled)
-- **SPD Entry List** -- Scrollable list with per-entry checkboxes, density dropdowns, and editable module names
+- **SPD Entry List** -- Scrollable list with per-entry checkboxes, capacity dropdowns, and editable module names
 - **Screen Replacement** -- Dropdown selector: None, DeckHD 1200p, DeckSight OLED (enabled for Steam Deck LCD only)
 - **DMI Export/Import** -- Backup and restore device identity (serial, UUID) for brick recovery
 - **Select All** -- Toggle all SPD entry checkboxes on/off

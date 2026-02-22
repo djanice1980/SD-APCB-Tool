@@ -2,6 +2,27 @@
 
 All notable changes to the APCB Memory Mod Tool.
 
+## [1.8.0] - 2025-02-22
+
+### Removed
+- **All PE Authenticode signing code deleted** -- ~715 lines removed from CLI and GUI. Hardware testing proved signing requires Insyde's private QA.pfx key which is not publicly available. The signing code was dead weight and has been permanently removed.
+- `hashlib` and `datetime` imports no longer needed (were only used by signing)
+- `cryptography` package reference removed from documentation
+
+### Fixed
+- **Output message no longer says "SPI flashable" for .fd firmware files** -- `.fd` files are PE firmware packages that must be flashed via the manufacturer's update tool (e.g. h2offt), not SPI programmer. Output messages now correctly distinguish between `.fd` ("Flash via manufacturer tool") and `.bin` ("Ready for SPI flash").
+- **GUI preserves original file extension** -- `.fd` input now defaults to `.fd` output (was always `.bin`)
+
+### Changed
+- **"Density" column renamed to "Capacity"** -- now shows per-package capacity info (e.g., "4x 8GB" instead of "32GB"). Reduces user confusion about what the SPD configuration represents.
+- **Per-device chip count info added** -- Steam Deck LCD: 4 packages, OLED: 2 packages, ROG Ally/Ally X: 4 packages. Steam Deck shows both variants (e.g., "4x4GB/2x8GB").
+- Device types and memory targets available as Python enums (`DeviceType`, `MemoryTarget`) for type safety
+- Mutable list constants converted to immutable tuples (`ALL_SPD_MAGICS`, `MEMG_OFFSET_*`, `memory_targets`)
+- SPD byte offsets use named constants (`SPD_BYTE_PKG_TYPE`, `SPD_BYTE_MODULE_ORG`, etc.) instead of magic numbers
+- GUI functions have complete type annotations
+- GUI event handlers (`_on_canvas_mousewheel`, `_bind_mousewheel_recursive`, `_on_entry_toggle`) extracted from inline closures to proper class methods
+- Version bumped to 1.8.0 in all files
+
 ## [1.7.1] - 2025-02-19
 
 ### Fixed
@@ -51,7 +72,7 @@ All notable changes to the APCB Memory Mod Tool.
 - Steam Deck firmware uses AMI DmiEdit `$DMI` store format (NOT standard SMBIOS entry points). Standard `_SM_`/`_SM3_`/`_DMI_` entry points don't exist in SPI flash — SMBIOS tables are generated at runtime by UEFI. The `$DMI` store at ~0x6A4000 holds the per-field overrides that DXE drivers read to populate runtime tables.
 - DMI record format: type(1) + field_offset(1) + flag(1, 0x00=current, 0xFF=factory_default) + length(2, little-endian) + data(variable). Each field stored twice (current + default).
 - DMI export requires raw SPI flash dump (16MB), not `.fd` update files
-- All signing functions (`sign_firmware`, `_build_pkcs7`, `_update_iflash_flags`, etc.) are **preserved in the codebase** for future use if a QA.pfx becomes available. They work correctly -- the problem is the key, not the code.
+- All signing functions were preserved in v1.7.0 but **permanently removed in v1.8.0** since the QA.pfx private key is not publicly available.
 - DeckHD succeeds with h2offt because they possess Insyde's QA private key (`QA.pfx`), used with `iEFIFlashSigner.exe`. This key is not publicly available.
 - The QA Certificate: CN="QA Certificate.", RSA-2048, sha256WithRSA, self-signed, created 2012-04-13, valid until 2039-12-31.
 
