@@ -766,8 +766,12 @@ def analyze_bios(filepath: str, device: str = 'auto') -> List[APCBBlock]:
 
             # Show first-entry SPD config summary
             first = block.spd_entries[0]
-            first_den = _density_label(first.byte6, first.byte12)
-            print(f"\n    First entry SPD config: {first_den}")
+            first_total = _density_label(first.byte6, first.byte12)
+            if chip_count is not None:
+                first_cap = _capacity_label(first.byte6, first.byte12, chip_count)
+                print(f"\n    First entry SPD config: {first_total} ({first_cap})")
+            else:
+                print(f"\n    First entry SPD config: {first_total}")
     
     return blocks
 
@@ -1603,7 +1607,12 @@ def _print_welcome(state: InteractiveState):
     # Detect current config from first entry (factual, no assumptions)
     cur_cfg = "Unknown"
     if state.all_entries:
-        cur_cfg = _density_from_bytes(state.all_entries[0].byte6, state.all_entries[0].byte12)
+        e = state.all_entries[0]
+        chip_count = state.device_profile.get('chip_count') if state.device_profile else None
+        if chip_count is not None:
+            cur_cfg = _capacity_label(e.byte6, e.byte12, chip_count)
+        else:
+            cur_cfg = _density_from_bytes(e.byte6, e.byte12)
 
     print(f"\n{c.HEADER}  {'='*72}")
     print(f"    APCB Memory Configuration Tool v{TOOL_VERSION} -- Interactive Mode")
@@ -1683,16 +1692,20 @@ def _print_status(state: InteractiveState):
 
     if state.entry_mods:
         print(f"\n  {c.BOLD}SPD Entry Modifications ({len(state.entry_mods)} of {len(state.all_entries)}):{c.RESET}")
-        print(f"  {c.DIM}{'-'*68}{c.RESET}")
-        print(f"  {c.LABEL}{'#':<4} {'Current Module':<28} {'Current':<9} {'Target':<9} {'New Name'}{c.RESET}")
-        print(f"  {c.DIM}{'-'*68}{c.RESET}")
+        print(f"  {c.DIM}{'-'*78}{c.RESET}")
+        print(f"  {c.LABEL}{'#':<4} {'Current Module':<28} {'Current':<16} {'Target':<9} {'New Name'}{c.RESET}")
+        print(f"  {c.DIM}{'-'*78}{c.RESET}")
+        chip_count = state.device_profile.get('chip_count') if state.device_profile else None
         for idx in sorted(state.entry_mods.keys()):
             mod = state.entry_mods[idx]
             e = state.all_entries[idx]
-            cur_den = _density_from_bytes(e.byte6, e.byte12)
+            if chip_count is not None:
+                cur_den = _capacity_label(e.byte6, e.byte12, chip_count)
+            else:
+                cur_den = _density_from_bytes(e.byte6, e.byte12)
             name = e.module_name or '(unnamed)'
             new_name = mod.new_name if mod.new_name is not None else f"{c.DIM}(unchanged){c.RESET}"
-            print(f"  {idx+1:<4} {name:<28} {cur_den:<9} {c.PENDING}{mod.target_gb}GB{c.RESET}      {new_name}")
+            print(f"  {idx+1:<4} {name:<28} {cur_den:<16} {c.PENDING}{mod.target_gb}GB{c.RESET}      {new_name}")
     else:
         print(f"\n  {c.DIM}No pending SPD modifications. Use SPD to select entries.{c.RESET}")
     print()

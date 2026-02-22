@@ -767,8 +767,13 @@ class APCBToolGUI:
             density_combo = ttk.Combobox(ef, textvariable=density_var, values=density_options,
                 state='disabled', width=6, font=('Consolas', 9))
             density_combo.pack(side='left', padx=(0,4))
-            # Current bytes
-            tk.Label(ef, text=f"b6=0x{e.byte6:02X} b12=0x{e.byte12:02X}", bg=C_BGL, fg=C_FGD, font=('Consolas', 8), anchor='w').pack(side='left')
+            # Current capacity + raw bytes
+            chip_count = self.device_profile.get('chip_count') if self.device_profile else None
+            if chip_count is not None:
+                cap_info = _capacity_label(e.byte6, e.byte12, chip_count)
+            else:
+                cap_info = density_from_bytes(e.byte6, e.byte12)
+            tk.Label(ef, text=f"{cap_info}  (b6=0x{e.byte6:02X} b12=0x{e.byte12:02X})", bg=C_BGL, fg=C_FGD, font=('Consolas', 8), anchor='w').pack(side='left')
             # Store row data
             row = {
                 'index': i,
@@ -896,10 +901,14 @@ class APCBToolGUI:
                 lp5x = sum(1 for e in b.spd_entries if e.mem_type == 'LPDDR5X')
                 ts = ', '.join(filter(None, [f"{lp5} LPDDR5" if lp5 else "", f"{lp5x} LPDDR5X" if lp5x else ""]))
                 self._log(f"\nMEMG @ 0x{b.offset:08X} — {len(b.spd_entries)} SPD entries ({ts}), cksum {'VALID' if b.checksum_valid else 'INVALID'}", 'header')
+                chip_count = self.device_profile.get('chip_count') if self.device_profile else None
                 for i,e in enumerate(b.spd_entries):
-                    den = density_from_bytes(e.byte6, e.byte12)
+                    if chip_count is not None:
+                        den = _capacity_label(e.byte6, e.byte12, chip_count)
+                    else:
+                        den = density_from_bytes(e.byte6, e.byte12)
                     die_info = f"{e.die_count}x{e.die_density}" if e.die_count and e.die_density else '?'
-                    self._log(f"  [{i+1}] {e.mem_type:<8} {e.module_name or '(unnamed)':<24} {den:<6}  "
+                    self._log(f"  [{i+1}] {e.mem_type:<8} {e.module_name or '(unnamed)':<24} {den:<16}  "
                               f"{e.manufacturer or '?':<8}  {die_info:<8} {e.dev_width:<4} {e.ranks}R  "
                               f"tAA={e.tAA_ns}ns tRCD={e.tRCD_ns}ns", 'dim')
                 break
