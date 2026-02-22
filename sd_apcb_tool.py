@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-APCB Memory Configuration Tool v1.4.0
+APCB Memory Configuration Tool v1.8.0
 ======================================
 Automated BIOS modification tool for handheld gaming device RAM upgrades.
 
@@ -16,11 +16,10 @@ Core modification: patches LPDDR5/LPDDR5X SPD density bytes in APCB MEMG blocks
   - 32GB: byte[6]=0xB5, byte[12]=0x0A
   - 64GB: byte[6]=0xF5, byte[12]=0x49  (requires LPDDR5X hardware)
 
-Flashing Paths:
-  - SPI programmer (CH341A + SOIC8 clip): Writes raw image directly to the
-    flash chip. Supported by all devices. No signing required.
-  - Steam Deck: h2offt software flash requires Insyde's QA private key
-    (QA.pfx), which is not publicly available. Use SPI programmer instead.
+Flashing:
+  - SPI programmer (CH341A + SOIC8 clip): Writes raw .bin image directly to
+    the flash chip. Supported by all devices.
+  - .fd files: Use the manufacturer's update tool (e.g. h2offt for Steam Deck).
 
 Supports:
   - Analysis mode: scans BIOS and reports all APCB blocks and SPD entries
@@ -40,16 +39,35 @@ import struct
 import sys
 import os
 import shutil
-import hashlib
-import datetime
 from dataclasses import dataclass, field
+from enum import Enum, IntEnum
 from typing import List, Optional, Tuple
+
+
+# ============================================================================
+# Enums
+# ============================================================================
+
+class DeviceType(str, Enum):
+    """Supported device types (str, Enum for backward compat with string comparisons)."""
+    STEAM_DECK = 'steam_deck'
+    ROG_ALLY = 'rog_ally'
+    ROG_ALLY_X = 'rog_ally_x'
+    AUTO = 'auto'
+
+
+class MemoryTarget(IntEnum):
+    """Supported memory target sizes in GB."""
+    GB_16 = 16
+    GB_32 = 32
+    GB_64 = 64
+
 
 # ============================================================================
 # Constants
 # ============================================================================
 
-TOOL_VERSION = "1.7.1"
+TOOL_VERSION = "1.8.0"
 
 APCB_MAGIC = b'APCB'                         # APCB header signature (stock)
 APCB_MAGIC_MOD = b'QPCB'                     # APCB header signature (one modder's marker - cosmetic only)
@@ -61,12 +79,12 @@ BCBA_MAGIC = b'BCBA'                          # Block marker preceding MEMG/TOKN
 LP5_SPD_MAGIC  = bytes([0x23, 0x11, 0x13, 0x0E])  # LPDDR5 SPD entry magic
 LP5X_SPD_MAGIC = bytes([0x23, 0x11, 0x15, 0x0E])  # LPDDR5X SPD entry magic
 LP4_SPD_MAGIC  = bytes([0x23, 0x11, 0x11, 0x0E])  # LPDDR4 SPD entry magic (for reference)
-ALL_SPD_MAGICS = [LP5_SPD_MAGIC, LP5X_SPD_MAGIC]  # All supported SPD magic types
+ALL_SPD_MAGICS = (LP5_SPD_MAGIC, LP5X_SPD_MAGIC)  # All supported SPD magic types
 SPD_ENTRY_SEPARATOR = bytes([0x12, 0x34, 0x56, 0x78])  # Entry boundary marker
 BL2_MAGIC = b'$BL2'                           # BIOS Level 2 directory marker
 
 # SPD modification values for different memory configurations
-# These are the bytes at SPD_magic+6 (byte6) and SPD_magic+12 (byte12)
+# byte6 = SPD_BYTE_PKG_TYPE (offset 6), byte12 = SPD_BYTE_MODULE_ORG (offset 12)
 MEMORY_CONFIGS = {
     16: {
         'name': '16GB (Stock)',
@@ -127,9 +145,9 @@ MANUFACTURER_IDS = {
 
 # Known MEMG content type offsets within APCB blocks (device-dependent)
 MEMG_OFFSET_STANDARD = 0x80    # Steam Deck: MEMG directly at 0x80
-MEMG_OFFSET_ALLY = [0xC0]      # ROG Ally: PSPG at 0x80, MEMG at 0xC0
-MEMG_OFFSET_ALLY_X = [0xC8]    # ROG Ally X: PSPG at 0x80, MEMG at 0xC8
-MEMG_OFFSET_PSPG = [0xC0, 0xC8]  # All ROG Ally series offsets (for scanning)
+MEMG_OFFSET_ALLY = (0xC0,)      # ROG Ally: PSPG at 0x80, MEMG at 0xC0
+MEMG_OFFSET_ALLY_X = (0xC8,)    # ROG Ally X: PSPG at 0x80, MEMG at 0xC8
+MEMG_OFFSET_PSPG = (0xC0, 0xC8)  # All ROG Ally series offsets (for scanning)
 PSPG_MAGIC = b'PSPG'           # PSP Group marker (ROG Ally series)
 
 # Screen replacement EDID data and profiles (Steam Deck LCD only)
@@ -178,19 +196,22 @@ DEVICE_PROFILES = {
     'steam_deck': {
         'name': 'Steam Deck',
         'memg_offset': MEMG_OFFSET_STANDARD,
-        'memory_targets': [16, 32],
+        'memory_targets': (16, 32),
+        'chip_count': (2, 4),   # OLED: 2 packages, LCD: 4 packages
         'flash_instructions': 'Flash via SPI programmer (CH341A + SOIC8 clip)',
     },
     'rog_ally': {
         'name': 'ROG Ally',
         'memg_offsets': MEMG_OFFSET_ALLY,
-        'memory_targets': [16, 32, 64],
+        'memory_targets': (16, 32, 64),
+        'chip_count': 4,
         'flash_instructions': 'Flash via SPI programmer (CH341A + SOIC8 clip)',
     },
     'rog_ally_x': {
         'name': 'ROG Ally X',
         'memg_offsets': MEMG_OFFSET_ALLY_X,
-        'memory_targets': [16, 32, 64],
+        'memory_targets': (16, 32, 64),
+        'chip_count': 4,
         'flash_instructions': 'Flash via SPI programmer (CH341A + SOIC8 clip)',
     },
 }
@@ -200,7 +221,20 @@ DEVICE_PROFILES = {
 # Data Structures
 # ============================================================================
 
-# SPD byte field constants (JEDEC SPD4.1.2.M-2 / LPDDR5 layout)
+# SPD byte offsets (JEDEC SPD4.1.2.M-2 / LPDDR5 layout)
+# These offsets are relative to the SPD entry magic (e.g. 23 11 13 0E)
+SPD_BYTE_DENSITY     = 4   # SDRAM density per die + bank architecture
+SPD_BYTE_ADDRESSING  = 5   # Row/column addressing
+SPD_BYTE_PKG_TYPE    = 6   # Package type — density/config byte 1 (modified for RAM upgrade)
+SPD_BYTE_OPTIONAL    = 7   # Optional features (tMAW, MAC)
+SPD_BYTE_MODULE_ORG  = 12  # Module organization — density/config byte 2 (modified for RAM upgrade)
+SPD_BYTE_BUS_WIDTH   = 13  # Module memory bus width
+SPD_BYTE_TCKMIN      = 18  # tCKmin (MTB units)
+SPD_BYTE_TAAMIN      = 24  # tAAmin (MTB units)
+SPD_BYTE_TRCDMIN     = 26  # tRCDmin (MTB units)
+SPD_BYTE_TRPABMIN    = 27  # tRPABmin (MTB units)
+SPD_BYTE_TRPPBMIN    = 28  # tRPPBmin (MTB units)
+
 # MTB = Medium Time Base = 125ps (0.125ns)
 SPD_MTB_PS = 125  # picoseconds
 
@@ -235,12 +269,12 @@ def _decode_spd_fields(spd: bytes) -> dict:
     if len(spd) < 29:
         return {}
 
-    b4 = spd[4]   # SDRAM Density and Banks
-    b5 = spd[5]   # SDRAM Addressing (rows/cols)
-    b6 = spd[6]   # SDRAM Package Type (die count, density)
-    b7 = spd[7]   # Optional Features (tMAW, MAC)
-    b12 = spd[12] # Module Organization (ranks, device width)
-    b13 = spd[13] # Module Memory Bus Width
+    b4 = spd[SPD_BYTE_DENSITY]      # SDRAM Density and Banks
+    b5 = spd[SPD_BYTE_ADDRESSING]    # SDRAM Addressing (rows/cols)
+    b6 = spd[SPD_BYTE_PKG_TYPE]      # SDRAM Package Type (die count, density)
+    b7 = spd[SPD_BYTE_OPTIONAL]      # Optional Features (tMAW, MAC)
+    b12 = spd[SPD_BYTE_MODULE_ORG]   # Module Organization (ranks, device width)
+    b13 = spd[SPD_BYTE_BUS_WIDTH]    # Module Memory Bus Width
 
     # Die density
     die_density_code = b4 & 0x0F
@@ -280,11 +314,11 @@ def _decode_spd_fields(spd: bytes) -> dict:
     }
 
     # Timing parameters (require at least 29 bytes)
-    b18 = spd[18]  # tCKmin (MTB)
-    b24 = spd[24]  # tAAmin (MTB)
-    b26 = spd[26]  # tRCDmin (MTB)
-    b27 = spd[27]  # tRPABmin (MTB)
-    b28 = spd[28]  # tRPPBmin (MTB)
+    b18 = spd[SPD_BYTE_TCKMIN]   # tCKmin (MTB)
+    b24 = spd[SPD_BYTE_TAAMIN]   # tAAmin (MTB)
+    b26 = spd[SPD_BYTE_TRCDMIN]  # tRCDmin (MTB)
+    b27 = spd[SPD_BYTE_TRPABMIN] # tRPABmin (MTB)
+    b28 = spd[SPD_BYTE_TRPPBMIN] # tRPPBmin (MTB)
 
     result['tCK_mtb'] = b18
     result['tAA_ns'] = round(b24 * SPD_MTB_PS / 1000, 2)
@@ -372,6 +406,11 @@ def verify_apcb_checksum(block_data: bytes) -> bool:
 # ============================================================================
 # Device Detection
 # ============================================================================
+
+def _is_pe_firmware(data: bytes) -> bool:
+    """Check if data starts with PE/MZ header (firmware update package, not raw SPI)."""
+    return len(data) >= 2 and data[:2] == b'MZ'
+
 
 def detect_device(data: bytes) -> str:
     """
@@ -602,11 +641,34 @@ def parse_spd_entries(data: bytes, apcb_offset: int, apcb_size: int) -> List[SPD
 # ============================================================================
 
 def _density_label(byte6: int, byte12: int) -> str:
-    """Return a factual density label from SPD byte values (no assumptions)."""
+    """Return total module capacity from SPD byte values."""
     for gb, cfg in MEMORY_CONFIGS.items():
         if cfg['byte6'] == byte6 and cfg['byte12'] == byte12:
             return f"{gb}GB"
     return f"Unknown (0x{byte6:02X}/0x{byte12:02X})"
+
+
+def _capacity_label(byte6: int, byte12: int, chip_count) -> str:
+    """Return per-package capacity string like '4x 8GB' or '2x 16GB'.
+
+    Args:
+        chip_count: int for fixed count, or tuple (lo, hi) for range
+                    (e.g. Steam Deck LCD=4, OLED=2 → (2, 4))
+    """
+    total_gb = None
+    for gb, cfg in MEMORY_CONFIGS.items():
+        if cfg['byte6'] == byte6 and cfg['byte12'] == byte12:
+            total_gb = gb
+            break
+    if total_gb is None:
+        return f"Unknown (0x{byte6:02X}/0x{byte12:02X})"
+    if isinstance(chip_count, tuple):
+        chips_lo, chips_hi = chip_count
+        per_lo = total_gb // chips_hi   # more packages = smaller each
+        per_hi = total_gb // chips_lo   # fewer packages = larger each
+        return f"{chips_hi}x{per_lo}GB/{chips_lo}x{per_hi}GB"
+    per_chip = total_gb // chip_count
+    return f"{chip_count}x {per_chip}GB"
 
 
 def analyze_bios(filepath: str, device: str = 'auto') -> List[APCBBlock]:
@@ -679,26 +741,30 @@ def analyze_bios(filepath: str, device: str = 'auto') -> List[APCBBlock]:
             if lp5x_count:
                 type_summary.append(f"{lp5x_count} LPDDR5X")
 
+            chip_count = device_profile.get('chip_count') if device_profile else None
             print(f"\n    SPD Entries ({len(block.spd_entries)}: {', '.join(type_summary)}):")
-            print(f"    {'-'*110}")
-            print(f"    {'#':<3} {'Type':<8} {'Module':<24} {'Mfr':<9} {'Density':<7} "
+            print(f"    {'-'*115}")
+            print(f"    {'#':<3} {'Type':<8} {'Module':<24} {'Mfr':<9} {'Capacity':<16} "
                   f"{'Dies':<5} {'Width':<6} {'Ranks':<6} "
                   f"{'tAA':<7} {'tRCD':<7} {'tRP':<7}")
-            print(f"    {'-'*110}")
+            print(f"    {'-'*115}")
 
             for j, entry in enumerate(block.spd_entries):
-                entry_den = _density_label(entry.byte6, entry.byte12)
+                if chip_count is not None:
+                    entry_cap = _capacity_label(entry.byte6, entry.byte12, chip_count)
+                else:
+                    entry_cap = _density_label(entry.byte6, entry.byte12)
                 die_info = f"{entry.die_count}x{entry.die_density}" if entry.die_count and entry.die_density else '?'
                 tAA = f"{entry.tAA_ns}ns" if entry.tAA_ns else '?'
                 tRCD = f"{entry.tRCD_ns}ns" if entry.tRCD_ns else '?'
                 tRP = f"{entry.tRPPB_ns}ns" if entry.tRPPB_ns else '?'
 
                 print(f"    {j+1:<3} {entry.mem_type:<8} {entry.module_name:<24} "
-                      f"{entry.manufacturer:<9} {entry_den:<7} "
+                      f"{entry.manufacturer:<9} {entry_cap:<16} "
                       f"{die_info:<5} {entry.dev_width:<6} {entry.ranks}R    "
                       f"{tAA:<7} {tRCD:<7} {tRP:<7}")
 
-            # Show first-entry SPD config (factual, no assumptions)
+            # Show first-entry SPD config summary
             first = block.spd_entries[0]
             first_den = _density_label(first.byte6, first.byte12)
             print(f"\n    First entry SPD config: {first_den}")
@@ -1032,531 +1098,7 @@ def import_dmi(firmware_data: bytearray, dmi_json: dict) -> List[Tuple[int, str]
     return patches
 
 
-# ============================================================================
-# PE Authenticode Signing (Pure Python, no external tools)
-# ============================================================================
-
-def _check_signing_available():
-    """Check if the cryptography library is available for signing."""
-    try:
-        from cryptography.hazmat.primitives import hashes, serialization
-        from cryptography.hazmat.primitives.asymmetric import rsa, padding
-        from cryptography.x509 import CertificateBuilder, Name, NameAttribute, NameOID
-        from cryptography import x509
-        return True
-    except ImportError:
-        return False
-
-
-# --- DER Encoding Helpers ---
-
-def _der_length(length):
-    """Encode a DER length field."""
-    if length < 0x80:
-        return bytes([length])
-    elif length < 0x100:
-        return bytes([0x81, length])
-    elif length < 0x10000:
-        return bytes([0x82, (length >> 8) & 0xFF, length & 0xFF])
-    elif length < 0x1000000:
-        return bytes([0x83, (length >> 16) & 0xFF, (length >> 8) & 0xFF, length & 0xFF])
-    else:
-        return bytes([0x84, (length >> 24) & 0xFF, (length >> 16) & 0xFF,
-                      (length >> 8) & 0xFF, length & 0xFF])
-
-def _der_tag(tag, content):
-    return bytes([tag]) + _der_length(len(content)) + content
-
-def _der_sequence(content):
-    return _der_tag(0x30, content)
-
-def _der_set(content):
-    return _der_tag(0x31, content)
-
-def _der_oid(oid_str):
-    """Encode a dotted OID string to DER."""
-    parts = [int(x) for x in oid_str.split('.')]
-    encoded = bytes([40 * parts[0] + parts[1]])
-    for val in parts[2:]:
-        if val < 0x80:
-            encoded += bytes([val])
-        elif val < 0x4000:
-            encoded += bytes([(val >> 7) | 0x80, val & 0x7F])
-        elif val < 0x200000:
-            encoded += bytes([(val >> 14) | 0x80, ((val >> 7) & 0x7F) | 0x80, val & 0x7F])
-        else:
-            encoded += bytes([(val >> 21) | 0x80, ((val >> 14) & 0x7F) | 0x80,
-                            ((val >> 7) & 0x7F) | 0x80, val & 0x7F])
-    return _der_tag(0x06, encoded)
-
-def _der_integer(value):
-    if isinstance(value, int):
-        if value == 0:
-            return _der_tag(0x02, b'\x00')
-        result = []
-        v = value
-        while v > 0:
-            result.insert(0, v & 0xFF)
-            v >>= 8
-        if result[0] & 0x80:
-            result.insert(0, 0)
-        return _der_tag(0x02, bytes(result))
-    return _der_tag(0x02, value)
-
-def _der_octet_string(data):
-    return _der_tag(0x04, data)
-
-def _der_null():
-    return bytes([0x05, 0x00])
-
-def _der_context(tag_num, content, constructed=True):
-    tag = (0xA0 if constructed else 0x80) | tag_num
-    return _der_tag(tag, content)
-
-def _der_utctime(dt):
-    return _der_tag(0x17, dt.strftime('%y%m%d%H%M%SZ').encode('ascii'))
-
-
-# --- Authenticode OIDs ---
-
-_OID_PKCS7_SIGNED_DATA = '1.2.840.113549.1.7.2'
-_OID_SPC_INDIRECT_DATA = '1.3.6.1.4.1.311.2.1.4'
-_OID_SPC_PE_IMAGE_DATA = '1.3.6.1.4.1.311.2.1.15'
-_OID_SPC_SP_OPUS_INFO  = '1.3.6.1.4.1.311.2.1.12'
-_OID_MS_IND_CODE_SIGN  = '1.3.6.1.4.1.311.2.1.21'
-_OID_SHA256            = '2.16.840.1.101.3.4.2.1'
-_OID_RSA_ENCRYPTION    = '1.2.840.113549.1.1.1'
-_OID_CONTENT_TYPE      = '1.2.840.113549.1.9.3'
-_OID_SIGNING_TIME      = '1.2.840.113549.1.9.5'
-_OID_MESSAGE_DIGEST    = '1.2.840.113549.1.9.4'
-
-
-def _compute_pe_checksum(data):
-    """Compute PE checksum (same algorithm as Windows MapFileAndCheckSum)."""
-    pe_offset = struct.unpack_from('<I', data, 0x3C)[0]
-    checksum_offset = pe_offset + 4 + 20 + 64
-
-    checksum = 0
-    remainder = len(data) % 4
-    for i in range(0, len(data) - remainder, 4):
-        if i == checksum_offset:
-            continue
-        val = struct.unpack_from('<I', data, i)[0]
-        checksum = (checksum & 0xFFFFFFFF) + val + (checksum >> 32)
-        checksum = (checksum & 0xFFFF) + (checksum >> 16)
-
-    if remainder:
-        val = int.from_bytes(data[-(remainder):] + b'\x00' * (4 - remainder), 'little')
-        checksum = (checksum & 0xFFFFFFFF) + val + (checksum >> 32)
-        checksum = (checksum & 0xFFFF) + (checksum >> 16)
-
-    checksum = (checksum & 0xFFFF) + (checksum >> 16)
-    return (checksum + len(data)) & 0xFFFFFFFF
-
-
-def _compute_authenticode_hash(data):
-    """Compute the Authenticode PE hash per Microsoft's specification.
-
-    The Authenticode hash covers the PE file in a specific order:
-    1. Headers from 0 to SizeOfHeaders, skipping checksum and security dir entry
-    2. Each PE section body, sorted by PointerToRawData
-    3. Any trailing data between the last section and the certificate table
-
-    Args:
-        data: PE file bytes (with security directory already cleared to zero
-              and checksum field zeroed).
-
-    Returns:
-        SHA-256 digest bytes.
-    """
-    pe_offset = struct.unpack_from('<I', data, 0x3C)[0]
-    coff_start = pe_offset + 4
-    num_sections = struct.unpack_from('<H', data, coff_start + 2)[0]
-    opt_header_size = struct.unpack_from('<H', data, coff_start + 16)[0]
-
-    opt_start = coff_start + 20
-    magic = struct.unpack_from('<H', data, opt_start)[0]
-    checksum_offset = opt_start + 64
-    dd_start = opt_start + (112 if magic == 0x20B else 96)
-    secdir_offset = dd_start + 32  # Security directory is data directory index 4
-
-    # SizeOfHeaders from optional header (offset 60 for both PE32 and PE32+)
-    size_of_headers = struct.unpack_from('<I', data, opt_start + 60)[0]
-
-    # Section table starts immediately after the optional header
-    section_table_offset = opt_start + opt_header_size
-
-    h = hashlib.sha256()
-
-    # Step 1: Hash headers from 0 to SizeOfHeaders, skipping checksum (4 bytes)
-    # and security directory entry (8 bytes)
-    h.update(data[:checksum_offset])
-    h.update(data[checksum_offset + 4:secdir_offset])
-    h.update(data[secdir_offset + 8:size_of_headers])
-
-    # Step 2: Hash PE sections sorted by PointerToRawData
-    sections = []
-    for i in range(num_sections):
-        sec_off = section_table_offset + i * 40
-        raw_size = struct.unpack_from('<I', data, sec_off + 16)[0]
-        raw_ptr = struct.unpack_from('<I', data, sec_off + 20)[0]
-        if raw_size > 0:
-            sections.append((raw_ptr, raw_size))
-    sections.sort(key=lambda s: s[0])
-
-    sum_of_bytes_hashed = size_of_headers
-    for ptr, size in sections:
-        h.update(data[ptr:ptr + size])
-        end = ptr + size
-        if end > sum_of_bytes_hashed:
-            sum_of_bytes_hashed = end
-
-    # Step 3: Hash any trailing data after the last section
-    # (between sum_of_bytes_hashed and the certificate table / end of file)
-    file_end = len(data)
-    if sum_of_bytes_hashed < file_end:
-        h.update(data[sum_of_bytes_hashed:file_end])
-
-    return h.digest()
-
-
-# --- Insyde _IFLASH Structure Helpers ---
-
-_IFLASH_BIOSCER_MAGIC = b'_IFLASH_BIOSCER'
-_IFLASH_BIOSCR2_MAGIC = b'_IFLASH_BIOSCR2'
-_IFLASH_FLAGS_OFFSET = 0x0F           # Validation mode flag byte
-_IFLASH_DRV_FLAGS2_OFFSET = 0x13     # DRV_IMG has a second flag byte here
-_IFLASH_BIOSCER_HASH_OFFSET = 0x18   # 32-byte SHA-256 hash starts here
-_IFLASH_BIOSCR2_CERT_OFFSET = 0x1F   # WIN_CERTIFICATE starts here
-
-
-def _find_iflash_structures(data):
-    """Find Insyde _IFLASH_BIOSCER and _IFLASH_BIOSCR2 in firmware.
-
-    Steam Deck .fd firmware files contain two internal integrity structures
-    in addition to the standard PE Authenticode signature:
-    - _IFLASH_BIOSCER: 32-byte SHA-256 hash at structure offset +0x18
-    - _IFLASH_BIOSCR2: full WIN_CERTIFICATE (PKCS#7) at structure offset +0x1F
-
-    Returns:
-        Tuple of (bioscer_offset, bioscr2_offset) or (None, None) if not found.
-    """
-    bioscer = data.find(_IFLASH_BIOSCER_MAGIC)
-    bioscr2 = data.find(_IFLASH_BIOSCR2_MAGIC)
-    if bioscer >= 0 and bioscr2 >= 0:
-        return bioscer, bioscr2
-    return None, None
-
-
-# DeckHD-proven flag transformations for h2offt QA mode.
-# Each _IFLASH structure has a flags byte at offset +0x0F that controls
-# h2offt's validation behavior. Stock firmware uses values that require
-# Valve's certificate chain; DeckHD changes them to accept self-signed certs.
-# Pattern verified across 3 DeckHD versions (F7A0120, F7A0121, F7A0131).
-_IFLASH_FLAG_MAP = {
-    b'_IFLASH_DRV_IMG': lambda f: f | 0x08,                    # 0x80→0x88, 0xA0→0xA8
-    b'_IFLASH_BIOSIMG': lambda f: 0x08 if f == 0x20 else f,    # 2nd copy (0x20) only
-    b'_IFLASH_INI_IMG': lambda f: 0x68,                         # Always 0x68
-    b'_IFLASH_BIOSCER': lambda f: 0x08,                         # Always 0x08
-    b'_IFLASH_BIOSCR2': lambda f: 0x08,                         # Always 0x08
-}
-
-
-def _update_iflash_flags(data):
-    """Update all _IFLASH structure flags for h2offt QA/self-signed mode.
-
-    Steam Deck .fd firmware contains 6 _IFLASH structures. DeckHD sets specific
-    flag values on each to tell h2offt to accept self-signed certificates instead
-    of requiring Valve's certificate chain. Each structure type has a different
-    transformation rule.
-
-    Args:
-        data: bytearray of the firmware (modified in place).
-
-    Returns:
-        List of (offset, name, old_flag, new_flag) for each updated structure.
-    """
-    pos = 0
-    updated = []
-    while pos < len(data):
-        idx = data.find(b'_IFLASH_', pos)
-        if idx < 0:
-            break
-        for magic, transform in _IFLASH_FLAG_MAP.items():
-            if data[idx:idx + len(magic)] == magic:
-                old_flag = data[idx + _IFLASH_FLAGS_OFFSET]
-                new_flag = transform(old_flag)
-                if old_flag != new_flag:
-                    data[idx + _IFLASH_FLAGS_OFFSET] = new_flag
-                    updated.append((idx, magic.decode(), old_flag, new_flag))
-                # DRV_IMG has a second flag byte at +0x13 that DeckHD also
-                # sets to the same value as the new primary flag at +0x0F.
-                if magic == b'_IFLASH_DRV_IMG':
-                    data[idx + _IFLASH_DRV_FLAGS2_OFFSET] = new_flag
-                break
-        pos = idx + 1
-    return updated
-
-
-def _build_spc_indirect_data(pe_hash):
-    """Build the SPC_INDIRECT_DATA_CONTENT structure.
-
-    Matches DeckHD's encoding:
-      SpcIndirectDataContent ::= SEQUENCE {
-        data  SpcAttributeTypeAndOptionalValue,   -- OID + SEQUENCE{BIT STRING, [0]{[2]{[0]}}}
-        messageImprint  DigestInfo               -- AlgorithmIdentifier + OCTET STRING
-      }
-
-    Returns (full_der, inner_content) where inner_content is the raw content
-    octets without the outer SEQUENCE tag/length, needed for messageDigest.
-    """
-    # SpcPeImageData: BIT STRING (just unused-bits byte) + SpcLink (empty)
-    # DeckHD uses: BITS len=1 [00], [0](A0) len=4 { [2](A2) len=2 { [0](80) len=0 } }
-    spc_flags = _der_tag(0x03, bytes([0x00]))  # BIT STRING: 0 unused bits, no flags
-    spc_link = _der_context(0, b'', constructed=False)  # [0] PRIMITIVE empty
-    spc_file = _der_context(2, spc_link)  # [2] CONSTRUCTED { [0] empty }
-    spc_pe_data = _der_sequence(spc_flags + _der_context(0, spc_file))
-    # DeckHD wraps the value in the SPC_ATTR as a direct SEQUENCE, not [0] EXPLICIT
-    spc_attr = _der_sequence(_der_oid(_OID_SPC_PE_IMAGE_DATA) + spc_pe_data)
-    digest_algo = _der_sequence(_der_oid(_OID_SHA256) + _der_null())
-    digest_info = _der_sequence(digest_algo + _der_octet_string(pe_hash))
-    inner_content = spc_attr + digest_info
-    return _der_sequence(inner_content), inner_content
-
-
-def _build_auth_attrs(spc_inner_content, signing_time):
-    """Build authenticated attributes for signer info.
-
-    Matches DeckHD's encoding: opusInfo, contentType, messageDigest.
-    DeckHD omits signingTime. Attributes are DER-sorted (as required for
-    SET OF in DER encoding).
-
-    Args:
-        spc_inner_content: The raw content octets of SPC_INDIRECT_DATA_CONTENT
-            (without the outer SEQUENCE tag/length). Per RFC 2315 Section 9.3,
-            the messageDigest is computed over these content octets only.
-        signing_time: UTC datetime (unused — DeckHD omits signingTime).
-    """
-    # SpcSpOpusInfo: empty SEQUENCE (no programName or moreInfo)
-    attr_opus = _der_sequence(
-        _der_oid(_OID_SPC_SP_OPUS_INFO) +
-        _der_set(_der_sequence(b'')))
-    # contentType: SPC_INDIRECT_DATA OID
-    attr_ct = _der_sequence(
-        _der_oid(_OID_CONTENT_TYPE) + _der_set(_der_oid(_OID_SPC_INDIRECT_DATA)))
-    # messageDigest: SHA-256 of SPC content octets only (per RFC 2315 Section 9.3)
-    content_hash = hashlib.sha256(spc_inner_content).digest()
-    attr_md = _der_sequence(
-        _der_oid(_OID_MESSAGE_DIGEST) + _der_set(_der_octet_string(content_hash)))
-    # DER SET OF encoding requires elements sorted by their DER encoding.
-    # DeckHD's order: opusInfo, contentType, messageDigest
-    # Sort by raw DER bytes to ensure correct ordering.
-    attrs = sorted([attr_opus, attr_ct, attr_md], key=lambda x: x)
-    return b''.join(attrs)
-
-
-def _build_pkcs7(pe_hash, cert_der, private_key, signing_time):
-    """Build complete PKCS#7 SignedData for Authenticode."""
-    from cryptography.hazmat.primitives import hashes as _hashes
-    from cryptography.hazmat.primitives.asymmetric import padding as _padding
-    from cryptography import x509 as _x509
-
-    cert = _x509.load_der_x509_certificate(cert_der)
-    serial = cert.serial_number
-    issuer_der = cert.issuer.public_bytes()
-
-    spc_content, spc_inner = _build_spc_indirect_data(pe_hash)
-    content_info = _der_sequence(
-        _der_oid(_OID_SPC_INDIRECT_DATA) + _der_context(0, spc_content))
-    sha256_algo = _der_sequence(_der_oid(_OID_SHA256) + _der_null())
-    digest_algos = _der_set(sha256_algo)
-    certificates = _der_context(0, cert_der)
-
-    auth_attrs_content = _build_auth_attrs(spc_inner, signing_time)
-    attrs_for_signing = _der_set(auth_attrs_content)
-    signature = private_key.sign(attrs_for_signing, _padding.PKCS1v15(), _hashes.SHA256())
-
-    issuer_and_serial = _der_sequence(issuer_der + _der_integer(serial))
-    rsa_algo = _der_sequence(_der_oid(_OID_RSA_ENCRYPTION) + _der_null())
-
-    signer_info = _der_sequence(
-        _der_integer(1) + issuer_and_serial + sha256_algo +
-        _der_context(0, auth_attrs_content) + rsa_algo +
-        _der_octet_string(signature))
-
-    signed_data = _der_sequence(
-        _der_integer(1) + digest_algos + content_info + certificates + _der_set(signer_info))
-
-    return _der_sequence(
-        _der_oid(_OID_PKCS7_SIGNED_DATA) + _der_context(0, signed_data))
-
-
-def _build_win_certificate(pkcs7_blob):
-    """Build a WIN_CERTIFICATE structure (8-byte aligned) from a PKCS#7 blob."""
-    wc_len = (8 + len(pkcs7_blob) + 7) & ~7
-    win_cert = struct.pack('<IHH', wc_len, 0x0200, 0x0002) + pkcs7_blob
-    win_cert += b'\x00' * (wc_len - len(win_cert))
-    return win_cert
-
-
-def sign_firmware(data_in):
-    """
-    Sign a PE firmware file with a fresh self-signed certificate.
-
-    NOTE: This function is currently unused. Hardware testing confirmed that
-    h2offt requires Insyde's QA private key (QA.pfx) for signature validation.
-    Self-signed certificates are rejected. This code is preserved for future
-    use if a QA.pfx becomes available. The signing logic itself is correct —
-    the issue is purely the certificate trust chain.
-
-    Handles three integrity layers present in Steam Deck firmware:
-    1. _IFLASH_BIOSCER: Internal hash (preserved — algorithm is proprietary)
-    2. _IFLASH_BIOSCR2: Internal Authenticode signature (re-signed with our cert)
-    3. PE Security Directory: Standard PE Authenticode (re-signed with our cert)
-
-    For non-Steam Deck firmware (no _IFLASH structures), only layer 3 is applied.
-
-    Args:
-        data_in: Input file bytes (PE format firmware)
-
-    Returns:
-        Signed file bytes ready for h2offt
-    """
-    from cryptography.hazmat.primitives import hashes as _hashes
-    from cryptography.hazmat.primitives.asymmetric import rsa as _rsa
-    from cryptography.x509 import CertificateBuilder, Name, NameAttribute, NameOID
-    from cryptography import x509 as _x509
-    from cryptography.hazmat.primitives.serialization import Encoding
-
-    data = bytearray(data_in)
-
-    # Locate PE structures
-    if data[:2] != b'MZ':
-        raise ValueError("Not a valid PE file (no MZ header)")
-    pe_offset = struct.unpack_from('<I', data, 0x3C)[0]
-    if data[pe_offset:pe_offset+4] != b'PE\x00\x00':
-        raise ValueError("Invalid PE signature")
-
-    opt_start = pe_offset + 4 + 20
-    magic = struct.unpack_from('<H', data, opt_start)[0]
-    checksum_offset = opt_start + 64
-    dd_start = opt_start + (112 if magic == 0x20B else 96)
-    secdir_offset = dd_start + 32  # Security directory is index 4
-
-    # Step 1: Strip existing PE Authenticode signature
-    old_va = struct.unpack_from('<I', data, secdir_offset)[0]
-    if old_va > 0 and old_va < len(data):
-        data = data[:old_va]
-
-    # Generate self-signed certificate (used for both BIOSCR2 and PE cert)
-    key = _rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    now = datetime.datetime.now(datetime.timezone.utc)
-    subject = issuer = Name([NameAttribute(NameOID.COMMON_NAME, "SD APCB Tool")])
-    cert = (CertificateBuilder()
-        .subject_name(subject).issuer_name(issuer)
-        .public_key(key.public_key())
-        .serial_number(_x509.random_serial_number())
-        .not_valid_before(now)
-        .not_valid_after(now + datetime.timedelta(days=3650))
-        .sign(key, _hashes.SHA256()))
-    cert_der = cert.public_bytes(Encoding.DER)
-
-    # Step 2: Handle Insyde _IFLASH internal integrity structures
-    bioscer_off, bioscr2_off = _find_iflash_structures(bytes(data))
-
-    if bioscer_off is not None and bioscr2_off is not None:
-        # Found _IFLASH structures (Steam Deck .fd firmware)
-
-        # 2a: Update ALL _IFLASH flags to QA/self-signed mode
-        # DeckHD changes flags on 5 of 6 structures (not just BIOSCER/BIOSCR2)
-        _update_iflash_flags(data)
-
-        # 2b: Determine the original BIOSCR2 slot size.
-        # The slot extends from the cert offset to SizeOfImage (len(data) after
-        # Step 1 stripped the PE cert).  This may include zero padding beyond
-        # the WIN_CERTIFICATE's dwLength (OLED stock has 16 bytes of padding).
-        # Using the full slot ensures we resize correctly so our new WC ends
-        # exactly at SizeOfImage with zero gap, matching DeckHD's layout.
-        bioscr2_cert_off = bioscr2_off + _IFLASH_BIOSCR2_CERT_OFFSET
-        old_bioscr2_slot = len(data) - bioscr2_cert_off
-
-        # 2c: Preserve _IFLASH_BIOSCER hash — the hash algorithm is proprietary
-        # and unknown, so we leave the original hash bytes untouched.  DeckHD
-        # also preserves the stock BIOSCER hash when it re-signs firmware.
-
-        # 2d: Re-sign _IFLASH_BIOSCR2 with our self-signed certificate
-        # Build a PKCS#7 signature for the BIOSCR2 slot using the same
-        # Authenticode hash format. We use the PE hash of the body data
-        # (with security dir and checksum zeroed) as the signed content.
-        bioscr2_body = bytearray(data)
-        struct.pack_into('<I', bioscr2_body, secdir_offset, 0)
-        struct.pack_into('<I', bioscr2_body, secdir_offset + 4, 0)
-        struct.pack_into('<I', bioscr2_body, checksum_offset, 0)
-        bioscr2_hash = _compute_authenticode_hash(bytes(bioscr2_body))
-        bioscr2_pkcs7 = _build_pkcs7(bioscr2_hash, cert_der, key, now)
-        bioscr2_wc = _build_win_certificate(bioscr2_pkcs7)
-
-        # Write the new BIOSCR2 WIN_CERTIFICATE and maintain layout invariant:
-        #   SizeOfImage == SecDir VA == bioscr2_cert_off + len(bioscr2_wc)
-        # DeckHD follows this rule: BIOSCR2 WC ends exactly at SizeOfImage,
-        # and the PE cert starts right there with zero gap.
-        # We compare against the full slot (which may include padding), not
-        # just the old WC dwLength, to eliminate any stock padding.
-        delta = len(bioscr2_wc) - old_bioscr2_slot
-        old_slot_end = bioscr2_cert_off + old_bioscr2_slot
-
-        if delta > 0:
-            # New cert is larger than slot — write what fits, insert the rest
-            data[bioscr2_cert_off:old_slot_end] = bioscr2_wc[:old_bioscr2_slot]
-            data[old_slot_end:old_slot_end] = bioscr2_wc[old_bioscr2_slot:]
-        elif delta < 0:
-            # New cert is smaller than slot — write it and remove excess bytes
-            data[bioscr2_cert_off:bioscr2_cert_off + len(bioscr2_wc)] = bioscr2_wc
-            del data[bioscr2_cert_off + len(bioscr2_wc):old_slot_end]
-        else:
-            # Same size as slot — simple overwrite
-            data[bioscr2_cert_off:old_slot_end] = bioscr2_wc
-
-        if delta != 0:
-            # Update SizeOfImage in PE Optional Header to maintain layout invariant
-            soi_offset = opt_start + 56
-            old_soi = struct.unpack_from('<I', data, soi_offset)[0]
-            struct.pack_into('<I', data, soi_offset, old_soi + delta)
-
-    # Step 3: Clear header fields for PE hash computation
-    struct.pack_into('<I', data, secdir_offset, 0)
-    struct.pack_into('<I', data, secdir_offset + 4, 0)
-    struct.pack_into('<I', data, checksum_offset, 0)
-
-    # Step 4: Compute PE Authenticode hash (now includes updated BIOSCER + BIOSCR2)
-    pe_hash = _compute_authenticode_hash(bytes(data))
-
-    # Step 5: Build PE PKCS#7 SignedData
-    pkcs7 = _build_pkcs7(pe_hash, cert_der, key, now)
-
-    # Step 6: Build and append WIN_CERTIFICATE
-    win_cert = _build_win_certificate(pkcs7)
-    cert_offset = len(data)
-    struct.pack_into('<I', data, secdir_offset, cert_offset)
-    struct.pack_into('<I', data, secdir_offset + 4, len(win_cert))
-    data.extend(win_cert)
-
-    # Step 7: Compute and write PE checksum
-    checksum = _compute_pe_checksum(bytes(data))
-    struct.pack_into('<I', data, checksum_offset, checksum)
-
-    # Self-check: verify the Authenticode hash matches what we signed
-    verify_data = bytearray(data[:cert_offset])
-    struct.pack_into('<I', verify_data, secdir_offset, 0)
-    struct.pack_into('<I', verify_data, secdir_offset + 4, 0)
-    struct.pack_into('<I', verify_data, checksum_offset, 0)
-    verify_hash = _compute_authenticode_hash(bytes(verify_data))
-    if verify_hash != pe_hash:
-        raise RuntimeError(
-            "Signing self-check FAILED: Authenticode hash mismatch. "
-            f"Expected {pe_hash.hex()}, got {verify_hash.hex()}")
-
-    return bytes(data)
+# (PE Authenticode signing code was removed in v1.8.0 — requires Insyde QA.pfx)
 
 
 # ============================================================================
@@ -1759,9 +1301,9 @@ def modify_bios(input_path: str, output_path: str, target_gb: int,
             
             entry = block.spd_entries[eidx]
             
-            # Calculate absolute file offsets for the two key bytes
-            byte6_offset = entry.offset_in_file + 6
-            byte12_offset = entry.offset_in_file + 12
+            # Calculate absolute file offsets for the two key SPD bytes
+            byte6_offset = entry.offset_in_file + SPD_BYTE_PKG_TYPE
+            byte12_offset = entry.offset_in_file + SPD_BYTE_MODULE_ORG
             
             old_byte6 = data[byte6_offset]
             old_byte12 = data[byte12_offset]
@@ -1863,12 +1405,16 @@ def modify_bios(input_path: str, output_path: str, target_gb: int,
     
     if all_ok:
         print(f"\n  *** MODIFICATION SUCCESSFUL ***")
-        print(f"  Output file is ready for SPI flash.")
+        if _is_pe_firmware(bytes(data)):
+            print(f"  Flash this file using the manufacturer's update tool (e.g. h2offt).")
+        else:
+            print(f"  Output file is ready for SPI flash.")
         if device_profile:
-            flash_instr = device_profile.get('flash_instructions', 'Flash via SPI programmer')
-            if isinstance(flash_instr, str) and '{filename}' in flash_instr:
-                flash_instr = flash_instr.format(filename=os.path.basename(output_path))
-            print(f"  {flash_instr}")
+            flash_instr = device_profile.get('flash_instructions', '')
+            if flash_instr:
+                if isinstance(flash_instr, str) and '{filename}' in flash_instr:
+                    flash_instr = flash_instr.format(filename=os.path.basename(output_path))
+                print(f"  {flash_instr}")
     else:
         print(f"\n  *** VERIFICATION FAILED ***")
         print(f"  DO NOT flash this file! Check for errors above.")
@@ -1974,7 +1520,7 @@ def modify_bios_data(data: bytearray, entry_modifications: list,
                 continue
             e = block.spd_entries[idx]
             config = MEMORY_CONFIGS[mod['target_gb']]
-            b6, b12 = e.offset_in_file + 6, e.offset_in_file + 12
+            b6, b12 = e.offset_in_file + SPD_BYTE_PKG_TYPE, e.offset_in_file + SPD_BYTE_MODULE_ORG
             mods.append((b6, data[b6], config['byte6']))
             mods.append((b12, data[b12], config['byte12']))
             data[b6] = config['byte6']
@@ -2083,11 +1629,16 @@ def _print_entry_table(state: InteractiveState):
         print(f"  {c.WARN}No SPD entries found.{c.RESET}")
         return
     # Header
-    print(f"\n  {c.HEADER}{'#':<4} {'Type':<9} {'Module':<24} {'Mfr':<9} {'Density':<7} "
+    chip_count = state.device_profile.get('chip_count') if state.device_profile else None
+    print(f"\n  {c.HEADER}{'#':<4} {'Type':<9} {'Module':<24} {'Mfr':<9} {'Capacity':<16} "
           f"{'Dies':<8} {'Width':<6} {'Ranks':<6} {'Pending'}{c.RESET}")
-    print(f"  {c.DIM}{'-'*95}{c.RESET}")
+    print(f"  {c.DIM}{'-'*100}{c.RESET}")
     for i, e in enumerate(entries):
         cur_den = _density_from_bytes(e.byte6, e.byte12)
+        if chip_count is not None:
+            cur_cap = _capacity_label(e.byte6, e.byte12, chip_count)
+        else:
+            cur_cap = cur_den
         die_info = f"{e.die_count}x{e.die_density}" if e.die_count and e.die_density else '?'
         pending = ""
         row_color = ""
@@ -2107,7 +1658,7 @@ def _print_entry_table(state: InteractiveState):
         name = e.module_name or '(unnamed)'
         mfr = e.manufacturer or '?'
         print(f"  {row_color}{sel}{i+1:<3} {e.mem_type:<9} {name:<24} "
-              f"{mfr:<9} {cur_den:<7} "
+              f"{mfr:<9} {cur_cap:<16} "
               f"{die_info:<8} {e.dev_width:<6} {e.ranks}R    {pending}{c.RESET}")
     print()
 
@@ -2161,7 +1712,7 @@ def _show_help(menu: str, state: InteractiveState):
         print(f"  {c.BOLD}  HELP / ?{c.RESET}      Show this help")
         print(f"  {c.BOLD}  EXIT{c.RESET}          Quit without writing\n")
     elif menu == 'spd':
-        targets = state.device_profile.get('memory_targets', [16, 32]) if state.device_profile else [16, 32]
+        targets = state.device_profile.get('memory_targets', (16, 32)) if state.device_profile else (16, 32)
         target_str = '/'.join(str(t) for t in targets)
         print(f"\n  {c.HEADER}SPD Entry Commands:{c.RESET}")
         print(f"  {c.BOLD}  LIST{c.RESET}                       Show entries with pending changes")
@@ -2277,7 +1828,10 @@ def _apply_changes(state: InteractiveState) -> bool:
 
     if all_ok:
         print(f"\n  {c.OK}{c.BOLD}*** MODIFICATION SUCCESSFUL ***{c.RESET}")
-        print(f"  Ready for SPI flash.")
+        if _is_pe_firmware(bytes(data)):
+            print(f"  Flash using the manufacturer's update tool (e.g. h2offt).")
+        else:
+            print(f"  Ready for SPI flash.")
     else:
         print(f"\n  {c.ERR}{c.BOLD}*** VERIFICATION FAILED ***{c.RESET}")
         print(f"  {c.ERR}DO NOT flash this file!{c.RESET}")
@@ -2330,7 +1884,7 @@ def _handle_spd_command(state: InteractiveState, cmd: str, args: list):
     """Handle an SPD submenu command."""
     c = _C
     entries = state.all_entries
-    targets = state.device_profile.get('memory_targets', [16, 32]) if state.device_profile else [16, 32]
+    targets = state.device_profile.get('memory_targets', (16, 32)) if state.device_profile else (16, 32)
     default_target = max(t for t in targets if t <= 32) if any(t <= 32 for t in targets) else targets[0]
 
     if cmd == 'list':
@@ -2357,11 +1911,13 @@ def _handle_spd_command(state: InteractiveState, cmd: str, args: list):
         mod = state.entry_mods[idx]
         name = e.module_name or '(unnamed)'
         cur = _density_from_bytes(e.byte6, e.byte12)
+        chip_count = state.device_profile.get('chip_count') if state.device_profile else None
+        cap_str = _capacity_label(e.byte6, e.byte12, chip_count) if chip_count else cur
         die_info = f"{e.die_count}x{e.die_density}" if e.die_count and e.die_density else '?'
         print(f"\n  {c.OK}Entry {n} selected:{c.RESET} {c.VALUE}{name}{c.RESET}")
-        print(f"    {c.LABEL}Type:{c.RESET}     {e.mem_type}  ({e.manufacturer or '?'})")
-        print(f"    {c.LABEL}Density:{c.RESET}  {cur}  (b6=0x{e.byte6:02X}, b12=0x{e.byte12:02X})")
-        print(f"    {c.LABEL}Package:{c.RESET}  {die_info} dies, {e.dev_width}, {e.ranks}R")
+        print(f"    {c.LABEL}Type:{c.RESET}      {e.mem_type}  ({e.manufacturer or '?'})")
+        print(f"    {c.LABEL}Capacity:{c.RESET}  {cap_str}  (b6=0x{e.byte6:02X}, b12=0x{e.byte12:02X})")
+        print(f"    {c.LABEL}Package:{c.RESET}   {die_info} dies, {e.dev_width}, {e.ranks}R")
         if e.tAA_ns:
             print(f"    {c.LABEL}Timings:{c.RESET}  tAA={e.tAA_ns}ns  tRCD={e.tRCD_ns}ns  "
                   f"tRPab={e.tRPAB_ns}ns  tRPpb={e.tRPPB_ns}ns")
@@ -2635,8 +2191,8 @@ Examples:
     python sd_apcb_tool.py dmi-import clean_bios.bin restored.bin my_dmi_backup.json
 
 Supported devices:
-  Steam Deck (LCD & OLED): 16GB/32GB, SPI flash
-  ROG Ally / Ally X: 16GB/32GB/64GB, SPI flash
+  Steam Deck (LCD & OLED): 16GB/32GB
+  ROG Ally / Ally X: 16GB/32GB/64GB
 
   Omit --target for interactive mode.
         """

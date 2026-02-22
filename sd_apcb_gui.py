@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-APCB Memory Mod Tool (GUI) v1.4.0
+APCB Memory Mod Tool (GUI) v1.8.0
 ===================================
 GUI for analyzing and modifying handheld device BIOS files
 to support 16GB/32GB/64GB memory configurations.
@@ -10,7 +10,6 @@ Supported devices:
   - ASUS ROG Ally / Ally X — 16GB/32GB/64GB
 
 Auto-detects device type from firmware contents.
-Outputs ready for SPI flash programming.
 
 Requirements:
   - Python 3.8+ (tkinter included with standard Python on Windows)
@@ -18,15 +17,32 @@ Requirements:
 Usage: python sd_apcb_gui.py
 """
 
-import os, sys, struct, hashlib, datetime
+import os, sys, struct
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from enum import Enum, IntEnum
+from typing import List, Optional, Tuple, Dict
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 
+
+class DeviceType(str, Enum):
+    """Supported device types."""
+    STEAM_DECK = 'steam_deck'
+    ROG_ALLY = 'rog_ally'
+    ROG_ALLY_X = 'rog_ally_x'
+    AUTO = 'auto'
+
+
+class MemoryTarget(IntEnum):
+    """Supported memory target sizes in GB."""
+    GB_16 = 16
+    GB_32 = 32
+    GB_64 = 64
+
+
 APP_TITLE = "SD APCB Memory Mod Tool"
-APP_VERSION = "1.7.1"
+APP_VERSION = "1.8.0"
 APCB_MAGIC = b'APCB'
 APCB_MAGIC_MOD = b'QPCB'
 APCB_CHECKSUM_OFFSET = 16
@@ -35,8 +51,13 @@ TOKN_MAGIC = b'TOKN'
 PSPG_MAGIC = b'PSPG'
 LP5_SPD_MAGIC  = bytes([0x23, 0x11, 0x13, 0x0E])
 LP5X_SPD_MAGIC = bytes([0x23, 0x11, 0x15, 0x0E])
-ALL_SPD_MAGICS = [LP5_SPD_MAGIC, LP5X_SPD_MAGIC]
+ALL_SPD_MAGICS = (LP5_SPD_MAGIC, LP5X_SPD_MAGIC)
 SPD_ENTRY_SEPARATOR = bytes([0x12, 0x34, 0x56, 0x78])
+# SPD byte offsets relative to entry magic
+SPD_BYTE_DENSITY = 4; SPD_BYTE_ADDRESSING = 5; SPD_BYTE_PKG_TYPE = 6; SPD_BYTE_OPTIONAL = 7
+SPD_BYTE_MODULE_ORG = 12; SPD_BYTE_BUS_WIDTH = 13; SPD_BYTE_TCKMIN = 18
+SPD_BYTE_TAAMIN = 24; SPD_BYTE_TRCDMIN = 26; SPD_BYTE_TRPABMIN = 27; SPD_BYTE_TRPPBMIN = 28
+SPD_MTB_PS = 125  # Medium Time Base in picoseconds
 MEMORY_CONFIGS = {
     16: {'name': '16GB (Stock)', 'byte6': 0x95, 'byte12': 0x02},
     32: {'name': '32GB Upgrade', 'byte6': 0xB5, 'byte12': 0x0A},
@@ -112,12 +133,16 @@ SCREEN_MFR_IDS = [p['mfr_id'] for p in SCREEN_PROFILES.values()]
 
 # Device profiles
 DEVICE_PROFILES = {
-    'steam_deck': {'name': 'Steam Deck', 'memory_targets': [16, 32]},
-    'rog_ally': {'name': 'ROG Ally', 'memory_targets': [16, 32, 64]},
-    'rog_ally_x': {'name': 'ROG Ally X', 'memory_targets': [16, 32, 64]},
+    'steam_deck': {'name': 'Steam Deck', 'memory_targets': (16, 32), 'chip_count': (2, 4)},
+    'rog_ally': {'name': 'ROG Ally', 'memory_targets': (16, 32, 64), 'chip_count': 4},
+    'rog_ally_x': {'name': 'ROG Ally X', 'memory_targets': (16, 32, 64), 'chip_count': 4},
 }
 
-def detect_device(data):
+def _is_pe_firmware(data: bytes) -> bool:
+    """Check if data starts with PE/MZ header (firmware update package, not raw SPI)."""
+    return len(data) >= 2 and data[:2] == b'MZ'
+
+def detect_device(data: bytes) -> str:
     """Auto-detect device type from firmware contents."""
     has_memg_80, has_pspg_memg_c0, has_pspg_memg_c8 = False, False, False
     for magic in [APCB_MAGIC, APCB_MAGIC_MOD]:
@@ -147,10 +172,11 @@ _DIE_DENSITY_MAP = {0x4: '4Gb', 0xB: '6Gb', 0x5: '8Gb', 0x8: '12Gb', 0x6: '16Gb'
 _DIE_COUNT_MAP = {0: 1, 1: 2, 2: 4, 3: 8}
 _DEV_WIDTH_MAP = {0: 'x4', 1: 'x8', 2: 'x16', 3: 'x32'}
 
-def _decode_spd_fields(spd):
+def _decode_spd_fields(spd: bytes) -> dict:
     """Decode LPDDR5/LPDDR5X SPD bytes into human-readable fields."""
     if len(spd) < 29: return {}
-    b4, b5, b6, b12, b13 = spd[4], spd[5], spd[6], spd[12], spd[13]
+    b4, b5, b6 = spd[SPD_BYTE_DENSITY], spd[SPD_BYTE_ADDRESSING], spd[SPD_BYTE_PKG_TYPE]
+    b12, b13 = spd[SPD_BYTE_MODULE_ORG], spd[SPD_BYTE_BUS_WIDTH]
     return {
         'die_density': _DIE_DENSITY_MAP.get(b4 & 0x0F, '?'),
         'die_count': _DIE_COUNT_MAP.get((b6 >> 4) & 0x07, 0),
@@ -161,10 +187,10 @@ def _decode_spd_fields(spd):
         'col_bits': (b5 & 0x07) + 9,
         'bank_groups': {0: 1, 1: 2, 2: 4}.get((b4 >> 4) & 0x03, 0),
         'banks_per_group': {0: 4, 1: 8, 2: 16}.get((b4 >> 6) & 0x03, 0),
-        'tAA_ns': round(spd[24] * SPD_MTB_PS / 1000, 2),
-        'tRCD_ns': round(spd[26] * SPD_MTB_PS / 1000, 2),
-        'tRPAB_ns': round(spd[27] * SPD_MTB_PS / 1000, 2),
-        'tRPPB_ns': round(spd[28] * SPD_MTB_PS / 1000, 2),
+        'tAA_ns': round(spd[SPD_BYTE_TAAMIN] * SPD_MTB_PS / 1000, 2),
+        'tRCD_ns': round(spd[SPD_BYTE_TRCDMIN] * SPD_MTB_PS / 1000, 2),
+        'tRPAB_ns': round(spd[SPD_BYTE_TRPABMIN] * SPD_MTB_PS / 1000, 2),
+        'tRPPB_ns': round(spd[SPD_BYTE_TRPPBMIN] * SPD_MTB_PS / 1000, 2),
     }
 
 @dataclass
@@ -187,17 +213,17 @@ class APCBBlock:
     @property
     def is_memg(self): return self.content_type == 'MEMG'
 
-def calculate_apcb_checksum(block_data):
+def calculate_apcb_checksum(block_data: bytes) -> int:
     total = 0
     for i, b in enumerate(block_data):
         if i == APCB_CHECKSUM_OFFSET: continue
         total = (total + b) & 0xFF
     return (0x100 - total) & 0xFF
 
-def verify_apcb_checksum(block_data):
+def verify_apcb_checksum(block_data: bytes) -> bool:
     return calculate_apcb_checksum(block_data) == block_data[APCB_CHECKSUM_OFFSET]
 
-def find_apcb_blocks(data):
+def find_apcb_blocks(data: bytes) -> List[APCBBlock]:
     blocks, found = [], set()
     for magic in [APCB_MAGIC, APCB_MAGIC_MOD]:
         pos = 0
@@ -228,7 +254,7 @@ def find_apcb_blocks(data):
     blocks.sort(key=lambda b: b.offset)
     return blocks
 
-def parse_spd_entries(data, apcb_offset, apcb_size):
+def parse_spd_entries(data: bytes, apcb_offset: int, apcb_size: int) -> List[SPDEntry]:
     entries, apcb = [], data[apcb_offset:apcb_offset+apcb_size]
     raw = []
     for spd_magic, mt in [(LP5_SPD_MAGIC, 'LPDDR5'), (LP5X_SPD_MAGIC, 'LPDDR5X')]:
@@ -267,7 +293,7 @@ def parse_spd_entries(data, apcb_offset, apcb_size):
         entries.append(e)
     return entries
 
-def detect_current_config(blocks):
+def detect_current_config(blocks: List[APCBBlock]) -> str:
     """Return a factual density label from the first SPD entry (no assumptions)."""
     for b in blocks:
         if b.is_memg and b.spd_entries:
@@ -275,14 +301,28 @@ def detect_current_config(blocks):
             return density_from_bytes(e.byte6, e.byte12)
     return "No MEMG blocks found"
 
-def density_from_bytes(byte6, byte12):
-    """Map current byte6/byte12 to a density string for the dropdown."""
+def density_from_bytes(byte6: int, byte12: int) -> str:
+    """Map current byte6/byte12 to a total capacity string."""
     for gb, cfg in MEMORY_CONFIGS.items():
         if cfg['byte6'] == byte6 and cfg['byte12'] == byte12:
             return f"{gb}GB"
     return "16GB"
 
-def modify_bios_data(data, entry_modifications, modify_magic=False):
+def _capacity_label(byte6: int, byte12: int, chip_count) -> str:
+    """Return per-package capacity string like '4x 8GB' or '2x 16GB'."""
+    total_gb = None
+    for gb, cfg in MEMORY_CONFIGS.items():
+        if cfg['byte6'] == byte6 and cfg['byte12'] == byte12:
+            total_gb = gb
+            break
+    if total_gb is None:
+        return "Unknown"
+    if isinstance(chip_count, tuple):
+        lo, hi = chip_count
+        return f"{hi}x{total_gb//hi}GB/{lo}x{total_gb//lo}GB"
+    return f"{chip_count}x {total_gb // chip_count}GB"
+
+def modify_bios_data(data: bytearray, entry_modifications: List[Dict], modify_magic: bool = False) -> List[tuple]:
     """Modify BIOS data with per-entry configurations.
 
     Args:
@@ -307,8 +347,8 @@ def modify_bios_data(data, entry_modifications, modify_magic=False):
             if idx >= len(block.spd_entries): continue
             e = block.spd_entries[idx]
             config = MEMORY_CONFIGS[mod['target_gb']]
-            # Write density bytes
-            b6, b12 = e.offset_in_file+6, e.offset_in_file+12
+            # Write SPD config bytes (package type + module organization)
+            b6, b12 = e.offset_in_file + SPD_BYTE_PKG_TYPE, e.offset_in_file + SPD_BYTE_MODULE_ORG
             mods.append((b6, data[b6], config['byte6'])); mods.append((b12, data[b12], config['byte12']))
             data[b6] = config['byte6']; data[b12] = config['byte12']
             # Write module name if changed
@@ -332,7 +372,7 @@ def modify_bios_data(data, entry_modifications, modify_magic=False):
 
 # ── Screen Replacement Patch ──
 
-def find_edid_blocks(data):
+def find_edid_blocks(data: bytes) -> list:
     """Find all EDID blocks in firmware. Returns list of (offset, edid_bytes) tuples."""
     blocks = []
     pos = 0
@@ -345,7 +385,7 @@ def find_edid_blocks(data):
         pos = idx + 1
     return blocks
 
-def patch_screen(data, screen_key):
+def patch_screen(data: bytearray, screen_key: str) -> List[tuple]:
     """Apply screen replacement patches to Steam Deck LCD firmware.
     Patches EDID blocks and appends version tag to $BVDT$ version strings.
     Returns list of (offset, description) tuples for logging.
@@ -384,194 +424,7 @@ def patch_screen(data, screen_key):
         pos = idx + 1
     return patches
 
-# ── PE Authenticode Signing Engine ──
-
-def _check_signing_available():
-    try:
-        from cryptography.hazmat.primitives.asymmetric import rsa; return True
-    except ImportError: return False
-
-def _dl(length):
-    if length < 0x80: return bytes([length])
-    elif length < 0x100: return bytes([0x81, length])
-    elif length < 0x10000: return bytes([0x82, (length>>8)&0xFF, length&0xFF])
-    elif length < 0x1000000: return bytes([0x83, (length>>16)&0xFF, (length>>8)&0xFF, length&0xFF])
-    else: return bytes([0x84, (length>>24)&0xFF, (length>>16)&0xFF, (length>>8)&0xFF, length&0xFF])
-
-def _dt(tag, c): return bytes([tag]) + _dl(len(c)) + c
-def _ds(c): return _dt(0x30, c)
-def _dset(c): return _dt(0x31, c)
-def _dn(): return b'\x05\x00'
-def _do(d): return _dt(0x04, d)
-def _dc(t, c, con=True): return _dt((0xA0 if con else 0x80)|t, c)
-def _dut(dt): return _dt(0x17, dt.strftime('%y%m%d%H%M%SZ').encode())
-
-def _doid(s):
-    p = [int(x) for x in s.split('.')]
-    e = bytes([40*p[0]+p[1]])
-    for v in p[2:]:
-        if v < 0x80: e += bytes([v])
-        elif v < 0x4000: e += bytes([(v>>7)|0x80, v&0x7F])
-        elif v < 0x200000: e += bytes([(v>>14)|0x80, ((v>>7)&0x7F)|0x80, v&0x7F])
-        else: e += bytes([(v>>21)|0x80, ((v>>14)&0x7F)|0x80, ((v>>7)&0x7F)|0x80, v&0x7F])
-    return _dt(0x06, e)
-
-def _dint(v):
-    if isinstance(v, int):
-        if v == 0: return _dt(0x02, b'\x00')
-        r = []
-        while v > 0: r.insert(0, v&0xFF); v >>= 8
-        if r[0] & 0x80: r.insert(0, 0)
-        return _dt(0x02, bytes(r))
-    return _dt(0x02, v)
-
-_P7='1.2.840.113549.1.7.2'; _SID='1.3.6.1.4.1.311.2.1.4'; _SPE='1.3.6.1.4.1.311.2.1.15'
-_SOP='1.3.6.1.4.1.311.2.1.12'; _MIC='1.3.6.1.4.1.311.2.1.21'
-_S256='2.16.840.1.101.3.4.2.1'; _RSA='1.2.840.113549.1.1.1'
-_CT='1.2.840.113549.1.9.3'; _ST='1.2.840.113549.1.9.5'; _MD='1.2.840.113549.1.9.4'
-_IFLASH_CER=b'_IFLASH_BIOSCER'; _IFLASH_CR2=b'_IFLASH_BIOSCR2'; _IFLASH_FL=0x0F; _IFLASH_CH=0x18; _IFLASH_CC=0x1F
-
-def _find_iflash(data):
-    """Find _IFLASH_BIOSCER and _IFLASH_BIOSCR2 offsets in firmware."""
-    a, b = data.find(_IFLASH_CER), data.find(_IFLASH_CR2)
-    return (a, b) if a >= 0 and b >= 0 else (None, None)
-
-_IFL_FMAP = {b'_IFLASH_DRV_IMG': lambda f: f|0x08, b'_IFLASH_BIOSIMG': lambda f: 0x08 if f==0x20 else f,
-    b'_IFLASH_INI_IMG': lambda f: 0x68, b'_IFLASH_BIOSCER': lambda f: 0x08, b'_IFLASH_BIOSCR2': lambda f: 0x08}
-
-def _update_ifl_flags(d):
-    """Update all _IFLASH flags for h2offt QA mode (DeckHD-proven pattern)."""
-    pos = 0
-    while pos < len(d):
-        idx = d.find(b'_IFLASH_', pos)
-        if idx < 0: break
-        for mag, xf in _IFL_FMAP.items():
-            if d[idx:idx+len(mag)] == mag:
-                nf = xf(d[idx + 0x0F]); d[idx + 0x0F] = nf
-                if mag == b'_IFLASH_DRV_IMG': d[idx + 0x13] = nf  # DRV_IMG has second flag
-                break
-        pos = idx + 1
-
-def _build_wc(p7):
-    """Build WIN_CERTIFICATE from PKCS#7 blob (8-byte aligned)."""
-    wl = (8+len(p7)+7)&~7; wc = struct.pack('<IHH', wl, 0x0200, 0x0002)+p7+b'\x00'*(wl-8-len(p7)); return wc
-
-def _build_p7(ph, cd, k, now):
-    """Build complete PKCS#7 SignedData for Authenticode."""
-    from cryptography.hazmat.primitives import hashes as H
-    from cryptography.hazmat.primitives.asymmetric import padding as P
-    from cryptography import x509 as X
-    cert = X.load_der_x509_certificate(cd)
-    # SPC_PE_IMAGE_DATA: BIT STRING(1B) + empty SpcLink, matching DeckHD encoding
-    sf = _dt(0x03, b'\x00'); sl = _dc(0, b'', False); spd = _ds(sf+_dc(0, _dc(2, sl)))
-    sa = _ds(_doid(_SPE)+spd); da = _ds(_doid(_S256)+_dn()); di = _ds(da+_do(ph))
-    spc_inner = sa+di; spc = _ds(spc_inner)
-    ci = _ds(_doid(_SID)+_dc(0, spc)); s256a = _ds(_doid(_S256)+_dn())
-    # Auth attrs: opusInfo, contentType, messageDigest (no signingTime, DER-sorted)
-    ac = _ds(_doid(_CT)+_dset(_doid(_SID)))
-    ao = _ds(_doid(_SOP)+_dset(_ds(b''))); ch = hashlib.sha256(spc_inner).digest()
-    am = _ds(_doid(_MD)+_dset(_do(ch)))
-    aa = b''.join(sorted([ao, ac, am], key=lambda x: x))
-    sig = k.sign(_dset(aa), P.PKCS1v15(), H.SHA256())
-    ias = _ds(cert.issuer.public_bytes()+_dint(cert.serial_number))
-    ra = _ds(_doid(_RSA)+_dn())
-    si = _ds(_dint(1)+ias+s256a+_dc(0,aa)+ra+_do(sig))
-    sd = _ds(_dint(1)+_dset(s256a)+ci+_dc(0,cd)+_dset(si))
-    return _ds(_doid(_P7)+_dc(0, sd))
-
-def _pe_cksum(data):
-    po = struct.unpack_from('<I', data, 0x3C)[0]; co = po+4+20+64
-    c, r = 0, len(data)%4
-    for i in range(0, len(data)-r, 4):
-        if i == co: continue
-        v = struct.unpack_from('<I', data, i)[0]; c = (c&0xFFFFFFFF)+v+(c>>32); c = (c&0xFFFF)+(c>>16)
-    if r:
-        v = int.from_bytes(data[-(r):]+b'\x00'*(4-r), 'little'); c = (c&0xFFFFFFFF)+v+(c>>32); c = (c&0xFFFF)+(c>>16)
-    c = (c&0xFFFF)+(c>>16); return (c+len(data))&0xFFFFFFFF
-
-def _auth_hash(data):
-    """Compute Authenticode PE hash per Microsoft spec (section-based)."""
-    po = struct.unpack_from('<I', data, 0x3C)[0]
-    ns = struct.unpack_from('<H', data, po+6)[0]
-    ohs = struct.unpack_from('<H', data, po+4+18)[0]
-    os_ = po+4+20; m = struct.unpack_from('<H', data, os_)[0]
-    co = os_+64; dd = os_+(112 if m == 0x20B else 96); so = dd+32
-    soh = struct.unpack_from('<I', data, os_+60)[0]
-    sto = os_+ohs
-    h = hashlib.sha256()
-    # Step 1: headers (skip checksum + secdir)
-    h.update(data[:co]); h.update(data[co+4:so]); h.update(data[so+8:soh])
-    # Step 2: sections sorted by PointerToRawData
-    secs = []
-    for i in range(ns):
-        so2 = sto+i*40; rs = struct.unpack_from('<I', data, so2+16)[0]; rp = struct.unpack_from('<I', data, so2+20)[0]
-        if rs > 0: secs.append((rp, rs))
-    secs.sort(key=lambda s: s[0])
-    sbh = soh
-    for ptr, sz in secs:
-        h.update(data[ptr:ptr+sz])
-        if ptr+sz > sbh: sbh = ptr+sz
-    # Step 3: trailing data
-    if sbh < len(data): h.update(data[sbh:])
-    return h.digest()
-
-def sign_firmware(data_in):
-    """Sign PE firmware with 3-layer integrity (BIOSCER hash + BIOSCR2 cert + PE Authenticode)."""
-    from cryptography.hazmat.primitives import hashes as H
-    from cryptography.hazmat.primitives.asymmetric import rsa as R
-    from cryptography.x509 import CertificateBuilder as CB, Name, NameAttribute, NameOID, random_serial_number
-    from cryptography.hazmat.primitives.serialization import Encoding
-    d = bytearray(data_in)
-    if d[:2] != b'MZ': raise ValueError("Not PE")
-    po = struct.unpack_from('<I', d, 0x3C)[0]; os_ = po+4+20
-    m = struct.unpack_from('<H', d, os_)[0]; co = os_+64
-    dd = os_+(112 if m == 0x20B else 96); so = dd+32
-    # Step 1: Strip existing PE cert
-    ov = struct.unpack_from('<I', d, so)[0]
-    if ov > 0 and ov < len(d): d = d[:ov]
-    # Generate self-signed cert (shared by BIOSCR2 + PE cert)
-    k = R.generate_private_key(65537, 2048); now = datetime.datetime.now(datetime.timezone.utc)
-    subj = Name([NameAttribute(NameOID.COMMON_NAME, "SD APCB Tool")])
-    cert = CB().subject_name(subj).issuer_name(subj).public_key(k.public_key()).serial_number(random_serial_number()).not_valid_before(now).not_valid_after(now+datetime.timedelta(days=3650)).sign(k, H.SHA256())
-    cd = cert.public_bytes(Encoding.DER)
-    # Step 2: Handle _IFLASH internal integrity structures
-    bcer, bcr2 = _find_iflash(bytes(d))
-    if bcer is not None and bcr2 is not None:
-        # 2a: Update ALL _IFLASH flags to QA mode (DeckHD pattern)
-        _update_ifl_flags(d)
-        # 2b: Get original BIOSCR2 slot size (full slot to SizeOfImage, not just WC len)
-        cr2co = bcr2 + _IFLASH_CC
-        old_cr2_slot = len(d) - cr2co
-        # 2b: Preserve BIOSCER hash (proprietary algorithm, leave untouched)
-        # 2c: Re-sign BIOSCR2 with our cert
-        bd = bytearray(d)
-        struct.pack_into('<I', bd, so, 0); struct.pack_into('<I', bd, so+4, 0); struct.pack_into('<I', bd, co, 0)
-        cr2_p7 = _build_p7(_auth_hash(bytes(bd)), cd, k, now)
-        cr2_wc = _build_wc(cr2_p7)
-        # Maintain layout invariant: SizeOfImage == bioscr2_wc_end (zero gap)
-        delta = len(cr2_wc) - old_cr2_slot; old_slot_end = cr2co + old_cr2_slot
-        if delta > 0:
-            d[cr2co:old_slot_end] = cr2_wc[:old_cr2_slot]
-            d[old_slot_end:old_slot_end] = cr2_wc[old_cr2_slot:]
-        elif delta < 0:
-            d[cr2co:cr2co+len(cr2_wc)] = cr2_wc; del d[cr2co+len(cr2_wc):old_slot_end]
-        else:
-            d[cr2co:old_slot_end] = cr2_wc
-        if delta != 0:
-            soi_off = os_ + 56; struct.pack_into('<I', d, soi_off, struct.unpack_from('<I', d, soi_off)[0] + delta)
-    # Step 3: Clear PE header fields
-    struct.pack_into('<I', d, so, 0); struct.pack_into('<I', d, so+4, 0); struct.pack_into('<I', d, co, 0)
-    # Step 4: Compute PE Authenticode hash (includes updated BIOSCER + BIOSCR2)
-    ph = _auth_hash(bytes(d))
-    # Step 5: Build PE PKCS#7 and append WIN_CERTIFICATE
-    p7 = _build_p7(ph, cd, k, now); wc = _build_wc(p7); ct = len(d)
-    struct.pack_into('<I', d, so, ct); struct.pack_into('<I', d, so+4, len(wc))
-    d.extend(wc); ck = _pe_cksum(bytes(d)); struct.pack_into('<I', d, co, ck)
-    # Self-check
-    vd = bytearray(d[:ct])
-    struct.pack_into('<I', vd, so, 0); struct.pack_into('<I', vd, so+4, 0); struct.pack_into('<I', vd, co, 0)
-    if _auth_hash(bytes(vd)) != ph: raise RuntimeError("Signing self-check FAILED: hash mismatch")
-    return bytes(d)
+# (PE Authenticode signing code was removed in v1.8.0 — requires Insyde QA.pfx)
 
 # ── DMI / SMBIOS (AMI DmiEdit $DMI Store) ──
 AMI_DMI_MAGIC = b'$DMI'
@@ -596,7 +449,7 @@ class DmiRecord:
     @property
     def type_name(self): return SMBIOS_TYPE_NAMES.get(self.smbios_type, f'Type {self.smbios_type}')
 
-def find_dmi_store(data, allow_empty=False):
+def find_dmi_store(data: bytes, allow_empty: bool = False) -> Optional[Tuple[int, int]]:
     pos, candidates = 0, []
     while pos < len(data) - 8:
         idx = data.find(AMI_DMI_MAGIC, pos)
@@ -626,7 +479,7 @@ def find_dmi_store(data, allow_empty=False):
             pos = idx + 1
     return max(candidates, key=lambda c: c[1]-c[0]) if candidates else None
 
-def parse_dmi_records(data, store_start, store_end):
+def parse_dmi_records(data: bytes, store_start: int, store_end: int) -> list:
     records, pos = [], store_start + 4
     while pos < store_end - 5:
         st, fo, fl = data[pos], data[pos+1], data[pos+2]
@@ -636,7 +489,7 @@ def parse_dmi_records(data, store_start, store_end):
         pos += rl
     return records
 
-def export_dmi(data):
+def export_dmi(data: bytes) -> dict:
     result = find_dmi_store(data)
     if result is None:
         raise ValueError("No DMI data found in firmware.\n"
@@ -663,7 +516,7 @@ def export_dmi(data):
                 elif r.field_offset == 0x05: export['board_info']['product'] = r.data_str
     return export
 
-def import_dmi(firmware_data, dmi_json):
+def import_dmi(firmware_data: bytearray, dmi_json: dict) -> bytearray:
     result = find_dmi_store(bytes(firmware_data), allow_empty=True)
     if result is None:
         raise ValueError("No AMI $DMI store found in target firmware.\n"
@@ -807,13 +660,8 @@ class APCBToolGUI:
         self.entry_canvas.pack(side='left', fill='both', expand=True)
         self.entry_scrollbar.pack(side='right', fill='y')
         # Mouse wheel scrolling — only for SPD canvas area (not global)
-        def _on_canvas_mousewheel(event): self.entry_canvas.yview_scroll(-1 * (event.delta // 120), 'units')
-        self.entry_canvas.bind('<MouseWheel>', _on_canvas_mousewheel)
-        self.entry_inner.bind('<MouseWheel>', _on_canvas_mousewheel)
-        def _bind_mousewheel_recursive(widget):
-            widget.bind('<MouseWheel>', _on_canvas_mousewheel)
-            for child in widget.winfo_children(): _bind_mousewheel_recursive(child)
-        self._bind_mw = _bind_mousewheel_recursive
+        self.entry_canvas.bind('<MouseWheel>', self._on_canvas_mousewheel)
+        self.entry_inner.bind('<MouseWheel>', self._on_canvas_mousewheel)
         # Placeholder
         self.entry_placeholder = ttk.Label(self.entry_inner, text="  Load a BIOS file to see SPD entries", style='Status.TLabel')
         self.entry_placeholder.pack(anchor='w', padx=8, pady=8)
@@ -863,7 +711,7 @@ class APCBToolGUI:
         ttk.Checkbutton(sa_frame, text="Select All", variable=self.select_all_var, command=self._toggle_all).pack(side='left')
         # Column headers
         hdr = tk.Frame(self.entry_inner, bg=C_BGL); hdr.pack(fill='x', padx=8, pady=(4,2))
-        for txt, w in [('#', 4), ('Type', 8), ('Manufacturer Prefix', 25), ('Module Suffix', 18), ('Density', 7), ('Current', 14)]:
+        for txt, w in [('#', 4), ('Type', 8), ('Manufacturer Prefix', 25), ('Module Suffix', 18), ('Capacity', 10), ('Current', 14)]:
             tk.Label(hdr, text=txt, bg=C_BGL, fg=C_FGD, font=('Consolas', 8), anchor='w', width=w).pack(side='left', padx=1)
         # Separator
         tk.Frame(self.entry_inner, bg=C_BDR, height=1).pack(fill='x', padx=8, pady=2)
@@ -940,23 +788,36 @@ class APCBToolGUI:
             }
             self.entry_rows.append(row)
             # Bind checkbox toggle to enable/disable widgets and sync density from global target
-            def _on_toggle(var=enabled_var, pw=prefix_combo, sw=suffix_entry, cw=density_combo,
-                           hn=has_name, dv=density_var):
-                if var.get():
-                    if hn:
-                        pw.configure(state='readonly')
-                        sw.configure(state='normal', fg=C_FG, insertbackground=C_FG)
-                    cw.configure(state='readonly')
-                    # Set density to current global target when entry is checked
-                    dv.set(f"{self.target_var.get()}GB")
-                else:
-                    pw.configure(state='disabled')
-                    sw.configure(state='disabled', fg=C_FG, insertbackground=C_FG)
-                    cw.configure(state='disabled')
-            cb.configure(command=_on_toggle)
+            cb.configure(command=lambda v=enabled_var, pw=prefix_combo, sw=suffix_entry,
+                         cw=density_combo, hn=has_name, dv=density_var:
+                         self._on_entry_toggle(v, pw, sw, cw, hn, dv))
         # Bind mousewheel to all child widgets for scrolling
-        if hasattr(self, '_bind_mw'):
-            self._bind_mw(self.entry_inner)
+        self._bind_mousewheel_recursive(self.entry_inner)
+
+    def _on_canvas_mousewheel(self, event: 'tk.Event') -> None:
+        """Handle mousewheel scrolling in the SPD entry canvas."""
+        self.entry_canvas.yview_scroll(-1 * (event.delta // 120), 'units')
+
+    def _bind_mousewheel_recursive(self, widget: 'tk.Widget') -> None:
+        """Bind mousewheel scrolling to widget and all its descendants."""
+        widget.bind('<MouseWheel>', self._on_canvas_mousewheel)
+        for child in widget.winfo_children():
+            self._bind_mousewheel_recursive(child)
+
+    def _on_entry_toggle(self, var: 'tk.BooleanVar', pw: 'tk.Widget',
+                         sw: 'tk.Widget', cw: 'tk.Widget',
+                         has_name: bool, density_var: 'tk.StringVar') -> None:
+        """Handle per-entry checkbox toggle: enable/disable widgets and sync density."""
+        if var.get():
+            if has_name:
+                pw.configure(state='readonly')
+                sw.configure(state='normal', fg=C_FG, insertbackground=C_FG)
+            cw.configure(state='readonly')
+            density_var.set(f"{self.target_var.get()}GB")
+        else:
+            pw.configure(state='disabled')
+            sw.configure(state='disabled', fg=C_FG, insertbackground=C_FG)
+            cw.configure(state='disabled')
 
     def _toggle_all(self):
         """Toggle all entry checkboxes and enable/disable widgets."""
@@ -1060,17 +921,21 @@ class APCBToolGUI:
             self._log(f"  Offset: 0x{block.offset:08X}  |  Size: 0x{block.data_size:04X}  |  Checksum: 0x{block.checksum_byte:02X} ({'VALID' if block.checksum_valid else 'INVALID'})",
                       'success' if block.checksum_valid else 'error')
             if block.is_memg and block.spd_entries:
-                self._log(f"\n  {'#':<4} {'Type':<8} {'Module':<24} {'Mfr':<9} {'Density':<7} "
+                chip_count = self.device_profile.get('chip_count') if self.device_profile else None
+                self._log(f"\n  {'#':<4} {'Type':<8} {'Module':<24} {'Mfr':<9} {'Capacity':<16} "
                           f"{'Dies':<8} {'Width':<5} {'Ranks':<6} {'tAA':<8} {'tRCD':<8} {'tRP'}", 'accent')
-                self._log(f"  {'─'*100}", 'dim')
+                self._log(f"  {'─'*105}", 'dim')
                 for j,e in enumerate(block.spd_entries):
-                    den = density_from_bytes(e.byte6, e.byte12)
+                    if chip_count is not None:
+                        cap = _capacity_label(e.byte6, e.byte12, chip_count)
+                    else:
+                        cap = density_from_bytes(e.byte6, e.byte12)
                     die_info = f"{e.die_count}x{e.die_density}" if e.die_count and e.die_density else '?'
                     tAA = f"{e.tAA_ns}ns" if e.tAA_ns else '?'
                     tRCD = f"{e.tRCD_ns}ns" if e.tRCD_ns else '?'
                     tRP = f"{e.tRPPB_ns}ns" if e.tRPPB_ns else '?'
                     self._log(f"  {j+1:<4} {e.mem_type:<8} {e.module_name or '—':<24} "
-                              f"{e.manufacturer or '?':<9} {den:<7} "
+                              f"{e.manufacturer or '?':<9} {cap:<16} "
                               f"{die_info:<8} {e.dev_width:<5} {e.ranks}R    "
                               f"{tAA:<8} {tRCD:<8} {tRP}", 'info')
 
@@ -1092,7 +957,8 @@ class APCBToolGUI:
         targets = [m['target_gb'] for m in entry_mods]
         primary_target = max(set(targets), key=targets.count)
         config = MEMORY_CONFIGS[primary_target]
-        sp = Path(self.loaded_file); dn = f"{sp.stem}{'_64GB' if primary_target==64 else '_32GB' if primary_target==32 else '_stock'}.bin"
+        sp = Path(self.loaded_file); ext = sp.suffix or '.bin'
+        dn = f"{sp.stem}{'_64GB' if primary_target==64 else '_32GB' if primary_target==32 else '_stock'}{ext}"
         op = filedialog.asksaveasfilename(title="Save Modified BIOS As", initialfile=dn, initialdir=str(sp.parent),
             filetypes=[("BIN files","*.bin"),("BIOS Files","*.fd *.rom"),("All files","*.*")])
         if not op: return
@@ -1108,7 +974,10 @@ class APCBToolGUI:
         for mod in entry_mods:
             name_note = f" → '{mod['new_name']}'" if mod['new_name'] else ''
             self._log(f"    [{mod['index']+1}] → {mod['target_gb']}GB{name_note}", 'dim')
-        self._log(f"  Output: SPI flash ready", 'dim')
+        if _is_pe_firmware(self.bios_data):
+            self._log(f"  Output: Flash via manufacturer tool (e.g. h2offt)", 'dim')
+        else:
+            self._log(f"  Output: SPI flash ready", 'dim')
         # Resolve screen selection to profile key
         screen_selection = self.screen_var.get()
         screen_key = None
@@ -1153,10 +1022,12 @@ class APCBToolGUI:
             if ok:
                 self._log(f"\n  ✓ MODIFICATION SUCCESSFUL", 'success')
                 dev_name = self.device_profile['name'] if self.device_profile else 'device'
-                self._log(f"  Ready for SPI flash.", 'success')
+                is_pe = _is_pe_firmware(self.bios_data)
+                flash_msg = "Flash via manufacturer tool (e.g. h2offt)." if is_pe else "Ready for SPI flash."
+                self._log(f"  {flash_msg}", 'success')
                 msg = f"Modified {len(entry_mods)} entries ({target_summary})!\n\nDevice: {dev_name}\n{op}\n\n{len(mods)} bytes changed."
                 if screen_key: msg += f"\n{SCREEN_PROFILES[screen_key]['name']} screen patch applied."
-                msg += f"\n\nReady for SPI flash."
+                msg += f"\n\n{flash_msg}"
                 messagebox.showinfo("Success", msg)
             else:
                 self._log(f"\n  ✗ VERIFICATION FAILED", 'error'); messagebox.showerror("Failed","DO NOT flash this file.")
@@ -1236,7 +1107,7 @@ class APCBToolGUI:
             self._log(f"DMI import error: {e}", 'error')
             messagebox.showerror("DMI Import Error", str(e))
 
-def main():
+def main() -> None:
     root = tk.Tk(); root.update_idletasks()
     w,h = 1100,720; root.geometry(f"{w}x{h}+{(root.winfo_screenwidth()//2)-(w//2)}+{(root.winfo_screenheight()//2)-(h//2)}")
     root.minsize(900, 550)
