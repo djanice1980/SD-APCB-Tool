@@ -56,6 +56,13 @@ class DeviceType(str, Enum):
     AUTO = 'auto'
 
 
+class SteamDeckVariant(str, Enum):
+    """Steam Deck sub-variants (LCD vs OLED)."""
+    LCD = 'lcd'
+    OLED = 'oled'
+    UNKNOWN = 'unknown'
+
+
 class MemoryTarget(IntEnum):
     """Supported memory target sizes in GB."""
     GB_16 = 16
@@ -68,6 +75,17 @@ class MemoryTarget(IntEnum):
 # ============================================================================
 
 TOOL_VERSION = "1.8.0"
+
+# Steam Deck firmware filename prefixes for LCD vs OLED variant detection
+SD_LCD_PREFIX = 'F7A'                            # Jupiter (LCD) firmware files
+SD_OLED_PREFIX = 'F7G'                           # Galileo (OLED) firmware files
+
+# Resolved chip counts per Steam Deck variant
+VARIANT_CHIP_COUNTS = {
+    SteamDeckVariant.LCD: 4,       # LCD: 4 DRAM packages
+    SteamDeckVariant.OLED: 2,      # OLED: 2 DRAM packages
+    SteamDeckVariant.UNKNOWN: (2, 4),  # Ambiguous fallback
+}
 
 APCB_MAGIC = b'APCB'                         # APCB header signature (stock)
 APCB_MAGIC_MOD = b'QPCB'                     # APCB header signature (one modder's marker - cosmetic only)
@@ -463,6 +481,50 @@ def detect_device(data: bytes) -> str:
     return 'unknown'
 
 
+def detect_steam_deck_variant(data: bytes, filename: Optional[str] = None) -> str:
+    """Detect Steam Deck sub-variant (LCD vs OLED) using a 3-tier strategy.
+
+    Tier 1: Filename prefix — F7A = LCD (Jupiter), F7G = OLED (Galileo)
+    Tier 2: Firmware content — DMI product_name, then codename string scan
+    Tier 3: Returns 'unknown' (caller should prompt user or show dropdown)
+
+    Args:
+        data: Firmware binary contents
+        filename: Original filename or path (basename is extracted), or None
+
+    Returns:
+        SteamDeckVariant value: 'lcd', 'oled', or 'unknown'
+    """
+    # Tier 1: Filename prefix
+    if filename:
+        basename = os.path.basename(filename).upper()
+        if basename.startswith(SD_LCD_PREFIX):
+            return SteamDeckVariant.LCD
+        if basename.startswith(SD_OLED_PREFIX):
+            return SteamDeckVariant.OLED
+
+    # Tier 2a: DMI product_name field
+    try:
+        dmi = export_dmi(data)
+        product = dmi.get('system_info', {}).get('product_name', '').upper()
+        if 'OLED' in product:
+            return SteamDeckVariant.OLED
+        elif 'STEAM DECK' in product:
+            # "Steam Deck" without "OLED" = LCD
+            return SteamDeckVariant.LCD
+    except (ValueError, Exception):
+        pass  # DMI not available (e.g. .fd files without populated DMI)
+
+    # Tier 2b: Codename string scan (Galileo = OLED, Jupiter = LCD)
+    if b'Galileo' in data or b'GALILEO' in data:
+        return SteamDeckVariant.OLED
+    if b'Jupiter' in data or b'JUPITER' in data:
+        return SteamDeckVariant.LCD
+
+    # Tier 3: Unknown
+    return SteamDeckVariant.UNKNOWN
+
+
 # ============================================================================
 # APCB Scanning and Parsing
 # ============================================================================
@@ -652,8 +714,9 @@ def _capacity_label(byte6: int, byte12: int, chip_count) -> str:
     """Return per-package capacity string like '4x 8GB' or '2x 16GB'.
 
     Args:
-        chip_count: int for fixed count, or tuple (lo, hi) for range
-                    (e.g. Steam Deck LCD=4, OLED=2 → (2, 4))
+        chip_count: int for fixed count, or tuple for ambiguous
+                    (e.g. Steam Deck LCD=4 vs OLED=2 → (2, 4)).
+                    When ambiguous, returns just the total (e.g. '16GB').
     """
     total_gb = None
     for gb, cfg in MEMORY_CONFIGS.items():
@@ -663,20 +726,31 @@ def _capacity_label(byte6: int, byte12: int, chip_count) -> str:
     if total_gb is None:
         return f"Unknown (0x{byte6:02X}/0x{byte12:02X})"
     if isinstance(chip_count, tuple):
-        chips_lo, chips_hi = chip_count
-        per_lo = total_gb // chips_hi   # more packages = smaller each
-        per_hi = total_gb // chips_lo   # fewer packages = larger each
-        return f"{chips_hi}x{per_lo}GB/{chips_lo}x{per_hi}GB"
+        # Can't determine exact chip count (e.g. Steam Deck LCD vs OLED)
+        return f"{total_gb}GB"
     per_chip = total_gb // chip_count
     return f"{chip_count}x {per_chip}GB"
 
 
-def analyze_bios(filepath: str, device: str = 'auto') -> List[APCBBlock]:
+def _resolve_chip_count(device_profile: Optional[dict], variant: str = 'unknown'):
+    """Resolve chip_count, using variant to disambiguate Steam Deck LCD/OLED.
+
+    When device_profile has a tuple chip_count (ambiguous), uses the variant
+    to look up the correct count from VARIANT_CHIP_COUNTS.
+    """
+    chip_count = device_profile.get('chip_count') if device_profile else None
+    if isinstance(chip_count, tuple) and variant in VARIANT_CHIP_COUNTS:
+        return VARIANT_CHIP_COUNTS.get(variant, chip_count)
+    return chip_count
+
+
+def analyze_bios(filepath: str, device: str = 'auto', variant: str = 'auto') -> List[APCBBlock]:
     """Analyze a BIOS file and display all APCB blocks and SPD entries.
 
     Args:
         filepath: Path to the BIOS file to analyze
         device: Device type ('auto', 'steam_deck', 'rog_ally', 'rog_ally_x')
+        variant: Steam Deck variant ('auto', 'lcd', 'oled')
     """
 
     if not os.path.exists(filepath):
@@ -691,6 +765,16 @@ def analyze_bios(filepath: str, device: str = 'auto') -> List[APCBBlock]:
         device = detect_device(data)
     device_profile = DEVICE_PROFILES.get(device)
     device_name = device_profile['name'] if device_profile else 'Unknown Device'
+
+    # Steam Deck variant detection (LCD vs OLED)
+    sd_variant = SteamDeckVariant.UNKNOWN
+    if device == 'steam_deck':
+        if variant != 'auto':
+            sd_variant = SteamDeckVariant(variant)
+        else:
+            sd_variant = detect_steam_deck_variant(data, filename=filepath)
+        if sd_variant != SteamDeckVariant.UNKNOWN:
+            device_name = f"Steam Deck ({sd_variant.value.upper()})"
 
     print(f"\n{'='*78}")
     print(f"  APCB Memory Configuration Analyzer v{TOOL_VERSION}")
@@ -741,7 +825,7 @@ def analyze_bios(filepath: str, device: str = 'auto') -> List[APCBBlock]:
             if lp5x_count:
                 type_summary.append(f"{lp5x_count} LPDDR5X")
 
-            chip_count = device_profile.get('chip_count') if device_profile else None
+            chip_count = _resolve_chip_count(device_profile, sd_variant)
             print(f"\n    SPD Entries ({len(block.spd_entries)}: {', '.join(type_summary)}):")
             print(f"    {'-'*115}")
             print(f"    {'#':<3} {'Type':<8} {'Module':<24} {'Mfr':<9} {'Capacity':<16} "
@@ -1203,7 +1287,8 @@ def patch_screen(data: bytearray, screen_key: str) -> List[Tuple[int, str]]:
 
 def modify_bios(input_path: str, output_path: str, target_gb: int,
                 modify_magic_byte: bool = False, entry_indices: Optional[List[int]] = None,
-                device: str = 'auto', screen: Optional[str] = None):
+                device: str = 'auto', screen: Optional[str] = None,
+                variant: str = 'auto'):
     """
     Modify BIOS file for target memory configuration.
 
@@ -1214,6 +1299,7 @@ def modify_bios(input_path: str, output_path: str, target_gb: int,
         modify_magic_byte: If True, change APCB byte[0] from 0x41 to 0x51 (cosmetic only)
         entry_indices: Which SPD entries to modify (0-based). None = first entry only.
         device: Device type ('auto', 'steam_deck', 'rog_ally', 'rog_ally_x')
+        variant: Steam Deck variant ('auto', 'lcd', 'oled')
     """
 
     if target_gb not in MEMORY_CONFIGS:
@@ -1232,6 +1318,16 @@ def modify_bios(input_path: str, output_path: str, target_gb: int,
         device = detect_device(bytes(data))
     device_profile = DEVICE_PROFILES.get(device)
     device_name = device_profile['name'] if device_profile else 'Unknown Device'
+
+    # Steam Deck variant detection
+    sd_variant = SteamDeckVariant.UNKNOWN
+    if device == 'steam_deck':
+        if variant != 'auto':
+            sd_variant = SteamDeckVariant(variant)
+        else:
+            sd_variant = detect_steam_deck_variant(bytes(data), filename=input_path)
+        if sd_variant != SteamDeckVariant.UNKNOWN:
+            device_name = f"Steam Deck ({sd_variant.value.upper()})"
 
     # Check memory target compatibility with device
     if device_profile and target_gb not in device_profile['memory_targets']:
@@ -1492,6 +1588,7 @@ class InteractiveState:
     blocks: List[APCBBlock]
     all_entries: List[SPDEntry]
     entry_mods: dict                       # index -> PendingEntryMod
+    variant: str = 'unknown'               # SteamDeckVariant value
     magic_enabled: bool = False
     screen_patch: Optional[str] = None
     selected_entry: Optional[int] = None   # 0-based index, None = no selection
@@ -1599,6 +1696,8 @@ def _print_welcome(state: InteractiveState):
     """Print the welcome banner on entering interactive mode."""
     c = _C
     dev = state.device_profile['name'] if state.device_profile else 'Unknown'
+    if state.device_key == 'steam_deck' and state.variant != SteamDeckVariant.UNKNOWN:
+        dev = f"Steam Deck ({state.variant.value.upper()})"
     mc = sum(1 for b in state.blocks if b.is_memg)
     tc = sum(1 for b in state.blocks if b.content_type == 'TOKN')
     lp5 = sum(1 for e in state.all_entries if e.mem_type == 'LPDDR5')
@@ -1608,7 +1707,7 @@ def _print_welcome(state: InteractiveState):
     cur_cfg = "Unknown"
     if state.all_entries:
         e = state.all_entries[0]
-        chip_count = state.device_profile.get('chip_count') if state.device_profile else None
+        chip_count = _resolve_chip_count(state.device_profile, state.variant)
         if chip_count is not None:
             cur_cfg = _capacity_label(e.byte6, e.byte12, chip_count)
         else:
@@ -1638,7 +1737,7 @@ def _print_entry_table(state: InteractiveState):
         print(f"  {c.WARN}No SPD entries found.{c.RESET}")
         return
     # Header
-    chip_count = state.device_profile.get('chip_count') if state.device_profile else None
+    chip_count = _resolve_chip_count(state.device_profile, state.variant)
     print(f"\n  {c.HEADER}{'#':<4} {'Type':<9} {'Module':<24} {'Mfr':<9} {'Capacity':<16} "
           f"{'Dies':<8} {'Width':<6} {'Ranks':<6} {'Pending'}{c.RESET}")
     print(f"  {c.DIM}{'-'*100}{c.RESET}")
@@ -1695,7 +1794,7 @@ def _print_status(state: InteractiveState):
         print(f"  {c.DIM}{'-'*78}{c.RESET}")
         print(f"  {c.LABEL}{'#':<4} {'Current Module':<28} {'Current':<16} {'Target':<9} {'New Name'}{c.RESET}")
         print(f"  {c.DIM}{'-'*78}{c.RESET}")
-        chip_count = state.device_profile.get('chip_count') if state.device_profile else None
+        chip_count = _resolve_chip_count(state.device_profile, state.variant)
         for idx in sorted(state.entry_mods.keys()):
             mod = state.entry_mods[idx]
             e = state.all_entries[idx]
@@ -1924,7 +2023,7 @@ def _handle_spd_command(state: InteractiveState, cmd: str, args: list):
         mod = state.entry_mods[idx]
         name = e.module_name or '(unnamed)'
         cur = _density_from_bytes(e.byte6, e.byte12)
-        chip_count = state.device_profile.get('chip_count') if state.device_profile else None
+        chip_count = _resolve_chip_count(state.device_profile, state.variant)
         cap_str = _capacity_label(e.byte6, e.byte12, chip_count) if chip_count else cur
         die_info = f"{e.die_count}x{e.die_density}" if e.die_count and e.die_density else '?'
         print(f"\n  {c.OK}Entry {n} selected:{c.RESET} {c.VALUE}{name}{c.RESET}")
@@ -2110,7 +2209,8 @@ def _handle_screen_command(state: InteractiveState, cmd: str, args: list):
 
 
 def interactive_modify(input_path: str, output_path: str, device: str = 'auto',
-                       magic: bool = False, screen: Optional[str] = None):
+                       magic: bool = False, screen: Optional[str] = None,
+                       variant: str = 'auto'):
     """Launch interactive DiskPart-style REPL for BIOS modification."""
     _enable_ansi_colors()
     c = _C
@@ -2122,6 +2222,14 @@ def interactive_modify(input_path: str, output_path: str, device: str = 'auto',
     if device == 'auto':
         device = detect_device(bytes(data))
     device_profile = DEVICE_PROFILES.get(device)
+
+    # Steam Deck variant detection
+    sd_variant = SteamDeckVariant.UNKNOWN
+    if device == 'steam_deck':
+        if variant != 'auto':
+            sd_variant = SteamDeckVariant(variant)
+        else:
+            sd_variant = detect_steam_deck_variant(bytes(data), filename=input_path)
 
     blocks = find_apcb_blocks(bytes(data))
     memg_blocks = [b for b in blocks if b.is_memg]
@@ -2142,6 +2250,7 @@ def interactive_modify(input_path: str, output_path: str, device: str = 'auto',
         blocks=blocks,
         all_entries=all_entries,
         entry_mods={},
+        variant=sd_variant,
         magic_enabled=magic,
         screen_patch=screen,
     )
@@ -2218,7 +2327,9 @@ Supported devices:
     analyze_parser.add_argument('bios_file', help='BIOS file to analyze')
     analyze_parser.add_argument('--device', choices=['auto', 'steam_deck', 'rog_ally', 'rog_ally_x'],
                                 default='auto', help='Device type (default: auto-detect)')
-    
+    analyze_parser.add_argument('--variant', choices=['auto', 'lcd', 'oled'],
+                                default='auto', help='Steam Deck variant (default: auto-detect from filename)')
+
     # Modify command
     modify_parser = subparsers.add_parser('modify', help='Modify BIOS for target memory')
     modify_parser.add_argument('bios_in', help='Input BIOS file')
@@ -2234,6 +2345,8 @@ Supported devices:
                               help='Specific entry index to modify (0-based, can repeat)')
     modify_parser.add_argument('--device', choices=['auto', 'steam_deck', 'rog_ally', 'rog_ally_x'],
                               default='auto', help='Device type (default: auto-detect)')
+    modify_parser.add_argument('--variant', choices=['auto', 'lcd', 'oled'],
+                              default='auto', help='Steam Deck variant (default: auto-detect from filename)')
     modify_parser.add_argument('--screen', choices=list(SCREEN_PROFILES.keys()),
                               default=None, metavar='SCREEN',
                               help='Apply screen replacement patch (Steam Deck LCD only). '
@@ -2250,6 +2363,8 @@ Supported devices:
     dmi_export_parser.add_argument('output_json', help='Output JSON file for DMI data')
     dmi_export_parser.add_argument('--device', choices=['auto', 'steam_deck', 'rog_ally', 'rog_ally_x'],
                                    default='auto', help='Device type (default: auto-detect)')
+    dmi_export_parser.add_argument('--variant', choices=['auto', 'lcd', 'oled'],
+                                   default='auto', help='Steam Deck variant (default: auto-detect)')
 
     # DMI import command
     dmi_import_parser = subparsers.add_parser('dmi-import',
@@ -2259,11 +2374,13 @@ Supported devices:
     dmi_import_parser.add_argument('dmi_json', help='DMI JSON file (from dmi-export)')
     dmi_import_parser.add_argument('--device', choices=['auto', 'steam_deck', 'rog_ally', 'rog_ally_x'],
                                    default='auto', help='Device type (default: auto-detect)')
+    dmi_import_parser.add_argument('--variant', choices=['auto', 'lcd', 'oled'],
+                                   default='auto', help='Steam Deck variant (default: auto-detect)')
 
     args = parser.parse_args()
     
     if args.command == 'analyze':
-        analyze_bios(args.bios_file, device=args.device)
+        analyze_bios(args.bios_file, device=args.device, variant=args.variant)
         
     elif args.command == 'modify':
         if args.bios_in == args.bios_out:
@@ -2291,6 +2408,7 @@ Supported devices:
                 entry_indices=entry_indices,
                 device=args.device,
                 screen=screen,
+                variant=args.variant,
             )
         else:
             # Interactive mode
@@ -2300,6 +2418,7 @@ Supported devices:
                 device=args.device,
                 magic=args.magic,
                 screen=screen,
+                variant=args.variant,
             )
 
     elif args.command == 'dmi-export':
