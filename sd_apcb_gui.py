@@ -34,6 +34,13 @@ class DeviceType(str, Enum):
     AUTO = 'auto'
 
 
+class SteamDeckVariant(str, Enum):
+    """Steam Deck sub-variants (LCD vs OLED)."""
+    LCD = 'lcd'
+    OLED = 'oled'
+    UNKNOWN = 'unknown'
+
+
 class MemoryTarget(IntEnum):
     """Supported memory target sizes in GB."""
     GB_16 = 16
@@ -43,6 +50,18 @@ class MemoryTarget(IntEnum):
 
 APP_TITLE = "SD APCB Memory Mod Tool"
 APP_VERSION = "1.8.0"
+
+# Steam Deck firmware filename prefixes for LCD vs OLED variant detection
+SD_LCD_PREFIX = 'F7A'     # Jupiter (LCD)
+SD_OLED_PREFIX = 'F7G'    # Galileo (OLED)
+
+# Resolved chip counts per Steam Deck variant
+VARIANT_CHIP_COUNTS = {
+    SteamDeckVariant.LCD: 4,
+    SteamDeckVariant.OLED: 2,
+    SteamDeckVariant.UNKNOWN: (2, 4),
+}
+
 APCB_MAGIC = b'APCB'
 APCB_MAGIC_MOD = b'QPCB'
 APCB_CHECKSUM_OFFSET = 16
@@ -165,6 +184,30 @@ def detect_device(data: bytes) -> str:
     elif has_pspg_memg_c8: return 'rog_ally_x'
     elif has_pspg_memg_c0: return 'rog_ally'
     return 'unknown'
+
+def detect_steam_deck_variant(data: bytes, filename: Optional[str] = None) -> str:
+    """Detect Steam Deck sub-variant (LCD vs OLED) using a 3-tier strategy.
+
+    Tier 1: Filename prefix — F7A = LCD (Jupiter), F7G = OLED (Galileo)
+    Tier 2: Firmware content — codename string scan
+    Tier 3: Returns 'unknown' (caller should prompt user or show dropdown)
+    """
+    # Tier 1: Filename prefix
+    if filename:
+        basename = os.path.basename(filename).upper()
+        if basename.startswith(SD_LCD_PREFIX):
+            return SteamDeckVariant.LCD
+        if basename.startswith(SD_OLED_PREFIX):
+            return SteamDeckVariant.OLED
+
+    # Tier 2: Codename string scan (Galileo = OLED, Jupiter = LCD)
+    if b'Galileo' in data or b'GALILEO' in data:
+        return SteamDeckVariant.OLED
+    if b'Jupiter' in data or b'JUPITER' in data:
+        return SteamDeckVariant.LCD
+
+    # Tier 3: Unknown
+    return SteamDeckVariant.UNKNOWN
 
 # SPD byte field constants (JEDEC SPD4.1.2.M-2 / LPDDR5 layout)
 SPD_MTB_PS = 125  # Medium Time Base in picoseconds
@@ -309,7 +352,11 @@ def density_from_bytes(byte6: int, byte12: int) -> str:
     return "16GB"
 
 def _capacity_label(byte6: int, byte12: int, chip_count) -> str:
-    """Return per-package capacity string like '4x 8GB' or '2x 16GB'."""
+    """Return per-package capacity string like '4x 8GB' or '2x 16GB'.
+
+    When chip_count is a tuple (ambiguous, e.g. Steam Deck LCD vs OLED),
+    returns just the total (e.g. '16GB').
+    """
     total_gb = None
     for gb, cfg in MEMORY_CONFIGS.items():
         if cfg['byte6'] == byte6 and cfg['byte12'] == byte12:
@@ -318,9 +365,15 @@ def _capacity_label(byte6: int, byte12: int, chip_count) -> str:
     if total_gb is None:
         return "Unknown"
     if isinstance(chip_count, tuple):
-        lo, hi = chip_count
-        return f"{hi}x{total_gb//hi}GB/{lo}x{total_gb//lo}GB"
+        return f"{total_gb}GB"
     return f"{chip_count}x {total_gb // chip_count}GB"
+
+def _resolve_chip_count(device_profile: Optional[dict], variant: str = 'unknown'):
+    """Resolve chip_count, using variant to disambiguate Steam Deck LCD/OLED."""
+    chip_count = device_profile.get('chip_count') if device_profile else None
+    if isinstance(chip_count, tuple) and variant in VARIANT_CHIP_COUNTS:
+        return VARIANT_CHIP_COUNTS.get(variant, chip_count)
+    return chip_count
 
 def modify_bios_data(data: bytearray, entry_modifications: List[Dict], modify_magic: bool = False) -> List[tuple]:
     """Modify BIOS data with per-entry configurations.
@@ -548,7 +601,7 @@ class APCBToolGUI:
     def __init__(self, root):
         self.root = root; root.title(APP_TITLE); root.geometry("820x720"); root.minsize(700,600); root.configure(bg=C_BG)
         self.loaded_file = None; self.loaded_data = None; self.blocks = []; self.current_config = ""
-        self.detected_device = 'unknown'; self.device_profile = None
+        self.detected_device = 'unknown'; self.device_profile = None; self.sd_variant = SteamDeckVariant.UNKNOWN
         # Fix combobox popup list colors (must be before any Combobox creation)
         root.option_add('*TCombobox*Listbox.background', C_BGE)
         root.option_add('*TCombobox*Listbox.foreground', C_FG)
@@ -615,6 +668,14 @@ class APCBToolGUI:
         self.lbl_fs = ttk.Label(r1, text="", style='Status.TLabel'); self.lbl_fs.pack(side='right')
         r1b = tk.Frame(ic, bg=C_BGL); r1b.pack(fill='x', pady=(4,0))
         self.lbl_dev = ttk.Label(r1b, text="", style='Status.TLabel'); self.lbl_dev.pack(side='left')
+        # Steam Deck variant selector (LCD / OLED) — only enabled when Steam Deck detected
+        self.variant_var = tk.StringVar(value="Auto")
+        self.variant_combo = ttk.Combobox(r1b, textvariable=self.variant_var,
+            values=["Auto", "LCD", "OLED"], state='disabled', width=8, font=('Segoe UI', 9))
+        self.variant_combo.pack(side='left', padx=(8, 0))
+        self.variant_label = tk.Label(r1b, text="", bg=C_BGL, fg=C_FGD, font=('Segoe UI', 9))
+        self.variant_label.pack(side='left', padx=(4, 0))
+        self.variant_combo.bind('<<ComboboxSelected>>', self._on_variant_changed)
         r2 = tk.Frame(ic, bg=C_BGL); r2.pack(fill='x', pady=(4,0))
         self.lbl_bl = ttk.Label(r2, text="", style='Status.TLabel'); self.lbl_bl.pack(side='left')
         self.lbl_cf = ttk.Label(r2, text="", style='Status.TLabel'); self.lbl_cf.pack(side='right')
@@ -768,7 +829,7 @@ class APCBToolGUI:
                 state='disabled', width=6, font=('Consolas', 9))
             density_combo.pack(side='left', padx=(0,4))
             # Current capacity + raw bytes
-            chip_count = self.device_profile.get('chip_count') if self.device_profile else None
+            chip_count = _resolve_chip_count(self.device_profile, self.sd_variant)
             if chip_count is not None:
                 cap_info = _capacity_label(e.byte6, e.byte12, chip_count)
             else:
@@ -849,6 +910,34 @@ class APCBToolGUI:
             if row['enabled_var'].get():
                 row['density_var'].set(density_str)
 
+    def _on_variant_changed(self, event=None):
+        """Handle user changing the Steam Deck variant dropdown."""
+        val = self.variant_var.get()
+        if val == "LCD":
+            self.sd_variant = SteamDeckVariant.LCD
+        elif val == "OLED":
+            self.sd_variant = SteamDeckVariant.OLED
+        else:
+            self.sd_variant = SteamDeckVariant.UNKNOWN
+        # Update device display name
+        if self.sd_variant != SteamDeckVariant.UNKNOWN:
+            name = f"Steam Deck ({self.sd_variant.value.upper()})"
+        else:
+            name = "Steam Deck"
+        self.lbl_dev.configure(text=f"Device: {name}", style='Info.TLabel')
+        self.variant_label.configure(text="(manually selected)" if val != "Auto" else "(select variant)")
+        # Update screen patch dropdown (LCD only, not OLED)
+        if self.sd_variant != SteamDeckVariant.OLED:
+            self.screen_combo.configure(state='readonly')
+        else:
+            self.screen_var.set('None')
+            self.screen_combo.configure(state='disabled')
+        # Re-populate entry rows to update capacity labels
+        if self.blocks:
+            first_memg = next((b for b in self.blocks if b.is_memg and b.spd_entries), None)
+            if first_memg:
+                self._populate_entries(first_memg.spd_entries)
+
     def _open_file(self):
         fp = filedialog.askopenfilename(title="Open BIOS File", filetypes=[("All files","*.*"),("BIOS Files","*.bin *.fd *.rom")])
         if not fp: return
@@ -864,6 +953,26 @@ class APCBToolGUI:
         self.detected_device = detect_device(data)
         self.device_profile = DEVICE_PROFILES.get(self.detected_device)
         device_name = self.device_profile['name'] if self.device_profile else 'Unknown Device'
+        # Steam Deck variant detection (LCD vs OLED)
+        self.sd_variant = SteamDeckVariant.UNKNOWN
+        if self.detected_device == 'steam_deck':
+            self.sd_variant = detect_steam_deck_variant(data, filename=fp)
+            self.variant_combo.configure(state='readonly')
+            if self.sd_variant == SteamDeckVariant.LCD:
+                self.variant_var.set("LCD")
+                self.variant_label.configure(text="(auto-detected)")
+            elif self.sd_variant == SteamDeckVariant.OLED:
+                self.variant_var.set("OLED")
+                self.variant_label.configure(text="(auto-detected)")
+            else:
+                self.variant_var.set("Auto")
+                self.variant_label.configure(text="(select variant)")
+            if self.sd_variant != SteamDeckVariant.UNKNOWN:
+                device_name = f"Steam Deck ({self.sd_variant.value.upper()})"
+        else:
+            self.variant_combo.configure(state='disabled')
+            self.variant_var.set("Auto")
+            self.variant_label.configure(text="")
         self.lbl_dev.configure(text=f"Device: {device_name}", style='Info.TLabel')
         self._log(f"Device: {device_name}", 'cyan')
         # Enable/disable 64GB option based on device support
@@ -872,8 +981,8 @@ class APCBToolGUI:
         else:
             self.target_radios[64].configure(state='disabled')
             if self.target_var.get() == 64: self.target_var.set(32)
-        # Enable screen patch dropdown only for Steam Deck LCD
-        if self.detected_device == 'steam_deck':
+        # Enable screen patch dropdown only for Steam Deck LCD (not OLED)
+        if self.detected_device == 'steam_deck' and self.sd_variant != SteamDeckVariant.OLED:
             self.screen_combo.configure(state='readonly')
         else:
             self.screen_var.set('None')
@@ -901,7 +1010,7 @@ class APCBToolGUI:
                 lp5x = sum(1 for e in b.spd_entries if e.mem_type == 'LPDDR5X')
                 ts = ', '.join(filter(None, [f"{lp5} LPDDR5" if lp5 else "", f"{lp5x} LPDDR5X" if lp5x else ""]))
                 self._log(f"\nMEMG @ 0x{b.offset:08X} — {len(b.spd_entries)} SPD entries ({ts}), cksum {'VALID' if b.checksum_valid else 'INVALID'}", 'header')
-                chip_count = self.device_profile.get('chip_count') if self.device_profile else None
+                chip_count = _resolve_chip_count(self.device_profile, self.sd_variant)
                 for i,e in enumerate(b.spd_entries):
                     if chip_count is not None:
                         den = _capacity_label(e.byte6, e.byte12, chip_count)
@@ -919,6 +1028,8 @@ class APCBToolGUI:
         if not self.loaded_data: return
         self._log_clear()
         dev_name = self.device_profile['name'] if self.device_profile else 'Unknown Device'
+        if self.detected_device == 'steam_deck' and self.sd_variant != SteamDeckVariant.UNKNOWN:
+            dev_name = f"Steam Deck ({self.sd_variant.value.upper()})"
         self._log("═"*70, 'header'); self._log("  FULL BIOS ANALYSIS", 'header'); self._log("═"*70, 'header')
         self._log(f"  File: {os.path.basename(self.loaded_file)}", 'info')
         self._log(f"  Size: {len(self.loaded_data):,} bytes", 'info')
@@ -930,7 +1041,7 @@ class APCBToolGUI:
             self._log(f"  Offset: 0x{block.offset:08X}  |  Size: 0x{block.data_size:04X}  |  Checksum: 0x{block.checksum_byte:02X} ({'VALID' if block.checksum_valid else 'INVALID'})",
                       'success' if block.checksum_valid else 'error')
             if block.is_memg and block.spd_entries:
-                chip_count = self.device_profile.get('chip_count') if self.device_profile else None
+                chip_count = _resolve_chip_count(self.device_profile, self.sd_variant)
                 self._log(f"\n  {'#':<4} {'Type':<8} {'Module':<24} {'Mfr':<9} {'Capacity':<16} "
                           f"{'Dies':<8} {'Width':<5} {'Ranks':<6} {'tAA':<8} {'tRCD':<8} {'tRP'}", 'accent')
                 self._log(f"  {'─'*105}", 'dim')
