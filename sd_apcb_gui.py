@@ -99,13 +99,13 @@ MANUFACTURER_IDS = {0x2C: 'Micron', 0xCE: 'Samsung', 0xAD: 'SK Hynix', 0x01: 'Sa
 # Known module name prefixes — used for prefix dropdown in GUI editor
 # Format: (prefix, display_label) — dropdown shows label, value uses prefix only
 MODULE_NAME_PREFIXES = [
-    ('MT6', 'MT6 - Micron LPDDR5/5X'),
-    ('K3K', 'K3K - Samsung LPDDR5'),
-    ('K3L', 'K3L - Samsung LPDDR5X'),
-    ('H58', 'H58 - SK Hynix LPDDR5/5X'),
-    ('H9H', 'H9H - SK Hynix LPDDR5/5X'),
-    ('SEC', 'SEC - Samsung (alt)'),
-    ('SAM', 'SAM - Samsung (alt)'),
+    ('MT6', 'MT6 - Micron'),
+    ('K3K', 'K3K - Samsung'),
+    ('K3L', 'K3L - Samsung'),
+    ('H58', 'H58 - SK Hynix'),
+    ('H9H', 'H9H - SK Hynix'),
+    ('SEC', 'SEC - Samsung'),
+    ('SAM', 'SAM - Samsung'),
 ]
 MODULE_PREFIX_LABELS = [label for _, label in MODULE_NAME_PREFIXES]
 MODULE_PREFIX_MAP = {label: prefix for prefix, label in MODULE_NAME_PREFIXES}
@@ -622,7 +622,7 @@ C_BTN='#3d59a1'; C_BTH='#5177c9'
 
 class APCBToolGUI:
     def __init__(self, root):
-        self.root = root; root.title(APP_TITLE); root.geometry("820x720"); root.minsize(700,600); root.configure(bg=C_BG)
+        self.root = root; root.title(APP_TITLE); root.configure(bg=C_BG)
         self.loaded_file = None; self.loaded_data = None; self.blocks = []; self.current_config = ""
         self.detected_device = 'unknown'; self.device_profile = None; self.sd_variant = SteamDeckVariant.UNKNOWN
         # Fix combobox popup list colors (must be before any Combobox creation)
@@ -760,14 +760,21 @@ class APCBToolGUI:
         ttk.Button(lh, text="Copy Log", command=self._copy_log).pack(side='right', padx=(4,0))
         ttk.Button(lh, text="Clear Log", command=self._log_clear).pack(side='right')
         lf = tk.Frame(right, bg=C_BDR, padx=1, pady=1); lf.pack(fill='both', expand=True)
-        self.log = scrolledtext.ScrolledText(lf, wrap='word', font=('Consolas',9), bg=C_BGE, fg=C_FG, insertbackground=C_FG,
+        self.log = scrolledtext.ScrolledText(lf, wrap='none', font=('Consolas',9), bg=C_BGE, fg=C_FG, insertbackground=C_FG,
             selectbackground=C_ACC, selectforeground=C_BG, relief='flat', borderwidth=0, padx=8, pady=8, state='disabled')
         self.log.pack(fill='both', expand=True)
+        # Horizontal scrollbar for log (wrap=none)
+        log_hscroll = ttk.Scrollbar(lf, orient='horizontal', command=self.log.xview)
+        log_hscroll.pack(side='bottom', fill='x')
+        self.log.configure(xscrollcommand=log_hscroll.set)
         for t,c in [('info',C_FG),('success',C_GRN),('warning',C_ORG),('error',C_RED),('accent',C_ACC),('cyan',C_CYN),('dim',C_FGD)]:
             self.log.tag_configure(t, foreground=c)
         self.log.tag_configure('header', foreground=C_FGB, font=('Consolas',9,'bold'))
         # Set initial sash position after layout
-        self.root.after(50, lambda: paned.sashpos(0, 500))
+        def _set_sash():
+            pw = paned.winfo_width()
+            paned.sashpos(0, int(pw * 0.40))  # Left 40%, Log 60%
+        self.root.after(100, _set_sash)
 
     def _log(self, text, tag='info'):
         self.log.configure(state='normal'); self.log.insert('end', text+'\n', tag); self.log.see('end'); self.log.configure(state='disabled')
@@ -793,12 +800,35 @@ class APCBToolGUI:
         sa_frame = tk.Frame(self.entry_inner, bg=C_BGL); sa_frame.pack(fill='x', padx=8, pady=(6,2))
         self.select_all_var.set(False)
         ttk.Checkbutton(sa_frame, text="Select All", variable=self.select_all_var, command=self._toggle_all).pack(side='left')
-        # Column headers (spacer accounts for checkbox width)
+        # Column headers — same font size (9) and widget types as rows for pixel-perfect alignment
         hdr = tk.Frame(self.entry_inner, bg=C_BGL); hdr.pack(fill='x', padx=8, pady=(4,2))
-        tk.Label(hdr, text='', bg=C_BGL, width=3).pack(side='left')
-        for txt, w in [('#', 4), ('Type', 8), ('Manufacturer Prefix', 25), ('Module Suffix', 18),
-                       ('Capacity', 8), ('Byte6', 6), ('Byte12', 6), ('Current', 14)]:
-            tk.Label(hdr, text=txt, bg=C_BGL, fg=C_FGD, font=('Consolas', 8), anchor='w', width=w).pack(side='left', padx=1)
+        _hdr_font = ('Consolas', 9)  # Must match row font size
+        _hdr_kw = dict(bg=C_BGL, fg=C_FGD, font=_hdr_font, anchor='w')
+        # Checkbox placeholder — real checkbox, same width as row checkboxes
+        _hcb = ttk.Checkbutton(hdr, text=''); _hcb.pack(side='left')
+        _hcb.state(['disabled'])
+        tk.Label(hdr, text='#', width=3, **_hdr_kw).pack(side='left')
+        tk.Label(hdr, text='Type', width=7, **_hdr_kw).pack(side='left')
+        # Combobox header — same width as row prefix combo
+        _hp = ttk.Combobox(hdr, values=['Mfr Prefix'], state='disabled', width=14, font=_hdr_font)
+        _hp.set('Mfr Prefix'); _hp.pack(side='left', padx=(2,0))
+        # Entry header — same width as row suffix entry
+        _hs = tk.Entry(hdr, font=_hdr_font, width=14, bg=C_BGL, fg=C_FGD, relief='flat',
+            borderwidth=1, highlightbackground=C_BDR, highlightthickness=1, state='disabled',
+            disabledbackground=C_BGL, disabledforeground=C_FGD)
+        _hs.pack(side='left', padx=(0,2))
+        _hs.configure(state='normal'); _hs.insert(0, 'Module Suffix'); _hs.configure(state='disabled')
+        # Density combo header — same width as row density combo
+        _hd = ttk.Combobox(hdr, values=['Cap'], state='disabled', width=5, font=_hdr_font)
+        _hd.set('Cap'); _hd.pack(side='left', padx=(0,2))
+        # Byte6/Byte12 entry headers — same width as row hex entries
+        for hdr_text in ['b6', 'b12']:
+            _he = tk.Entry(hdr, font=_hdr_font, width=4, bg=C_BGL, fg=C_FGD, relief='flat',
+                borderwidth=1, highlightbackground=C_BDR, highlightthickness=1, state='disabled',
+                disabledbackground=C_BGL, disabledforeground=C_FGD)
+            _he.pack(side='left', padx=(0,1))
+            _he.configure(state='normal'); _he.insert(0, hdr_text); _he.configure(state='disabled')
+        tk.Label(hdr, text='Current', **_hdr_kw).pack(side='left')
         # Separator
         tk.Frame(self.entry_inner, bg=C_BDR, height=1).pack(fill='x', padx=8, pady=2)
         # Individual entry rows
@@ -824,20 +854,20 @@ class APCBToolGUI:
             cb = ttk.Checkbutton(ef, variable=enabled_var)
             cb.pack(side='left')
             # Index
-            tk.Label(ef, text=f"[{i+1}]", bg=C_BGL, fg=C_FG, font=('Consolas', 9), width=4, anchor='w').pack(side='left')
+            tk.Label(ef, text=f"[{i+1}]", bg=C_BGL, fg=C_FG, font=('Consolas', 9), width=3, anchor='w').pack(side='left')
             # Type
-            tk.Label(ef, text=e.mem_type, bg=C_BGL, fg=C_FGD, font=('Consolas', 9), width=8, anchor='w').pack(side='left')
+            tk.Label(ef, text=e.mem_type, bg=C_BGL, fg=C_FGD, font=('Consolas', 9), width=7, anchor='w').pack(side='left')
             # Manufacturer prefix dropdown (shows descriptive labels, maps to 3-char prefix)
             has_name = e.module_name_offset >= 0
             prefix_combo = ttk.Combobox(ef, textvariable=prefix_var, values=MODULE_PREFIX_LABELS,
-                state='disabled', width=24, font=('Consolas', 9))
+                state='disabled', width=14, font=('Consolas', 9))
             prefix_combo.pack(side='left', padx=(2,0))
             # Module name suffix entry (constrained)
             field_len = e.module_name_field_len if e.module_name_field_len > 0 else 20
-            suffix_entry = tk.Entry(ef, textvariable=suffix_var, font=('Consolas', 9), width=18,
+            suffix_entry = tk.Entry(ef, textvariable=suffix_var, font=('Consolas', 9), width=14,
                 bg=C_BGE, fg=C_FG, insertbackground=C_FG, relief='flat', borderwidth=1,
                 highlightbackground=C_BDR, highlightthickness=1, state='disabled')
-            suffix_entry.pack(side='left', padx=(0,4))
+            suffix_entry.pack(side='left', padx=(0,2))
             # Validate suffix: printable ASCII only, length constrained by field_len minus prefix (3 chars)
             def _validate_suffix(new_val, fl=field_len, pv=prefix_var):
                 # Prefix is always 3 chars regardless of display label
@@ -851,19 +881,19 @@ class APCBToolGUI:
                 suffix_var.set('(no name field)')
             # Density combobox
             density_combo = ttk.Combobox(ef, textvariable=density_var, values=density_options,
-                state='disabled', width=6, font=('Consolas', 9))
-            density_combo.pack(side='left', padx=(0,4))
+                state='disabled', width=5, font=('Consolas', 9))
+            density_combo.pack(side='left', padx=(0,2))
             # Hex byte6/byte12 entry fields for manual editing
             byte6_var = tk.StringVar(value=f"0x{e.byte6:02X}")
             byte12_var = tk.StringVar(value=f"0x{e.byte12:02X}")
-            byte6_entry = tk.Entry(ef, textvariable=byte6_var, font=('Consolas', 9), width=5,
+            byte6_entry = tk.Entry(ef, textvariable=byte6_var, font=('Consolas', 9), width=4,
                 bg=C_BGE, fg=C_FG, insertbackground=C_FG, relief='flat', borderwidth=1,
                 highlightbackground=C_BDR, highlightthickness=1, state='disabled')
-            byte6_entry.pack(side='left', padx=(0,2))
-            byte12_entry = tk.Entry(ef, textvariable=byte12_var, font=('Consolas', 9), width=5,
+            byte6_entry.pack(side='left', padx=(0,1))
+            byte12_entry = tk.Entry(ef, textvariable=byte12_var, font=('Consolas', 9), width=4,
                 bg=C_BGE, fg=C_FG, insertbackground=C_FG, relief='flat', borderwidth=1,
                 highlightbackground=C_BDR, highlightthickness=1, state='disabled')
-            byte12_entry.pack(side='left', padx=(0,4))
+            byte12_entry.pack(side='left', padx=(0,1))
             # Hex validation: 0x prefix + up to 2 hex digits, max 4 chars
             def _validate_hex(new_val):
                 if new_val == '': return True
@@ -1347,9 +1377,18 @@ class APCBToolGUI:
             messagebox.showerror("DMI Import Error", str(e))
 
 def main() -> None:
-    root = tk.Tk(); root.update_idletasks()
-    w,h = 1100,720; root.geometry(f"{w}x{h}+{(root.winfo_screenwidth()//2)-(w//2)}+{(root.winfo_screenheight()//2)-(h//2)}")
-    root.minsize(900, 550)
+    root = tk.Tk()
+    root.update_idletasks()
+    # Get screen size in Tk's coordinate system
+    sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+    # Tk reports DPI-scaled values (e.g. 2560x1440 for 4K at 150%)
+    # Target: ~60% physical screen width, ~80% physical height
+    w = int(sw * 0.55)
+    h = int(sh * 0.75)
+    x = int(sw * 0.01)
+    y = max(10, (sh - h) // 2 - 30)
+    root.geometry(f"{w}x{h}+{x}+{y}")
+    root.minsize(700, 500)
     APCBToolGUI(root); root.mainloop()
 
 if __name__ == '__main__':
