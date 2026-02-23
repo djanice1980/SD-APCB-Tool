@@ -78,9 +78,9 @@ SPD_BYTE_MODULE_ORG = 12; SPD_BYTE_BUS_WIDTH = 13; SPD_BYTE_TCKMIN = 18
 SPD_BYTE_TAAMIN = 24; SPD_BYTE_TRCDMIN = 26; SPD_BYTE_TRPABMIN = 27; SPD_BYTE_TRPPBMIN = 28
 SPD_MTB_PS = 125  # Medium Time Base in picoseconds
 MEMORY_CONFIGS = {
-    16: {'name': '16GB (Stock)', 'byte6': 0x95, 'byte12': 0x02},
-    32: {'name': '32GB Upgrade', 'byte6': 0xB5, 'byte12': 0x0A},
-    64: {'name': '64GB Upgrade', 'byte6': 0xF5, 'byte12': 0x49},
+    16: {'name': '16GB', 'byte6': 0x95, 'byte12': 0x02},
+    32: {'name': '32GB', 'byte6': 0xB5, 'byte12': 0x0A},
+    64: {'name': '64GB', 'byte6': 0xF5, 'byte12': 0x49},
 }
 MODULE_DENSITY_MAP = {
     'MT62F512M32D2DR': '16GB', 'MT62F768M32D2DR': '24GB',
@@ -337,12 +337,28 @@ def parse_spd_entries(data: bytes, apcb_offset: int, apcb_size: int) -> List[SPD
     return entries
 
 def detect_current_config(blocks: List[APCBBlock]) -> str:
-    """Return a factual density label from the first SPD entry (no assumptions)."""
+    """Determine if firmware SPD entries are stock, modded, or mixed."""
+    configs_found = set()
     for b in blocks:
         if b.is_memg and b.spd_entries:
-            e = b.spd_entries[0]
-            return density_from_bytes(e.byte6, e.byte12)
-    return "No MEMG blocks found"
+            for e in b.spd_entries:
+                matched = False
+                for gb, cfg in MEMORY_CONFIGS.items():
+                    if cfg['byte6'] == e.byte6 and cfg['byte12'] == e.byte12:
+                        configs_found.add(gb)
+                        matched = True
+                        break
+                if not matched:
+                    configs_found.add('custom')
+            break  # Only check first MEMG block
+    if not configs_found:
+        return "No MEMG"
+    if configs_found == {16}:
+        return "Stock"
+    if len(configs_found) == 1:
+        gb = configs_found.pop()
+        return f"Modded ({gb}GB)" if isinstance(gb, int) else "Custom"
+    return "Mixed"
 
 def density_from_bytes(byte6: int, byte12: int) -> str:
     """Map current byte6/byte12 to a total capacity string."""
@@ -382,8 +398,10 @@ def modify_bios_data(data: bytearray, entry_modifications: List[Dict], modify_ma
         data: bytearray of BIOS
         entry_modifications: list of dicts with keys:
             'index': int - SPD entry index
-            'target_gb': int - 16, 32, or 64
+            'target_gb': int|None - 16, 32, or 64 (None if custom bytes)
             'new_name': str|None - new module name or None to keep current
+            'custom_byte6': int|None - custom byte6 value (when target_gb is None)
+            'custom_byte12': int|None - custom byte12 value (when target_gb is None)
         modify_magic: bool - modify APCB magic byte
     Returns:
         list of (offset, old_byte, new_byte) tuples
@@ -393,17 +411,22 @@ def modify_bios_data(data: bytearray, entry_modifications: List[Dict], modify_ma
     # Build a lookup: index -> modification
     mod_by_idx = {m['index']: m for m in entry_modifications}
     # Determine magic byte from first modification's target (or default 32)
-    first_target = entry_modifications[0]['target_gb'] if entry_modifications else 32
+    first_target = entry_modifications[0].get('target_gb') or 32 if entry_modifications else 32
     for block in [b for b in blocks if b.is_memg]:
         if not block.spd_entries: continue
         for idx, mod in mod_by_idx.items():
             if idx >= len(block.spd_entries): continue
             e = block.spd_entries[idx]
-            config = MEMORY_CONFIGS[mod['target_gb']]
+            # Use custom bytes if provided, else lookup from MEMORY_CONFIGS
+            if mod.get('custom_byte6') is not None:
+                new_b6, new_b12 = mod['custom_byte6'], mod['custom_byte12']
+            else:
+                config = MEMORY_CONFIGS[mod['target_gb']]
+                new_b6, new_b12 = config['byte6'], config['byte12']
             # Write SPD config bytes (package type + module organization)
             b6, b12 = e.offset_in_file + SPD_BYTE_PKG_TYPE, e.offset_in_file + SPD_BYTE_MODULE_ORG
-            mods.append((b6, data[b6], config['byte6'])); mods.append((b12, data[b12], config['byte12']))
-            data[b6] = config['byte6']; data[b12] = config['byte12']
+            mods.append((b6, data[b6], new_b6)); mods.append((b12, data[b12], new_b12))
+            data[b6] = new_b6; data[b12] = new_b12
             # Write module name if changed
             new_name = mod.get('new_name')
             if new_name is not None and e.module_name_offset >= 0 and e.module_name_field_len > 0:
@@ -763,16 +786,18 @@ class APCBToolGUI:
             return
         # Determine available density options based on device
         if self.device_profile and 64 in self.device_profile.get('memory_targets', []):
-            density_options = ['16GB', '32GB', '64GB']
+            density_options = ['16GB', '32GB', '64GB', 'Custom']
         else:
-            density_options = ['16GB', '32GB']
+            density_options = ['16GB', '32GB', 'Custom']
         # Select All checkbox
         sa_frame = tk.Frame(self.entry_inner, bg=C_BGL); sa_frame.pack(fill='x', padx=8, pady=(6,2))
         self.select_all_var.set(False)
         ttk.Checkbutton(sa_frame, text="Select All", variable=self.select_all_var, command=self._toggle_all).pack(side='left')
-        # Column headers
+        # Column headers (spacer accounts for checkbox width)
         hdr = tk.Frame(self.entry_inner, bg=C_BGL); hdr.pack(fill='x', padx=8, pady=(4,2))
-        for txt, w in [('#', 4), ('Type', 8), ('Manufacturer Prefix', 25), ('Module Suffix', 18), ('Capacity', 10), ('Current', 14)]:
+        tk.Label(hdr, text='', bg=C_BGL, width=3).pack(side='left')
+        for txt, w in [('#', 4), ('Type', 8), ('Manufacturer Prefix', 25), ('Module Suffix', 18),
+                       ('Capacity', 8), ('Byte6', 6), ('Byte12', 6), ('Current', 14)]:
             tk.Label(hdr, text=txt, bg=C_BGL, fg=C_FGD, font=('Consolas', 8), anchor='w', width=w).pack(side='left', padx=1)
         # Separator
         tk.Frame(self.entry_inner, bg=C_BDR, height=1).pack(fill='x', padx=8, pady=2)
@@ -828,13 +853,62 @@ class APCBToolGUI:
             density_combo = ttk.Combobox(ef, textvariable=density_var, values=density_options,
                 state='disabled', width=6, font=('Consolas', 9))
             density_combo.pack(side='left', padx=(0,4))
-            # Current capacity + raw bytes
+            # Hex byte6/byte12 entry fields for manual editing
+            byte6_var = tk.StringVar(value=f"0x{e.byte6:02X}")
+            byte12_var = tk.StringVar(value=f"0x{e.byte12:02X}")
+            byte6_entry = tk.Entry(ef, textvariable=byte6_var, font=('Consolas', 9), width=5,
+                bg=C_BGE, fg=C_FG, insertbackground=C_FG, relief='flat', borderwidth=1,
+                highlightbackground=C_BDR, highlightthickness=1, state='disabled')
+            byte6_entry.pack(side='left', padx=(0,2))
+            byte12_entry = tk.Entry(ef, textvariable=byte12_var, font=('Consolas', 9), width=5,
+                bg=C_BGE, fg=C_FG, insertbackground=C_FG, relief='flat', borderwidth=1,
+                highlightbackground=C_BDR, highlightthickness=1, state='disabled')
+            byte12_entry.pack(side='left', padx=(0,4))
+            # Hex validation: 0x prefix + up to 2 hex digits, max 4 chars
+            def _validate_hex(new_val):
+                if new_val == '': return True
+                if len(new_val) > 4: return False
+                if new_val.startswith('0x') or new_val.startswith('0X'):
+                    return all(c in '0123456789abcdefABCDEF' for c in new_val[2:])
+                return all(c in '0123456789abcdefABCDEFxX' for c in new_val)
+            hex_vcmd = (self.root.register(_validate_hex), '%P')
+            byte6_entry.configure(validate='key', validatecommand=hex_vcmd)
+            byte12_entry.configure(validate='key', validatecommand=hex_vcmd)
+            # Bidirectional sync: density dropdown → hex fields
+            def _on_density_changed(*args, dv=density_var, b6v=byte6_var, b12v=byte12_var):
+                val = dv.get()
+                if val == 'Custom': return
+                try:
+                    gb = int(val.replace('GB', ''))
+                except ValueError:
+                    return
+                if gb in MEMORY_CONFIGS:
+                    b6v.set(f"0x{MEMORY_CONFIGS[gb]['byte6']:02X}")
+                    b12v.set(f"0x{MEMORY_CONFIGS[gb]['byte12']:02X}")
+            density_var.trace_add('write', _on_density_changed)
+            # Bidirectional sync: hex fields → density dropdown
+            def _on_hex_changed(*args, dv=density_var, b6v=byte6_var, b12v=byte12_var):
+                try:
+                    b6 = int(b6v.get(), 16)
+                    b12 = int(b12v.get(), 16)
+                except (ValueError, TypeError):
+                    return
+                for gb, cfg in MEMORY_CONFIGS.items():
+                    if cfg['byte6'] == b6 and cfg['byte12'] == b12:
+                        if dv.get() != f"{gb}GB":
+                            dv.set(f"{gb}GB")
+                        return
+                if dv.get() != 'Custom':
+                    dv.set('Custom')
+            byte6_var.trace_add('write', _on_hex_changed)
+            byte12_var.trace_add('write', _on_hex_changed)
+            # Current capacity label (read-only)
             chip_count = _resolve_chip_count(self.device_profile, self.sd_variant)
             if chip_count is not None:
                 cap_info = _capacity_label(e.byte6, e.byte12, chip_count)
             else:
                 cap_info = density_from_bytes(e.byte6, e.byte12)
-            tk.Label(ef, text=f"{cap_info}  (b6=0x{e.byte6:02X} b12=0x{e.byte12:02X})", bg=C_BGL, fg=C_FGD, font=('Consolas', 8), anchor='w').pack(side='left')
+            tk.Label(ef, text=cap_info, bg=C_BGL, fg=C_FGD, font=('Consolas', 8), anchor='w').pack(side='left')
             # Store row data
             row = {
                 'index': i,
@@ -842,9 +916,13 @@ class APCBToolGUI:
                 'prefix_var': prefix_var,
                 'suffix_var': suffix_var,
                 'density_var': density_var,
+                'byte6_var': byte6_var,
+                'byte12_var': byte12_var,
                 'prefix_widget': prefix_combo,
                 'suffix_widget': suffix_entry,
                 'combo_widget': density_combo,
+                'byte6_widget': byte6_entry,
+                'byte12_widget': byte12_entry,
                 'original_name': orig_name,
                 'original_prefix': orig_prefix,
                 'original_suffix': orig_suffix,
@@ -855,8 +933,9 @@ class APCBToolGUI:
             self.entry_rows.append(row)
             # Bind checkbox toggle to enable/disable widgets and sync density from global target
             cb.configure(command=lambda v=enabled_var, pw=prefix_combo, sw=suffix_entry,
-                         cw=density_combo, hn=has_name, dv=density_var:
-                         self._on_entry_toggle(v, pw, sw, cw, hn, dv))
+                         cw=density_combo, b6w=byte6_entry, b12w=byte12_entry,
+                         hn=has_name, dv=density_var:
+                         self._on_entry_toggle(v, pw, sw, cw, b6w, b12w, hn, dv))
         # Bind mousewheel to all child widgets for scrolling
         self._bind_mousewheel_recursive(self.entry_inner)
 
@@ -872,6 +951,7 @@ class APCBToolGUI:
 
     def _on_entry_toggle(self, var: 'tk.BooleanVar', pw: 'tk.Widget',
                          sw: 'tk.Widget', cw: 'tk.Widget',
+                         b6w: 'tk.Widget', b12w: 'tk.Widget',
                          has_name: bool, density_var: 'tk.StringVar') -> None:
         """Handle per-entry checkbox toggle: enable/disable widgets and sync density."""
         if var.get():
@@ -879,11 +959,15 @@ class APCBToolGUI:
                 pw.configure(state='readonly')
                 sw.configure(state='normal', fg=C_FG, insertbackground=C_FG)
             cw.configure(state='readonly')
+            b6w.configure(state='normal', fg=C_FG, insertbackground=C_FG)
+            b12w.configure(state='normal', fg=C_FG, insertbackground=C_FG)
             density_var.set(f"{self.target_var.get()}GB")
         else:
             pw.configure(state='disabled')
             sw.configure(state='disabled', fg=C_FG, insertbackground=C_FG)
             cw.configure(state='disabled')
+            b6w.configure(state='disabled')
+            b12w.configure(state='disabled')
 
     def _toggle_all(self):
         """Toggle all entry checkboxes and enable/disable widgets."""
@@ -896,19 +980,24 @@ class APCBToolGUI:
                     row['prefix_widget'].configure(state='readonly')
                     row['suffix_widget'].configure(state='normal', fg=C_FG, insertbackground=C_FG)
                 row['combo_widget'].configure(state='readonly')
+                row['byte6_widget'].configure(state='normal', fg=C_FG, insertbackground=C_FG)
+                row['byte12_widget'].configure(state='normal', fg=C_FG, insertbackground=C_FG)
                 row['density_var'].set(density_str)
             else:
                 row['prefix_widget'].configure(state='disabled')
                 row['suffix_widget'].configure(state='disabled', fg=C_FG, insertbackground=C_FG)
                 row['combo_widget'].configure(state='disabled')
+                row['byte6_widget'].configure(state='disabled')
+                row['byte12_widget'].configure(state='disabled')
 
     def _sync_target_to_entries(self, *args):
-        """When global target changes, update all checked entries' density dropdowns."""
+        """When global target changes, update all checked entries' density dropdowns and hex fields."""
         target = self.target_var.get()
         density_str = f"{target}GB"
         for row in self.entry_rows:
             if row['enabled_var'].get():
                 row['density_var'].set(density_str)
+                # Hex fields are auto-updated by the density_var trace callback
 
     def _on_variant_changed(self, event=None):
         """Handle user changing the Steam Deck variant dropdown."""
@@ -1065,20 +1154,37 @@ class APCBToolGUI:
         entry_mods = []
         for row in self.entry_rows:
             if not row['enabled_var'].get(): continue
-            target_gb = int(row['density_var'].get().replace('GB', ''))
             prefix_label = row['prefix_var'].get()
             prefix = MODULE_PREFIX_MAP.get(prefix_label, prefix_label)
             new_name = prefix + row['suffix_var'].get().strip()
             name_to_write = new_name if (row['has_name_field'] and new_name != row['original_name']) else None
-            entry_mods.append({'index': row['index'], 'target_gb': target_gb, 'new_name': name_to_write})
+            density_val = row['density_var'].get()
+            if density_val == 'Custom':
+                try:
+                    custom_b6 = int(row['byte6_var'].get(), 16)
+                    custom_b12 = int(row['byte12_var'].get(), 16)
+                except (ValueError, TypeError):
+                    messagebox.showerror("Invalid Hex", f"Entry [{row['index']+1}] has invalid hex values."); return
+                entry_mods.append({'index': row['index'], 'target_gb': None,
+                                   'custom_byte6': custom_b6, 'custom_byte12': custom_b12,
+                                   'new_name': name_to_write})
+            else:
+                target_gb = int(density_val.replace('GB', ''))
+                entry_mods.append({'index': row['index'], 'target_gb': target_gb, 'new_name': name_to_write})
         if not entry_mods:
             messagebox.showwarning("No Entries Selected", "Select at least one SPD entry to modify."); return
         # Determine output filename from most common target
-        targets = [m['target_gb'] for m in entry_mods]
-        primary_target = max(set(targets), key=targets.count)
-        config = MEMORY_CONFIGS[primary_target]
+        targets = [m['target_gb'] for m in entry_mods if m.get('target_gb') is not None]
+        if targets:
+            primary_target = max(set(targets), key=targets.count)
+        else:
+            primary_target = None
         sp = Path(self.loaded_file); ext = sp.suffix or '.bin'
-        dn = f"{sp.stem}{'_64GB' if primary_target==64 else '_32GB' if primary_target==32 else '_stock'}{ext}"
+        if primary_target == 64: suffix = '_64GB'
+        elif primary_target == 32: suffix = '_32GB'
+        elif primary_target == 16: suffix = '_stock'
+        else: suffix = '_custom'
+        dn = f"{sp.stem}{suffix}{ext}"
         # Order filetypes so the input file's extension appears first
         if ext.lower() in ('.fd', '.rom'):
             ftypes = [("BIOS Files", f"*{ext}"), ("BIN files", "*.bin"), ("All files", "*.*")]
@@ -1090,8 +1196,11 @@ class APCBToolGUI:
         if os.path.abspath(op) == os.path.abspath(self.loaded_file): messagebox.showerror("Error","Cannot overwrite input."); return
         self._log_clear()
         # Build summary of per-entry changes
+        has_custom = any(m.get('target_gb') is None for m in entry_mods)
         unique_targets = sorted(set(targets))
-        target_summary = ', '.join(f"{t}GB" for t in unique_targets)
+        parts = [f"{t}GB" for t in unique_targets]
+        if has_custom: parts.append('Custom')
+        target_summary = ', '.join(parts) if parts else 'Custom'
         self._log("═"*70, 'header'); self._log(f"  MODIFYING SPD ENTRIES ({target_summary})", 'header'); self._log("═"*70, 'header')
         self._log(f"  Input:  {os.path.basename(self.loaded_file)}", 'info')
         self._log(f"  Output: {os.path.basename(op)}", 'info')
@@ -1133,7 +1242,12 @@ class APCBToolGUI:
             self._log(f"\n  Verifying...", 'dim')
             vb = find_apcb_blocks(open(op,'rb').read()); ok = True
             # Build per-entry expected config lookup
-            expected = {m['index']: MEMORY_CONFIGS[m['target_gb']] for m in entry_mods}
+            expected = {}
+            for m in entry_mods:
+                if m.get('custom_byte6') is not None:
+                    expected[m['index']] = {'byte6': m['custom_byte6'], 'byte12': m['custom_byte12'], 'name': 'Custom'}
+                else:
+                    expected[m['index']] = MEMORY_CONFIGS[m['target_gb']]
             for b in vb:
                 if b.is_memg:
                     if not b.checksum_valid: self._log(f"    FAIL: 0x{b.offset:08X}", 'error'); ok = False
