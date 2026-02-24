@@ -1209,17 +1209,13 @@ class APCBToolGUI:
             primary_target = max(set(targets), key=targets.count)
         else:
             primary_target = None
-        sp = Path(self.loaded_file); ext = sp.suffix or '.bin'
+        sp = Path(self.loaded_file)
         if primary_target == 64: suffix = '_64GB'
         elif primary_target == 32: suffix = '_32GB'
         elif primary_target == 16: suffix = '_stock'
         else: suffix = '_custom'
-        dn = f"{sp.stem}{suffix}{ext}"
-        # Order filetypes so the input file's extension appears first
-        if ext.lower() in ('.fd', '.rom'):
-            ftypes = [("BIOS Files", f"*{ext}"), ("BIN files", "*.bin"), ("All files", "*.*")]
-        else:
-            ftypes = [("BIN files", "*.bin"), ("BIOS Files", "*.fd *.rom"), ("All files", "*.*")]
+        dn = f"{sp.stem}{suffix}.bin"  # Always output as .bin (SPI flash image)
+        ftypes = [("BIN files", "*.bin"), ("All files", "*.*")]
         op = filedialog.asksaveasfilename(title="Save Modified BIOS As", initialfile=dn, initialdir=str(sp.parent),
             filetypes=ftypes)
         if not op: return
@@ -1238,10 +1234,7 @@ class APCBToolGUI:
         for mod in entry_mods:
             name_note = f" → '{mod['new_name']}'" if mod['new_name'] else ''
             self._log(f"    [{mod['index']+1}] → {mod['target_gb']}GB{name_note}", 'dim')
-        if _is_pe_firmware(self.loaded_data):
-            self._log(f"  Output: Flash via manufacturer tool (e.g. h2offt)", 'dim')
-        else:
-            self._log(f"  Output: SPI flash ready", 'dim')
+        self._log(f"  Output: Flash via SPI programmer", 'dim')
         # Resolve screen selection to profile key
         screen_selection = self.screen_var.get()
         screen_key = None
@@ -1291,8 +1284,7 @@ class APCBToolGUI:
             if ok:
                 self._log(f"\n  ✓ MODIFICATION SUCCESSFUL", 'success')
                 dev_name = self.device_profile['name'] if self.device_profile else 'device'
-                is_pe = _is_pe_firmware(self.loaded_data)
-                flash_msg = "Flash via manufacturer tool (e.g. h2offt)." if is_pe else "Ready for SPI flash."
+                flash_msg = "Flash via SPI programmer."
                 self._log(f"  {flash_msg}", 'success')
                 msg = f"Modified {len(entry_mods)} entries ({target_summary})!\n\nDevice: {dev_name}\n{op}\n\n{len(mods)} bytes changed."
                 if screen_key: msg += f"\n{SCREEN_PROFILES[screen_key]['name']} screen patch applied."
