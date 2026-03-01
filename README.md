@@ -521,7 +521,6 @@ Since the matching certificate is already in NVRAM, h2offt will accept the new f
 The `signing/` directory contains standalone utilities (all run on Steam Deck):
 - `secureflash_flash.py` — **Guided flash utility.** Handles cert injection + h2offt flashing with interactive prompts. Also supports `--revert` to remove the injected cert.
 - `secureflash_check.py` — NVRAM vulnerability scanner. Checks if your device is vulnerable to CVE-2025-4275. Run this first.
-- `secureflash_esl.py` — Key pair + ESL generator (for advanced use; not needed if `sd_apcb_tool.py` handles signing).
 
 ### Important notes
 
@@ -632,7 +631,6 @@ sd_apcb_tool.py                 -- CLI tool (analysis, modification, signing, in
 sd_apcb_gui.py                  -- GUI application (same engine, graphical interface)
 signing/secureflash_flash.py    -- Guided flash utility (cert injection + h2offt, runs on Steam Deck)
 signing/secureflash_check.py    -- NVRAM vulnerability scanner (CVE-2025-4275)
-signing/secureflash_esl.py      -- Key pair + ESL generator for certificate injection
 signing/README.md               -- Signing & flash tools documentation
 README.md                       -- This file
 CHANGELOG.md                    -- Version history
