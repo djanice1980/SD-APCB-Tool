@@ -469,17 +469,19 @@ python sd_apcb_tool.py modify F7G0112_sign.fd F7G0112_32GB.fd --target 32
 
 The tool automatically generates three output files:
 - `F7G0112_32GB.fd` — signed firmware (PE Authenticode + _IFLASH flags updated)
-- `F7G0112_32GB_key.pem` — RSA-2048 private key (keep this for re-signing later)
-- `F7G0112_32GB_cert.esl` — certificate in EFI_SIGNATURE_LIST format for NVRAM injection
+- `signing_key.pem` — RSA-2048 private key (keep this for re-signing later)
+- `signing_cert.esl` — certificate in EFI_SIGNATURE_LIST format for NVRAM injection
+
+If `signing_key.pem` already exists in the output directory, you'll be asked whether to reuse it. Reusing the same key means the certificate already in NVRAM stays valid — no need to re-inject.
 
 ### Step 2: Transfer to Steam Deck
 
 Copy three files to the Steam Deck (USB drive, scp, etc.):
 - `F7G0112_32GB.fd` — signed firmware
-- `F7G0112_32GB_cert.esl` — certificate for NVRAM injection
+- `signing_cert.esl` — certificate for NVRAM injection
 - `signing/secureflash_flash.py` — guided flash utility
 
-The `_key.pem` file stays on your computer (for re-signing later).
+The `signing_key.pem` stays on your computer (for re-signing later).
 
 ### Step 3: Flash (on Steam Deck)
 
@@ -508,13 +510,20 @@ Or leave it — the certificate only means h2offt will accept firmware signed wi
 
 ### Re-signing with an existing key
 
-If you kept the `_key.pem`, you can re-sign without re-injecting the certificate:
+If you kept `signing_key.pem`, you can re-sign without re-injecting the certificate. The tool auto-detects it in the output directory and asks to reuse:
 
 ```bash
-python sd_apcb_tool.py modify new_bios.fd new_bios_mod.fd --target 32 --signing-key F7G0112_32GB_key.pem
+python sd_apcb_tool.py modify new_bios.fd new_bios_mod.fd --target 32
+# → "Found existing signing_key.pem. Reuse this key? [Y/n]"
 ```
 
-Since the matching certificate is already in NVRAM, h2offt will accept the new firmware without repeating Steps 3-4.
+Or specify the key explicitly:
+
+```bash
+python sd_apcb_tool.py modify new_bios.fd new_bios_mod.fd --target 32 --signing-key /path/to/signing_key.pem
+```
+
+Since the matching certificate is already in NVRAM, h2offt will accept the new firmware without repeating the certificate injection step.
 
 ### Signing tools
 

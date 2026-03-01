@@ -55,9 +55,9 @@ Checks:
 
 ```
 PC:         python sd_apcb_tool.py modify input.fd output.fd --target 32
-              → output.fd + output_key.pem + output_cert.esl
+              → output.fd + signing_key.pem + signing_cert.esl
 
-Transfer:   Copy output.fd, output_cert.esl, and secureflash_flash.py to Steam Deck
+Transfer:   Copy output.fd, signing_cert.esl, and secureflash_flash.py to Steam Deck
 
 Steam Deck: sudo python3 secureflash_flash.py
               → Detects files → Injects cert → Flashes → Auto-reboots

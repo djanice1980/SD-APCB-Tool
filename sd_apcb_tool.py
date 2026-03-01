@@ -1954,23 +1954,32 @@ def modify_bios(input_path: str, output_path: str, target_gb: int,
     if should_sign and _is_pe_firmware(output_data):
         if _check_signing_available():
             print(f"\n  Signing firmware for h2offt...")
+            out_dir = os.path.dirname(output_path) or '.'
+            key_file = os.path.join(out_dir, 'signing_key.pem')
+            esl_file = os.path.join(out_dir, 'signing_cert.esl')
+            # Check for existing key in output directory (auto-reuse prompt)
+            if not signing_key and os.path.isfile(key_file):
+                ans = input(f"  Found existing {key_file}. Reuse this key? [Y/n] ").strip().lower()
+                if ans in ('', 'y', 'yes'):
+                    signing_key = key_file
+                    print(f"  Reusing existing signing key")
+            # Find cert alongside key (standardized or legacy naming)
             cert_path = None
             if signing_key:
-                # Try to find cert alongside key
-                base = os.path.splitext(signing_key)[0]
-                for ext in ('.der', '_cert.der'):
-                    cp = base + ext
-                    if os.path.isfile(cp):
-                        cert_path = cp
+                key_dir = os.path.dirname(signing_key) or '.'
+                for candidate in [
+                    os.path.join(key_dir, 'signing_cert.der'),
+                    os.path.splitext(signing_key)[0] + '.der',
+                    os.path.splitext(signing_key)[0] + '_cert.der',
+                ]:
+                    if os.path.isfile(candidate):
+                        cert_path = candidate
                         break
             signed_data, key_pem, cert_der = sign_firmware(output_data, signing_key, cert_path)
             output_data = signed_data
             print(f"  Signed with PE Authenticode + _IFLASH flags updated")
             # Save key materials if freshly generated
             if not signing_key:
-                base = os.path.splitext(output_path)[0]
-                key_file = f"{base}_key.pem"
-                esl_file = f"{base}_cert.esl"
                 with open(key_file, 'wb') as f:
                     f.write(key_pem)
                 esl_blob = build_esl(cert_der)
@@ -2435,21 +2444,32 @@ def _apply_changes(state: InteractiveState) -> bool:
     if should_sign and _is_pe_firmware(output_data):
         if _check_signing_available():
             print(f"\n  {c.CYAN}Signing firmware for h2offt...{c.RESET}")
+            out_dir = os.path.dirname(state.output_path) or '.'
+            key_file = os.path.join(out_dir, 'signing_key.pem')
+            esl_file = os.path.join(out_dir, 'signing_cert.esl')
+            signing_key = state.signing_key
+            # Check for existing key in output directory (auto-reuse prompt)
+            if not signing_key and os.path.isfile(key_file):
+                ans = input(f"  Found existing {key_file}. Reuse this key? [Y/n] ").strip().lower()
+                if ans in ('', 'y', 'yes'):
+                    signing_key = key_file
+                    print(f"  Reusing existing signing key")
+            # Find cert alongside key (standardized or legacy naming)
             cert_path = None
-            if state.signing_key:
-                base = os.path.splitext(state.signing_key)[0]
-                for ext in ('.der', '_cert.der'):
-                    cp = base + ext
-                    if os.path.isfile(cp):
-                        cert_path = cp
+            if signing_key:
+                key_dir = os.path.dirname(signing_key) or '.'
+                for candidate in [
+                    os.path.join(key_dir, 'signing_cert.der'),
+                    os.path.splitext(signing_key)[0] + '.der',
+                    os.path.splitext(signing_key)[0] + '_cert.der',
+                ]:
+                    if os.path.isfile(candidate):
+                        cert_path = candidate
                         break
-            signed_data, key_pem, cert_der = sign_firmware(output_data, state.signing_key, cert_path)
+            signed_data, key_pem, cert_der = sign_firmware(output_data, signing_key, cert_path)
             output_data = signed_data
             print(f"  {c.OK}Signed with PE Authenticode + _IFLASH flags updated{c.RESET}")
-            if not state.signing_key:
-                base = os.path.splitext(state.output_path)[0]
-                key_file = f"{base}_key.pem"
-                esl_file = f"{base}_cert.esl"
+            if not signing_key:
                 with open(key_file, 'wb') as f:
                     f.write(key_pem)
                 esl_blob = build_esl(cert_der)
@@ -2462,7 +2482,7 @@ def _apply_changes(state: InteractiveState) -> bool:
                 print(f"      /sys/firmware/efi/efivars/SecureFlashCertData"
                       f"-382af2bb-ffff-abcd-aaee-cce099338877")
             else:
-                print(f"  Using existing key: {state.signing_key}")
+                print(f"  Using existing key: {signing_key}")
         else:
             print(f"\n  {c.WARN}WARNING: cryptography library not available, skipping signing{c.RESET}")
             print(f"  Install with: pip install cryptography")
