@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-APCB Memory Mod Tool (GUI) v1.9.0
+APCB Memory Mod Tool (GUI) v2.0.0
 ===================================
 GUI for analyzing and modifying handheld device BIOS files
 to support 16GB/32GB/64GB memory configurations.
@@ -17,7 +17,7 @@ Requirements:
 Usage: python sd_apcb_gui.py
 """
 
-import os, sys, struct
+import os, sys, struct, hashlib, datetime
 from dataclasses import dataclass, field
 from enum import Enum, IntEnum
 from typing import List, Optional, Tuple, Dict
@@ -49,7 +49,7 @@ class MemoryTarget(IntEnum):
 
 
 APP_TITLE = "SD APCB Memory Mod Tool"
-APP_VERSION = "1.9.0"
+APP_VERSION = "2.0.0"
 
 # Steam Deck firmware filename prefixes for LCD vs OLED variant detection
 SD_LCD_PREFIX = 'F7A'     # Jupiter (LCD)
@@ -500,7 +500,481 @@ def patch_screen(data: bytearray, screen_key: str) -> List[tuple]:
         pos = idx + 1
     return patches
 
-# (PE Authenticode signing code was removed in v1.8.0 — requires Insyde QA.pfx)
+# ── PE Authenticode Signing (restored in v2.0.0 — CVE-2025-4275 SecureFlash injection) ──
+
+def _check_signing_available():
+    """Check if the cryptography library is available for signing."""
+    try:
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa, padding
+        from cryptography.x509 import CertificateBuilder, Name, NameAttribute, NameOID
+        from cryptography import x509
+        return True
+    except ImportError:
+        return False
+
+
+# --- DER Encoding Helpers ---
+
+def _der_length(length):
+    """Encode a DER length field."""
+    if length < 0x80:
+        return bytes([length])
+    elif length < 0x100:
+        return bytes([0x81, length])
+    elif length < 0x10000:
+        return bytes([0x82, (length >> 8) & 0xFF, length & 0xFF])
+    elif length < 0x1000000:
+        return bytes([0x83, (length >> 16) & 0xFF, (length >> 8) & 0xFF, length & 0xFF])
+    else:
+        return bytes([0x84, (length >> 24) & 0xFF, (length >> 16) & 0xFF,
+                      (length >> 8) & 0xFF, length & 0xFF])
+
+def _der_tag(tag, content):
+    return bytes([tag]) + _der_length(len(content)) + content
+
+def _der_sequence(content):
+    return _der_tag(0x30, content)
+
+def _der_set(content):
+    return _der_tag(0x31, content)
+
+def _der_oid(oid_str):
+    """Encode a dotted OID string to DER."""
+    parts = [int(x) for x in oid_str.split('.')]
+    encoded = bytes([40 * parts[0] + parts[1]])
+    for val in parts[2:]:
+        if val < 0x80:
+            encoded += bytes([val])
+        elif val < 0x4000:
+            encoded += bytes([(val >> 7) | 0x80, val & 0x7F])
+        elif val < 0x200000:
+            encoded += bytes([(val >> 14) | 0x80, ((val >> 7) & 0x7F) | 0x80, val & 0x7F])
+        else:
+            encoded += bytes([(val >> 21) | 0x80, ((val >> 14) & 0x7F) | 0x80,
+                            ((val >> 7) & 0x7F) | 0x80, val & 0x7F])
+    return _der_tag(0x06, encoded)
+
+def _der_integer(value):
+    if isinstance(value, int):
+        if value == 0:
+            return _der_tag(0x02, b'\x00')
+        result = []
+        v = value
+        while v > 0:
+            result.insert(0, v & 0xFF)
+            v >>= 8
+        if result[0] & 0x80:
+            result.insert(0, 0)
+        return _der_tag(0x02, bytes(result))
+    return _der_tag(0x02, value)
+
+def _der_octet_string(data):
+    return _der_tag(0x04, data)
+
+def _der_null():
+    return bytes([0x05, 0x00])
+
+def _der_context(tag_num, content, constructed=True):
+    tag = (0xA0 if constructed else 0x80) | tag_num
+    return _der_tag(tag, content)
+
+def _der_utctime(dt):
+    return _der_tag(0x17, dt.strftime('%y%m%d%H%M%SZ').encode('ascii'))
+
+
+# --- Authenticode OIDs ---
+
+_OID_PKCS7_SIGNED_DATA = '1.2.840.113549.1.7.2'
+_OID_SPC_INDIRECT_DATA = '1.3.6.1.4.1.311.2.1.4'
+_OID_SPC_PE_IMAGE_DATA = '1.3.6.1.4.1.311.2.1.15'
+_OID_SPC_SP_OPUS_INFO  = '1.3.6.1.4.1.311.2.1.12'
+_OID_SHA256            = '2.16.840.1.101.3.4.2.1'
+_OID_RSA_ENCRYPTION    = '1.2.840.113549.1.1.1'
+_OID_CONTENT_TYPE      = '1.2.840.113549.1.9.3'
+_OID_MESSAGE_DIGEST    = '1.2.840.113549.1.9.4'
+
+
+# --- EFI_SIGNATURE_LIST Builder (for NVRAM injection) ---
+
+# EFI_CERT_X509_GUID = {a5c059a1-94e4-4aa7-87b5-ab155c2bf072}
+_EFI_CERT_X509_GUID = bytes([
+    0xa1, 0x59, 0xc0, 0xa5, 0xe4, 0x94, 0xa7, 0x4a,
+    0x87, 0xb5, 0xab, 0x15, 0x5c, 0x2b, 0xf0, 0x72
+])
+_SD_APCB_OWNER_GUID = bytes([
+    0x50, 0x41, 0x44, 0x53, 0x42, 0x43, 0x4f, 0x54,
+    0x4f, 0x4c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01
+])
+
+def build_esl(cert_der: bytes) -> bytes:
+    """Build an EFI_SIGNATURE_LIST blob for NVRAM injection.
+
+    Wraps a DER-encoded X.509 certificate in EFI_SIGNATURE_LIST format
+    with efivarfs attribute prefix, ready to write to:
+      /sys/firmware/efi/efivars/SecureFlashCertData-382af2bb-ffff-abcd-aaee-cce099338877
+    """
+    sig_size = 16 + len(cert_der)
+    list_size = 28 + sig_size
+    esl = bytearray()
+    esl.extend(_EFI_CERT_X509_GUID)
+    esl.extend(struct.pack('<I', list_size))
+    esl.extend(struct.pack('<I', 0))            # SignatureHeaderSize
+    esl.extend(struct.pack('<I', sig_size))
+    esl.extend(_SD_APCB_OWNER_GUID)
+    esl.extend(cert_der)
+    # Prepend efivarfs attributes (NV|BS|RT = 0x07)
+    return struct.pack('<I', 0x00000007) + bytes(esl)
+
+
+def _compute_pe_checksum(data):
+    """Compute PE checksum (same algorithm as Windows MapFileAndCheckSum)."""
+    pe_offset = struct.unpack_from('<I', data, 0x3C)[0]
+    checksum_offset = pe_offset + 4 + 20 + 64
+
+    checksum = 0
+    remainder = len(data) % 4
+    for i in range(0, len(data) - remainder, 4):
+        if i == checksum_offset:
+            continue
+        val = struct.unpack_from('<I', data, i)[0]
+        checksum = (checksum & 0xFFFFFFFF) + val + (checksum >> 32)
+        checksum = (checksum & 0xFFFF) + (checksum >> 16)
+
+    if remainder:
+        val = int.from_bytes(data[-(remainder):] + b'\x00' * (4 - remainder), 'little')
+        checksum = (checksum & 0xFFFFFFFF) + val + (checksum >> 32)
+        checksum = (checksum & 0xFFFF) + (checksum >> 16)
+
+    checksum = (checksum & 0xFFFF) + (checksum >> 16)
+    return (checksum + len(data)) & 0xFFFFFFFF
+
+
+def _compute_authenticode_hash(data):
+    """Compute the Authenticode PE hash per Microsoft's specification."""
+    pe_offset = struct.unpack_from('<I', data, 0x3C)[0]
+    coff_start = pe_offset + 4
+    num_sections = struct.unpack_from('<H', data, coff_start + 2)[0]
+    opt_header_size = struct.unpack_from('<H', data, coff_start + 16)[0]
+
+    opt_start = coff_start + 20
+    magic = struct.unpack_from('<H', data, opt_start)[0]
+    checksum_offset = opt_start + 64
+    dd_start = opt_start + (112 if magic == 0x20B else 96)
+    secdir_offset = dd_start + 32
+
+    size_of_headers = struct.unpack_from('<I', data, opt_start + 60)[0]
+    section_table_offset = opt_start + opt_header_size
+
+    h = hashlib.sha256()
+    h.update(data[:checksum_offset])
+    h.update(data[checksum_offset + 4:secdir_offset])
+    h.update(data[secdir_offset + 8:size_of_headers])
+
+    sections = []
+    for i in range(num_sections):
+        sec_off = section_table_offset + i * 40
+        raw_size = struct.unpack_from('<I', data, sec_off + 16)[0]
+        raw_ptr = struct.unpack_from('<I', data, sec_off + 20)[0]
+        if raw_size > 0:
+            sections.append((raw_ptr, raw_size))
+    sections.sort(key=lambda s: s[0])
+
+    sum_of_bytes_hashed = size_of_headers
+    for ptr, size in sections:
+        h.update(data[ptr:ptr + size])
+        end = ptr + size
+        if end > sum_of_bytes_hashed:
+            sum_of_bytes_hashed = end
+
+    file_end = len(data)
+    if sum_of_bytes_hashed < file_end:
+        h.update(data[sum_of_bytes_hashed:file_end])
+
+    return h.digest()
+
+
+# --- Insyde _IFLASH Structure Helpers ---
+
+_IFLASH_BIOSCER_MAGIC = b'_IFLASH_BIOSCER'
+_IFLASH_BIOSCR2_MAGIC = b'_IFLASH_BIOSCR2'
+_IFLASH_FLAGS_OFFSET = 0x0F
+_IFLASH_DRV_FLAGS2_OFFSET = 0x13
+_IFLASH_BIOSCER_HASH_OFFSET = 0x18
+_IFLASH_BIOSCR2_CERT_OFFSET = 0x1F
+
+
+def _find_iflash_structures(data):
+    """Find _IFLASH_BIOSCER and _IFLASH_BIOSCR2 in firmware."""
+    bioscer = data.find(_IFLASH_BIOSCER_MAGIC)
+    bioscr2 = data.find(_IFLASH_BIOSCR2_MAGIC)
+    if bioscer >= 0 and bioscr2 >= 0:
+        return bioscer, bioscr2
+    return None, None
+
+
+# DeckHD-proven flag transformations for h2offt QA mode.
+_IFLASH_FLAG_MAP = {
+    b'_IFLASH_DRV_IMG': lambda f: f | 0x08,
+    b'_IFLASH_BIOSIMG': lambda f: 0x08 if f == 0x20 else f,
+    b'_IFLASH_INI_IMG': lambda f: 0x68,
+    b'_IFLASH_BIOSCER': lambda f: 0x08,
+    b'_IFLASH_BIOSCR2': lambda f: 0x08,
+}
+
+
+def _update_iflash_flags(data):
+    """Update all _IFLASH structure flags for h2offt QA/self-signed mode."""
+    pos = 0
+    updated = []
+    while pos < len(data):
+        idx = data.find(b'_IFLASH_', pos)
+        if idx < 0:
+            break
+        for magic, transform in _IFLASH_FLAG_MAP.items():
+            if data[idx:idx + len(magic)] == magic:
+                old_flag = data[idx + _IFLASH_FLAGS_OFFSET]
+                new_flag = transform(old_flag)
+                if old_flag != new_flag:
+                    data[idx + _IFLASH_FLAGS_OFFSET] = new_flag
+                    updated.append((idx, magic.decode(), old_flag, new_flag))
+                if magic == b'_IFLASH_DRV_IMG':
+                    data[idx + _IFLASH_DRV_FLAGS2_OFFSET] = new_flag
+                break
+        pos = idx + 1
+    return updated
+
+
+def _build_spc_indirect_data(pe_hash):
+    """Build SPC_INDIRECT_DATA_CONTENT for Authenticode."""
+    spc_flags = _der_tag(0x03, bytes([0x00]))
+    spc_link = _der_context(0, b'', constructed=False)
+    spc_file = _der_context(2, spc_link)
+    spc_pe_data = _der_sequence(spc_flags + _der_context(0, spc_file))
+    spc_attr = _der_sequence(_der_oid(_OID_SPC_PE_IMAGE_DATA) + spc_pe_data)
+    digest_algo = _der_sequence(_der_oid(_OID_SHA256) + _der_null())
+    digest_info = _der_sequence(digest_algo + _der_octet_string(pe_hash))
+    inner_content = spc_attr + digest_info
+    return _der_sequence(inner_content), inner_content
+
+
+def _build_auth_attrs(spc_inner_content):
+    """Build authenticated attributes for PKCS#7 signer info."""
+    attr_opus = _der_sequence(
+        _der_oid(_OID_SPC_SP_OPUS_INFO) +
+        _der_set(_der_sequence(b'')))
+    attr_ct = _der_sequence(
+        _der_oid(_OID_CONTENT_TYPE) + _der_set(_der_oid(_OID_SPC_INDIRECT_DATA)))
+    content_hash = hashlib.sha256(spc_inner_content).digest()
+    attr_md = _der_sequence(
+        _der_oid(_OID_MESSAGE_DIGEST) + _der_set(_der_octet_string(content_hash)))
+    attrs = sorted([attr_opus, attr_ct, attr_md], key=lambda x: x)
+    return b''.join(attrs)
+
+
+def _build_pkcs7(pe_hash, cert_der, private_key):
+    """Build complete PKCS#7 SignedData for Authenticode."""
+    from cryptography.hazmat.primitives import hashes as _hashes
+    from cryptography.hazmat.primitives.asymmetric import padding as _padding
+    from cryptography import x509 as _x509
+
+    cert = _x509.load_der_x509_certificate(cert_der)
+    serial = cert.serial_number
+    issuer_der = cert.issuer.public_bytes()
+
+    spc_content, spc_inner = _build_spc_indirect_data(pe_hash)
+    content_info = _der_sequence(
+        _der_oid(_OID_SPC_INDIRECT_DATA) + _der_context(0, spc_content))
+    sha256_algo = _der_sequence(_der_oid(_OID_SHA256) + _der_null())
+    digest_algos = _der_set(sha256_algo)
+    certificates = _der_context(0, cert_der)
+
+    auth_attrs_content = _build_auth_attrs(spc_inner)
+    attrs_for_signing = _der_set(auth_attrs_content)
+    signature = private_key.sign(attrs_for_signing, _padding.PKCS1v15(), _hashes.SHA256())
+
+    issuer_and_serial = _der_sequence(issuer_der + _der_integer(serial))
+    rsa_algo = _der_sequence(_der_oid(_OID_RSA_ENCRYPTION) + _der_null())
+
+    signer_info = _der_sequence(
+        _der_integer(1) + issuer_and_serial + sha256_algo +
+        _der_context(0, auth_attrs_content) + rsa_algo +
+        _der_octet_string(signature))
+
+    signed_data = _der_sequence(
+        _der_integer(1) + digest_algos + content_info + certificates + _der_set(signer_info))
+
+    return _der_sequence(
+        _der_oid(_OID_PKCS7_SIGNED_DATA) + _der_context(0, signed_data))
+
+
+def _build_win_certificate(pkcs7_blob):
+    """Build a WIN_CERTIFICATE structure (8-byte aligned) from a PKCS#7 blob."""
+    wc_len = (8 + len(pkcs7_blob) + 7) & ~7
+    win_cert = struct.pack('<IHH', wc_len, 0x0200, 0x0002) + pkcs7_blob
+    win_cert += b'\x00' * (wc_len - len(win_cert))
+    return win_cert
+
+
+def sign_firmware(data_in: bytes, key_path: str = None, cert_path: str = None) -> tuple:
+    """
+    Sign a PE firmware file for h2offt flashing via CVE-2025-4275.
+
+    Uses certificate injection into SecureFlashCertData NVRAM variable to
+    establish trust. Signs with user-provided key pair, or generates a fresh
+    RSA-2048 key pair if none provided.
+
+    Args:
+        data_in: Input file bytes (PE format firmware)
+        key_path: Path to RSA private key PEM file (optional)
+        cert_path: Path to X.509 certificate DER file (optional)
+
+    Returns:
+        Tuple of (signed_data, key_pem_bytes, cert_der_bytes)
+    """
+    from cryptography.hazmat.primitives import hashes as _hashes
+    from cryptography.hazmat.primitives.asymmetric import rsa as _rsa
+    from cryptography.hazmat.primitives.asymmetric import padding as _padding
+    from cryptography.x509 import CertificateBuilder, Name, NameAttribute, NameOID
+    from cryptography import x509 as _x509
+    from cryptography.hazmat.primitives.serialization import Encoding, load_pem_private_key
+    from cryptography.hazmat.primitives import serialization
+
+    data = bytearray(data_in)
+
+    if data[:2] != b'MZ':
+        raise ValueError("Not a valid PE file (no MZ header)")
+    pe_offset = struct.unpack_from('<I', data, 0x3C)[0]
+    if data[pe_offset:pe_offset+4] != b'PE\x00\x00':
+        raise ValueError("Invalid PE signature")
+
+    opt_start = pe_offset + 4 + 20
+    magic = struct.unpack_from('<H', data, opt_start)[0]
+    checksum_offset = opt_start + 64
+    dd_start = opt_start + (112 if magic == 0x20B else 96)
+    secdir_offset = dd_start + 32
+
+    # Step 1: Strip existing PE Authenticode signature
+    old_va = struct.unpack_from('<I', data, secdir_offset)[0]
+    if old_va > 0 and old_va < len(data):
+        data = data[:old_va]
+
+    # Load or generate key pair + certificate
+    if key_path and cert_path:
+        with open(key_path, 'rb') as f:
+            key_pem = f.read()
+        key = load_pem_private_key(key_pem, password=None)
+        with open(cert_path, 'rb') as f:
+            cert_der = f.read()
+    elif key_path:
+        with open(key_path, 'rb') as f:
+            key_pem = f.read()
+        key = load_pem_private_key(key_pem, password=None)
+        # Try to find cert alongside key
+        base = os.path.splitext(key_path)[0]
+        for ext in ('.der', '_cert.der', '.cert.der'):
+            cp = base + ext
+            if os.path.isfile(cp):
+                with open(cp, 'rb') as f:
+                    cert_der = f.read()
+                break
+        else:
+            now = datetime.datetime.now(datetime.timezone.utc)
+            subject = issuer = Name([NameAttribute(NameOID.COMMON_NAME, "SD APCB Tool")])
+            cert = (CertificateBuilder()
+                .subject_name(subject).issuer_name(issuer)
+                .public_key(key.public_key())
+                .serial_number(_x509.random_serial_number())
+                .not_valid_before(now)
+                .not_valid_after(now + datetime.timedelta(days=3650))
+                .sign(key, _hashes.SHA256()))
+            cert_der = cert.public_bytes(Encoding.DER)
+    else:
+        key = _rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        key_pem = key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption()
+        )
+        now = datetime.datetime.now(datetime.timezone.utc)
+        subject = issuer = Name([NameAttribute(NameOID.COMMON_NAME, "SD APCB Tool")])
+        cert = (CertificateBuilder()
+            .subject_name(subject).issuer_name(issuer)
+            .public_key(key.public_key())
+            .serial_number(_x509.random_serial_number())
+            .not_valid_before(now)
+            .not_valid_after(now + datetime.timedelta(days=3650))
+            .sign(key, _hashes.SHA256()))
+        cert_der = cert.public_bytes(Encoding.DER)
+
+    # Step 2: Handle Insyde _IFLASH internal integrity structures
+    bioscer_off, bioscr2_off = _find_iflash_structures(bytes(data))
+
+    if bioscer_off is not None and bioscr2_off is not None:
+        _update_iflash_flags(data)
+
+        bioscr2_cert_off = bioscr2_off + _IFLASH_BIOSCR2_CERT_OFFSET
+        old_bioscr2_slot = len(data) - bioscr2_cert_off
+
+        bioscr2_body = bytearray(data)
+        struct.pack_into('<I', bioscr2_body, secdir_offset, 0)
+        struct.pack_into('<I', bioscr2_body, secdir_offset + 4, 0)
+        struct.pack_into('<I', bioscr2_body, checksum_offset, 0)
+        bioscr2_hash = _compute_authenticode_hash(bytes(bioscr2_body))
+        bioscr2_pkcs7 = _build_pkcs7(bioscr2_hash, cert_der, key)
+        bioscr2_wc = _build_win_certificate(bioscr2_pkcs7)
+
+        delta = len(bioscr2_wc) - old_bioscr2_slot
+        old_slot_end = bioscr2_cert_off + old_bioscr2_slot
+
+        if delta > 0:
+            data[bioscr2_cert_off:old_slot_end] = bioscr2_wc[:old_bioscr2_slot]
+            data[old_slot_end:old_slot_end] = bioscr2_wc[old_bioscr2_slot:]
+        elif delta < 0:
+            data[bioscr2_cert_off:bioscr2_cert_off + len(bioscr2_wc)] = bioscr2_wc
+            del data[bioscr2_cert_off + len(bioscr2_wc):old_slot_end]
+        else:
+            data[bioscr2_cert_off:old_slot_end] = bioscr2_wc
+
+        if delta != 0:
+            soi_offset = opt_start + 56
+            old_soi = struct.unpack_from('<I', data, soi_offset)[0]
+            struct.pack_into('<I', data, soi_offset, old_soi + delta)
+
+    # Step 3: Clear header fields for PE hash computation
+    struct.pack_into('<I', data, secdir_offset, 0)
+    struct.pack_into('<I', data, secdir_offset + 4, 0)
+    struct.pack_into('<I', data, checksum_offset, 0)
+
+    # Step 4: Compute PE Authenticode hash
+    pe_hash = _compute_authenticode_hash(bytes(data))
+
+    # Step 5: Build PE PKCS#7 SignedData
+    pkcs7 = _build_pkcs7(pe_hash, cert_der, key)
+
+    # Step 6: Build and append WIN_CERTIFICATE
+    win_cert = _build_win_certificate(pkcs7)
+    cert_offset = len(data)
+    struct.pack_into('<I', data, secdir_offset, cert_offset)
+    struct.pack_into('<I', data, secdir_offset + 4, len(win_cert))
+    data.extend(win_cert)
+
+    # Step 7: Compute and write PE checksum
+    checksum = _compute_pe_checksum(bytes(data))
+    struct.pack_into('<I', data, checksum_offset, checksum)
+
+    # Self-check
+    verify_data = bytearray(data[:cert_offset])
+    struct.pack_into('<I', verify_data, secdir_offset, 0)
+    struct.pack_into('<I', verify_data, secdir_offset + 4, 0)
+    struct.pack_into('<I', verify_data, checksum_offset, 0)
+    verify_hash = _compute_authenticode_hash(bytes(verify_data))
+    if verify_hash != pe_hash:
+        raise RuntimeError(
+            "Signing self-check FAILED: Authenticode hash mismatch. "
+            f"Expected {pe_hash.hex()}, got {verify_hash.hex()}")
+
+    return bytes(data), key_pem, cert_der
 
 # ── DMI / SMBIOS (AMI DmiEdit $DMI Store) ──
 AMI_DMI_MAGIC = b'$DMI'
@@ -1209,7 +1683,10 @@ class APCBToolGUI:
             name_note = f" → '{mod['new_name']}'" if mod['new_name'] else ''
             self._log(f"    [{mod['index']+1}] → {mod['target_gb']}GB{name_note}", 'dim')
         if _is_pe_firmware(self.loaded_data):
-            self._log(f"  Output: Flash via manufacturer tool (e.g. h2offt)", 'dim')
+            if op.lower().endswith('.fd'):
+                self._log(f"  Output: PE firmware (.fd) — will be signed for h2offt", 'dim')
+            else:
+                self._log(f"  Output: Flash via manufacturer tool (e.g. h2offt)", 'dim')
         else:
             self._log(f"  Output: SPI flash ready", 'dim')
         # Resolve screen selection to profile key
@@ -1238,6 +1715,26 @@ class APCBToolGUI:
             self._log(f"\n  Byte changes: {len(mods)}", 'success')
             for off,old,new in mods: self._log(f"    0x{off:08X}: 0x{old:02X} → 0x{new:02X}", 'dim')
             od = bytes(data)
+            # Sign if saving as .fd and input was PE firmware
+            signing_info = None
+            if op.lower().endswith('.fd') and _is_pe_firmware(self.loaded_data):
+                if _check_signing_available():
+                    self._log(f"\n  Signing firmware for h2offt...", 'accent')
+                    signed_data, key_pem, cert_der = sign_firmware(od)
+                    od = signed_data
+                    base = os.path.splitext(op)[0]
+                    key_file = f"{base}_key.pem"
+                    esl_file = f"{base}_cert.esl"
+                    with open(key_file, 'wb') as f: f.write(key_pem)
+                    esl_blob = build_esl(cert_der)
+                    with open(esl_file, 'wb') as f: f.write(esl_blob)
+                    self._log(f"  Signed with PE Authenticode", 'success')
+                    self._log(f"  Key:  {os.path.basename(key_file)}", 'dim')
+                    self._log(f"  ESL:  {os.path.basename(esl_file)} (inject into NVRAM before flashing)", 'dim')
+                    signing_info = {'key': key_file, 'esl': esl_file}
+                else:
+                    self._log(f"\n  WARNING: cryptography library not available, saving unsigned", 'warning')
+                    self._log(f"  Install with: pip install cryptography", 'dim')
             with open(op,'wb') as f: f.write(od)
             self._log(f"\n  Verifying...", 'dim')
             vb = find_apcb_blocks(open(op,'rb').read()); ok = True
@@ -1262,11 +1759,23 @@ class APCBToolGUI:
                 self._log(f"\n  ✓ MODIFICATION SUCCESSFUL", 'success')
                 dev_name = self.device_profile['name'] if self.device_profile else 'device'
                 is_pe = _is_pe_firmware(self.loaded_data)
-                flash_msg = "Flash via manufacturer tool (e.g. h2offt)." if is_pe else "Ready for SPI flash."
-                self._log(f"  {flash_msg}", 'success')
+                if signing_info:
+                    flash_msg = "Signed for h2offt. Inject cert ESL into NVRAM before flashing."
+                    self._log(f"  {flash_msg}", 'success')
+                elif is_pe:
+                    flash_msg = "Flash via manufacturer tool (e.g. h2offt)."
+                    self._log(f"  {flash_msg}", 'success')
+                else:
+                    flash_msg = "Ready for SPI flash."
+                    self._log(f"  {flash_msg}", 'success')
                 msg = f"Modified {len(entry_mods)} entries ({target_summary})!\n\nDevice: {dev_name}\n{op}\n\n{len(mods)} bytes changed."
                 if screen_key: msg += f"\n{SCREEN_PROFILES[screen_key]['name']} screen patch applied."
-                msg += f"\n\n{flash_msg}"
+                if signing_info:
+                    msg += f"\nSigned with self-signed certificate."
+                    msg += f"\nESL: {os.path.basename(signing_info['esl'])}"
+                    msg += f"\n\n{flash_msg}"
+                else:
+                    msg += f"\n\n{flash_msg}"
                 messagebox.showinfo("Success", msg)
             else:
                 self._log(f"\n  ✗ VERIFICATION FAILED", 'error'); messagebox.showerror("Failed","DO NOT flash this file.")

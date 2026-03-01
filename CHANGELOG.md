@@ -2,6 +2,29 @@
 
 All notable changes to the APCB Memory Mod Tool.
 
+## [2.0.0] - 2026-03-01
+
+### Added
+- **PE Authenticode signing restored** -- Full firmware signing support via CVE-2025-4275 (Hydroph0bia) certificate injection. When saving as `.fd`, the tool automatically signs the firmware with a self-signed RSA-2048 certificate and generates an EFI_SIGNATURE_LIST (ESL) blob for NVRAM injection. This enables flashing modified firmware via h2offt on Steam Deck without needing the Insyde QA.pfx private key.
+- **`--sign` CLI flag** -- Explicitly request firmware signing regardless of output file extension.
+- **`--signing-key` CLI option** -- Use an existing RSA private key PEM file (e.g. from `secureflash_esl.py`) instead of generating a fresh key pair each time.
+- **Auto-sign for `.fd` output** -- When the output file has a `.fd` extension, signing is automatically enabled for PE firmware files. Default `.bin` output remains unsigned (SPI programmer path).
+- **`signing/secureflash_check.py`** -- NVRAM vulnerability scanner that checks whether a device is vulnerable to CVE-2025-4275 SecureFlash certificate injection. Detects Insyde H2O firmware via multiple signals (vendor string, h2offt presence, SecureFlash NVRAM variables, F7 version prefix). Recognizes both Steam Deck LCD (Jupiter) and OLED (Galileo) codenames.
+- **`signing/secureflash_esl.py`** -- Key pair and ESL generator that produces RSA-2048 signing materials (PEM key, DER cert, ESL blob) for certificate injection.
+- **Inline `build_esl()` function** -- EFI_SIGNATURE_LIST builder available in both CLI and GUI for generating NVRAM injection blobs alongside signed firmware.
+- **GUI signing integration** -- GUI automatically signs when saving as `.fd`, generates key + ESL files, and shows signing status in the log and success dialog with NVRAM injection instructions.
+
+### Changed
+- Version bumped to 2.0.0 in all files (major feature: firmware signing)
+- `hashlib` and `datetime` imports restored (needed by signing code)
+- `cryptography` library is optional but recommended for signing (pure-Python RSA fallback available in key generation tools)
+
+### Technical Notes
+- Three integrity layers handled during signing: _IFLASH_BIOSCER (proprietary hash, preserved), _IFLASH_BIOSCR2 (internal PKCS#7, re-signed), PE Security Directory (standard Authenticode, re-signed)
+- _IFLASH flag transformations match DeckHD-proven QA mode values
+- Self-check verifies Authenticode hash round-trips correctly after signing
+- Signing falls back gracefully to unsigned output if `cryptography` library is unavailable
+
 ## [1.9.0] - 2025-03-01
 
 ### Added
