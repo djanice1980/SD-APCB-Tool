@@ -82,6 +82,29 @@ MEMORY_CONFIGS = {
     32: {'name': '32GB', 'byte6': 0xB5, 'byte12': 0x0A},
     64: {'name': '64GB', 'byte6': 0xF5, 'byte12': 0x49},
 }
+# Speed profiles — maps MT/s rate to tCK byte value
+# Formula: MT/s = 2000 / (tCK_byte * MTB_ns), where MTB_ns = 0.125
+SPEED_PROFILES = {
+    8000: {'name': '8000 MT/s', 'tCK': 0x02},
+    5333: {'name': '5333 MT/s', 'tCK': 0x03},
+    4000: {'name': '4000 MT/s', 'tCK': 0x04},
+    3200: {'name': '3200 MT/s', 'tCK': 0x05},
+}
+
+def speed_from_tck(tck_byte: int) -> str:
+    """Convert tCK byte to speed dropdown label, or 'Custom'."""
+    for mts, prof in SPEED_PROFILES.items():
+        if prof['tCK'] == tck_byte:
+            return prof['name']
+    return 'Custom'
+
+def tck_from_speed(speed_str: str) -> Optional[int]:
+    """Convert speed label to tCK byte, or None for Custom."""
+    for mts, prof in SPEED_PROFILES.items():
+        if prof['name'] == speed_str:
+            return prof['tCK']
+    return None
+
 MODULE_DENSITY_MAP = {
     'MT62F512M32D2DR': '16GB', 'MT62F768M32D2DR': '24GB',
     'MT62F1G64D4BS': '32GB', 'MT62F1G64D4AH': '32GB', 'MT62F1G32D4DR': '32GB',
@@ -230,6 +253,7 @@ def _decode_spd_fields(spd: bytes) -> dict:
         'col_bits': (b5 & 0x07) + 9,
         'bank_groups': {0: 1, 1: 2, 2: 4}.get((b4 >> 4) & 0x03, 0),
         'banks_per_group': {0: 4, 1: 8, 2: 16}.get((b4 >> 6) & 0x03, 0),
+        'tCK_byte': spd[SPD_BYTE_TCKMIN],
         'tAA_ns': round(spd[SPD_BYTE_TAAMIN] * SPD_MTB_PS / 1000, 2),
         'tRCD_ns': round(spd[SPD_BYTE_TRCDMIN] * SPD_MTB_PS / 1000, 2),
         'tRPAB_ns': round(spd[SPD_BYTE_TRPABMIN] * SPD_MTB_PS / 1000, 2),
@@ -246,6 +270,7 @@ class SPDEntry:
     die_density: str = ''; die_count: int = 0; ranks: int = 0; dev_width: str = ''
     bus_width: int = 0; row_bits: int = 0; col_bits: int = 0
     bank_groups: int = 0; banks_per_group: int = 0
+    tCK_byte: int = 0
     tAA_ns: float = 0.0; tRCD_ns: float = 0.0; tRPAB_ns: float = 0.0; tRPPB_ns: float = 0.0
 
 @dataclass
@@ -402,6 +427,8 @@ def modify_bios_data(data: bytearray, entry_modifications: List[Dict], modify_ma
             'new_name': str|None - new module name or None to keep current
             'custom_byte6': int|None - custom byte6 value (when target_gb is None)
             'custom_byte12': int|None - custom byte12 value (when target_gb is None)
+            'timing': dict|None - optional timing byte overrides with keys:
+                'tCK', 'tAA', 'tRCD', 'tRPab', 'tRPpb' (int values)
         modify_magic: bool - modify APCB magic byte
     Returns:
         list of (offset, old_byte, new_byte) tuples
@@ -436,6 +463,19 @@ def modify_bios_data(data: bytearray, entry_modifications: List[Dict], modify_ma
                     off = e.module_name_offset + i
                     if data[off] != nb:
                         mods.append((off, data[off], nb)); data[off] = nb
+            # Write timing bytes if modified
+            timing = mod.get('timing')
+            if timing:
+                for spd_off, key in [
+                    (SPD_BYTE_TCKMIN, 'tCK'), (SPD_BYTE_TAAMIN, 'tAA'),
+                    (SPD_BYTE_TRCDMIN, 'tRCD'), (SPD_BYTE_TRPABMIN, 'tRPab'),
+                    (SPD_BYTE_TRPPBMIN, 'tRPpb')
+                ]:
+                    off = e.offset_in_file + spd_off
+                    new_val = timing[key]
+                    if data[off] != new_val:
+                        mods.append((off, data[off], new_val))
+                        data[off] = new_val
         if modify_magic:
             nb = 0x51 if first_target == 32 else 0x41
             if data[block.offset] != nb: mods.append((block.offset, data[block.offset], nb)); data[block.offset] = nb
@@ -704,7 +744,7 @@ class APCBToolGUI:
         self.lbl_cf = ttk.Label(r2, text="", style='Status.TLabel'); self.lbl_cf.pack(side='right')
         # Target configuration
         ttk.Label(left, text="Target Configuration", style='Section.TLabel').pack(anchor='w', pady=(4,0))
-        ttk.Label(left, text="Sets density for all checked entries below", style='Subtitle.TLabel').pack(anchor='w', pady=(0,4))
+        ttk.Label(left, text="Sets density and SPD timings for all checked entries below", style='Subtitle.TLabel').pack(anchor='w', pady=(0,4))
         tc = tk.Frame(left, bg=C_BGL, padx=16, pady=12, highlightbackground=C_BDR, highlightthickness=1); tc.pack(fill='x', pady=(0,10))
         self.target_var = tk.IntVar(value=32)
         self.target_radios = {}
@@ -724,6 +764,16 @@ class APCBToolGUI:
             state='disabled', width=20, font=('Segoe UI', 9))
         self.screen_combo.pack(side='left', padx=(8,0))
         tk.Label(df, text="(Steam Deck LCD only)", bg=C_BGL, fg=C_FGD, font=('Segoe UI', 9)).pack(side='left', padx=(8,0))
+        # Speed setting
+        spf = tk.Frame(tc, bg=C_BGL); spf.pack(fill='x', pady=(4,0))
+        tk.Label(spf, text="SPD Timings:", bg=C_BGL, fg=C_FG, font=('Segoe UI', 10)).pack(side='left')
+        speed_options = [SPEED_PROFILES[k]['name'] for k in sorted(SPEED_PROFILES.keys(), reverse=True)]
+        speed_options.append('Custom')
+        self.speed_var = tk.StringVar(value='5333 MT/s')
+        self.speed_combo = ttk.Combobox(spf, textvariable=self.speed_var, values=speed_options,
+            state='disabled', width=14, font=('Segoe UI', 9))
+        self.speed_combo.pack(side='left', padx=(8,0))
+        tk.Label(spf, text="(SPD timing capability \u2014 actual speed set via CBS/PBS)", bg=C_BGL, fg=C_FGD, font=('Segoe UI', 9)).pack(side='left', padx=(8,0))
         # SPD entry section label
         ttk.Label(left, text="SPD Entries to Modify", style='Section.TLabel').pack(anchor='w', pady=(4,4))
         # Button row — pack BEFORE canvas so buttons always visible at bottom
@@ -753,6 +803,8 @@ class APCBToolGUI:
         self.select_all_var = tk.BooleanVar(value=True)
         # Wire global target radio to sync per-entry dropdowns
         self.target_var.trace_add('write', self._sync_target_to_entries)
+        # Wire global SPD timings combo to sync per-entry dropdowns
+        self.speed_var.trace_add('write', self._sync_speed_to_entries)
         # RIGHT COLUMN — log output
         right = ttk.Frame(paned); paned.add(right, weight=1)
         lh = ttk.Frame(right); lh.pack(fill='x', pady=(8,4))
@@ -829,6 +881,21 @@ class APCBToolGUI:
             _he.pack(side='left', padx=(0,1))
             _he.configure(state='normal'); _he.insert(0, hdr_text); _he.configure(state='disabled')
         tk.Label(hdr, text='Current', **_hdr_kw).pack(side='left')
+        # Timing column headers (second line)
+        thdr = tk.Frame(self.entry_inner, bg=C_BGL); thdr.pack(fill='x', padx=8)
+        # Indent to align past checkbox + index
+        _thcb = ttk.Checkbutton(thdr, text=''); _thcb.pack(side='left'); _thcb.state(['disabled'])
+        tk.Label(thdr, text='', width=3, **_hdr_kw).pack(side='left')
+        # SPD Rate combo header — same width as row speed combo
+        _hsp = ttk.Combobox(thdr, values=['SPD Rate'], state='disabled', width=12, font=_hdr_font)
+        _hsp.set('SPD Rate'); _hsp.pack(side='left', padx=(2,2))
+        # Timing byte headers
+        for lbl in ['tCK', 'tAA', 'tRCD', 'tRPab', 'tRPpb']:
+            _ht = tk.Entry(thdr, font=_hdr_font, width=5, bg=C_BGL, fg=C_FGD, relief='flat',
+                borderwidth=1, highlightbackground=C_BDR, highlightthickness=1, state='disabled',
+                disabledbackground=C_BGL, disabledforeground=C_FGD)
+            _ht.pack(side='left', padx=(0,1))
+            _ht.configure(state='normal'); _ht.insert(0, lbl); _ht.configure(state='disabled')
         # Separator
         tk.Frame(self.entry_inner, bg=C_BDR, height=1).pack(fill='x', padx=8, pady=2)
         # Individual entry rows
@@ -939,6 +1006,50 @@ class APCBToolGUI:
             else:
                 cap_info = density_from_bytes(e.byte6, e.byte12)
             tk.Label(ef, text=cap_info, bg=C_BGL, fg=C_FGD, font=('Consolas', 8), anchor='w').pack(side='left')
+            # --- Timing row (second line per entry) ---
+            tf = tk.Frame(self.entry_inner, bg=C_BGL); tf.pack(fill='x', padx=8, pady=(0,2))
+            # Indent past checkbox + index (matching header alignment)
+            _tcb = ttk.Checkbutton(tf, text=''); _tcb.pack(side='left'); _tcb.state(['disabled'])
+            tk.Label(tf, text='', bg=C_BGL, width=3, font=('Consolas', 9)).pack(side='left')
+            # Speed dropdown per entry
+            current_speed = speed_from_tck(e.tCK_byte)
+            speed_options_entry = [SPEED_PROFILES[k]['name'] for k in sorted(SPEED_PROFILES.keys(), reverse=True)] + ['Custom']
+            speed_var = tk.StringVar(value=current_speed)
+            speed_combo = ttk.Combobox(tf, textvariable=speed_var, values=speed_options_entry,
+                state='disabled', width=12, font=('Consolas', 9))
+            speed_combo.pack(side='left', padx=(2,2))
+            # Timing hex fields: tCK, tAA, tRCD, tRPab, tRPpb
+            tCK_var = tk.StringVar(value=f"0x{e.tCK_byte:02X}")
+            tAA_var = tk.StringVar(value=f"0x{e.spd_bytes[SPD_BYTE_TAAMIN]:02X}" if len(e.spd_bytes) > SPD_BYTE_TAAMIN else "0x00")
+            tRCD_var = tk.StringVar(value=f"0x{e.spd_bytes[SPD_BYTE_TRCDMIN]:02X}" if len(e.spd_bytes) > SPD_BYTE_TRCDMIN else "0x00")
+            tRPab_var = tk.StringVar(value=f"0x{e.spd_bytes[SPD_BYTE_TRPABMIN]:02X}" if len(e.spd_bytes) > SPD_BYTE_TRPABMIN else "0x00")
+            tRPpb_var = tk.StringVar(value=f"0x{e.spd_bytes[SPD_BYTE_TRPPBMIN]:02X}" if len(e.spd_bytes) > SPD_BYTE_TRPPBMIN else "0x00")
+            timing_vars = [tCK_var, tAA_var, tRCD_var, tRPab_var, tRPpb_var]
+            timing_widgets = []
+            for tv in timing_vars:
+                tw = tk.Entry(tf, textvariable=tv, font=('Consolas', 9), width=5,
+                    bg=C_BGE, fg=C_FG, insertbackground=C_FG, relief='flat', borderwidth=1,
+                    highlightbackground=C_BDR, highlightthickness=1, state='disabled')
+                tw.pack(side='left', padx=(0,1))
+                tw.configure(validate='key', validatecommand=hex_vcmd)
+                timing_widgets.append(tw)
+            # Bidirectional sync: speed dropdown → tCK hex field
+            def _on_speed_changed(*args, sv=speed_var, tv=tCK_var):
+                val = sv.get()
+                tck = tck_from_speed(val)
+                if tck is not None:
+                    tv.set(f"0x{tck:02X}")
+            speed_var.trace_add('write', _on_speed_changed)
+            # Bidirectional sync: tCK hex field → speed dropdown
+            def _on_tck_changed(*args, sv=speed_var, tv=tCK_var):
+                try:
+                    tck = int(tv.get(), 16)
+                except (ValueError, TypeError):
+                    return
+                label = speed_from_tck(tck)
+                if sv.get() != label:
+                    sv.set(label)
+            tCK_var.trace_add('write', _on_tck_changed)
             # Store row data
             row = {
                 'index': i,
@@ -959,13 +1070,29 @@ class APCBToolGUI:
                 'original_density': current_density,
                 'max_name_len': field_len,
                 'has_name_field': has_name,
+                # SPD timing fields
+                'speed_var': speed_var,
+                'tCK_var': tCK_var,
+                'tAA_var': tAA_var,
+                'tRCD_var': tRCD_var,
+                'tRPab_var': tRPab_var,
+                'tRPpb_var': tRPpb_var,
+                'speed_widget': speed_combo,
+                'timing_widgets': timing_widgets,
+                'timing_frame': tf,
+                'original_tCK': e.tCK_byte,
+                'original_tAA': e.spd_bytes[SPD_BYTE_TAAMIN] if len(e.spd_bytes) > SPD_BYTE_TAAMIN else 0,
+                'original_tRCD': e.spd_bytes[SPD_BYTE_TRCDMIN] if len(e.spd_bytes) > SPD_BYTE_TRCDMIN else 0,
+                'original_tRPab': e.spd_bytes[SPD_BYTE_TRPABMIN] if len(e.spd_bytes) > SPD_BYTE_TRPABMIN else 0,
+                'original_tRPpb': e.spd_bytes[SPD_BYTE_TRPPBMIN] if len(e.spd_bytes) > SPD_BYTE_TRPPBMIN else 0,
             }
             self.entry_rows.append(row)
-            # Bind checkbox toggle to enable/disable widgets and sync density from global target
+            # Bind checkbox toggle to enable/disable widgets and sync density/timings from global
             cb.configure(command=lambda v=enabled_var, pw=prefix_combo, sw=suffix_entry,
                          cw=density_combo, b6w=byte6_entry, b12w=byte12_entry,
-                         hn=has_name, dv=density_var:
-                         self._on_entry_toggle(v, pw, sw, cw, b6w, b12w, hn, dv))
+                         hn=has_name, dv=density_var,
+                         scw=speed_combo, tws=timing_widgets, spv=speed_var:
+                         self._on_entry_toggle(v, pw, sw, cw, b6w, b12w, hn, dv, scw, tws, spv))
         # Bind mousewheel to all child widgets for scrolling
         self._bind_mousewheel_recursive(self.entry_inner)
 
@@ -982,8 +1109,10 @@ class APCBToolGUI:
     def _on_entry_toggle(self, var: 'tk.BooleanVar', pw: 'tk.Widget',
                          sw: 'tk.Widget', cw: 'tk.Widget',
                          b6w: 'tk.Widget', b12w: 'tk.Widget',
-                         has_name: bool, density_var: 'tk.StringVar') -> None:
-        """Handle per-entry checkbox toggle: enable/disable widgets and sync density."""
+                         has_name: bool, density_var: 'tk.StringVar',
+                         scw: 'tk.Widget' = None, tws: list = None,
+                         spv: 'tk.StringVar' = None) -> None:
+        """Handle per-entry checkbox toggle: enable/disable widgets and sync density/timings."""
         if var.get():
             if has_name:
                 pw.configure(state='readonly')
@@ -992,17 +1121,29 @@ class APCBToolGUI:
             b6w.configure(state='normal', fg=C_FG, insertbackground=C_FG)
             b12w.configure(state='normal', fg=C_FG, insertbackground=C_FG)
             density_var.set(f"{self.target_var.get()}GB")
+            # Enable SPD timing widgets
+            if scw: scw.configure(state='readonly')
+            if tws:
+                for tw in tws:
+                    tw.configure(state='normal', fg=C_FG, insertbackground=C_FG)
+            if spv: spv.set(self.speed_var.get())
         else:
             pw.configure(state='disabled')
             sw.configure(state='disabled', fg=C_FG, insertbackground=C_FG)
             cw.configure(state='disabled')
             b6w.configure(state='disabled')
             b12w.configure(state='disabled')
+            # Disable SPD timing widgets
+            if scw: scw.configure(state='disabled')
+            if tws:
+                for tw in tws:
+                    tw.configure(state='disabled')
 
     def _toggle_all(self):
         """Toggle all entry checkboxes and enable/disable widgets."""
         val = self.select_all_var.get()
         density_str = f"{self.target_var.get()}GB"
+        speed_str = self.speed_var.get()
         for row in self.entry_rows:
             row['enabled_var'].set(val)
             if val:
@@ -1013,12 +1154,26 @@ class APCBToolGUI:
                 row['byte6_widget'].configure(state='normal', fg=C_FG, insertbackground=C_FG)
                 row['byte12_widget'].configure(state='normal', fg=C_FG, insertbackground=C_FG)
                 row['density_var'].set(density_str)
+                # Enable SPD timing widgets
+                if 'speed_widget' in row:
+                    row['speed_widget'].configure(state='readonly')
+                if 'timing_widgets' in row:
+                    for tw in row['timing_widgets']:
+                        tw.configure(state='normal', fg=C_FG, insertbackground=C_FG)
+                if 'speed_var' in row:
+                    row['speed_var'].set(speed_str)
             else:
                 row['prefix_widget'].configure(state='disabled')
                 row['suffix_widget'].configure(state='disabled', fg=C_FG, insertbackground=C_FG)
                 row['combo_widget'].configure(state='disabled')
                 row['byte6_widget'].configure(state='disabled')
                 row['byte12_widget'].configure(state='disabled')
+                # Disable SPD timing widgets
+                if 'speed_widget' in row:
+                    row['speed_widget'].configure(state='disabled')
+                if 'timing_widgets' in row:
+                    for tw in row['timing_widgets']:
+                        tw.configure(state='disabled')
 
     def _sync_target_to_entries(self, *args):
         """When global target changes, update all checked entries' density dropdowns and hex fields."""
@@ -1028,6 +1183,14 @@ class APCBToolGUI:
             if row['enabled_var'].get():
                 row['density_var'].set(density_str)
                 # Hex fields are auto-updated by the density_var trace callback
+
+    def _sync_speed_to_entries(self, *args):
+        """When global SPD timings dropdown changes, update all checked entries."""
+        speed = self.speed_var.get()
+        for row in self.entry_rows:
+            if row['enabled_var'].get() and 'speed_var' in row:
+                row['speed_var'].set(speed)
+                # tCK hex field is auto-updated by the speed_var trace callback
 
     def _on_variant_changed(self, event=None):
         """Handle user changing the Steam Deck variant dropdown."""
@@ -1106,6 +1269,8 @@ class APCBToolGUI:
         else:
             self.screen_var.set('None')
             self.screen_combo.configure(state='disabled')
+        # Enable SPD timings dropdown on file load
+        self.speed_combo.configure(state='readonly')
         self._log(f"Format: {'PE firmware (.fd)' if data[:2]==b'MZ' else 'Raw SPI dump'}", 'dim')
         self._log("Scanning...", 'dim')
         self.blocks = find_apcb_blocks(data)
@@ -1194,13 +1359,36 @@ class APCBToolGUI:
                     custom_b6 = int(row['byte6_var'].get(), 16)
                     custom_b12 = int(row['byte12_var'].get(), 16)
                 except (ValueError, TypeError):
-                    messagebox.showerror("Invalid Hex", f"Entry [{row['index']+1}] has invalid hex values."); return
-                entry_mods.append({'index': row['index'], 'target_gb': None,
-                                   'custom_byte6': custom_b6, 'custom_byte12': custom_b12,
-                                   'new_name': name_to_write})
+                    messagebox.showerror("Invalid Hex", f"Entry [{row['index']+1}] has invalid density hex values."); return
+                mod = {'index': row['index'], 'target_gb': None,
+                       'custom_byte6': custom_b6, 'custom_byte12': custom_b12,
+                       'new_name': name_to_write}
             else:
                 target_gb = int(density_val.replace('GB', ''))
-                entry_mods.append({'index': row['index'], 'target_gb': target_gb, 'new_name': name_to_write})
+                mod = {'index': row['index'], 'target_gb': target_gb, 'new_name': name_to_write}
+            # Collect timing byte modifications if any changed from original
+            if 'tCK_var' in row:
+                try:
+                    timing_tCK = int(row['tCK_var'].get(), 16)
+                    timing_tAA = int(row['tAA_var'].get(), 16)
+                    timing_tRCD = int(row['tRCD_var'].get(), 16)
+                    timing_tRPab = int(row['tRPab_var'].get(), 16)
+                    timing_tRPpb = int(row['tRPpb_var'].get(), 16)
+                except (ValueError, TypeError):
+                    messagebox.showerror("Invalid Hex", f"Entry [{row['index']+1}] has invalid timing hex values."); return
+                timing_changed = (
+                    timing_tCK != row['original_tCK'] or
+                    timing_tAA != row['original_tAA'] or
+                    timing_tRCD != row['original_tRCD'] or
+                    timing_tRPab != row['original_tRPab'] or
+                    timing_tRPpb != row['original_tRPpb']
+                )
+                if timing_changed:
+                    mod['timing'] = {
+                        'tCK': timing_tCK, 'tAA': timing_tAA,
+                        'tRCD': timing_tRCD, 'tRPab': timing_tRPab, 'tRPpb': timing_tRPpb
+                    }
+            entry_mods.append(mod)
         if not entry_mods:
             messagebox.showwarning("No Entries Selected", "Select at least one SPD entry to modify."); return
         # Determine output filename from most common target
@@ -1233,7 +1421,14 @@ class APCBToolGUI:
         self._log(f"  Entries: {len(entry_mods)} selected", 'accent')
         for mod in entry_mods:
             name_note = f" → '{mod['new_name']}'" if mod['new_name'] else ''
-            self._log(f"    [{mod['index']+1}] → {mod['target_gb']}GB{name_note}", 'dim')
+            density_note = f"{mod['target_gb']}GB" if mod.get('target_gb') else 'Custom'
+            timing_note = ''
+            if mod.get('timing'):
+                t = mod['timing']
+                tck_ns = t['tCK'] * SPD_MTB_PS / 1000
+                mts = int(2000 / tck_ns) if tck_ns > 0 else 0
+                timing_note = f" | SPD tCK: {mts} MT/s (0x{t['tCK']:02X})"
+            self._log(f"    [{mod['index']+1}] → {density_note}{name_note}{timing_note}", 'dim')
         self._log(f"  Output: Flash via SPI programmer", 'dim')
         # Resolve screen selection to profile key
         screen_selection = self.screen_var.get()
