@@ -16,7 +16,8 @@ Patches the APCB (AMD Platform Configuration Block) SPD entries in firmware to r
 - **All Chip Brands** -- Patches all SPD entries by default (Micron, Samsung, SK Hynix, etc.)
 - **DMI Backup & Restore** -- Export/import device identity (serial, UUID) for brick recovery
 - **Cross-platform** -- Works on Windows, Linux, macOS, and Steam Deck itself
-- **GUI** -- Two-column layout with per-entry checkboxes, capacity dropdowns, screen patch selector, DMI tools, and dark theme
+- **SPD Timing Editor** -- Per-entry editing of SPD timing bytes (tCK, tAA, tRCD, tRPab, tRPpb) with speed presets and raw hex fields
+- **GUI** -- Two-column layout with per-entry checkboxes, capacity dropdowns, SPD timing editor, screen patch selector, DMI tools, and dark theme
 
 ## Quick Start
 
@@ -67,7 +68,7 @@ python sd_apcb_tool.py modify modified.bin stock.bin --target 16
 python sd_apcb_gui.py
 ```
 
-Open your BIOS file, select your target memory size per entry via capacity dropdowns, optionally select a screen replacement from the dropdown, and click "Apply Modification".
+Open your BIOS file, select your target memory size per entry via capacity dropdowns, optionally adjust SPD timing presets, optionally select a screen replacement from the dropdown, and click "Apply Modification".
 
 ## Interactive CLI Guide
 
@@ -79,7 +80,7 @@ When you enter interactive mode, you'll see a summary of the loaded firmware:
 
 ```
   ========================================================================
-    APCB Memory Configuration Tool v1.7.0 -- Interactive Mode
+    APCB Memory Configuration Tool v1.9.0 -- Interactive Mode
   ========================================================================
 
   Device:  Steam Deck (auto-detected)
@@ -386,6 +387,18 @@ The tool patches two bytes in each SPD (Serial Presence Detect) entry of every A
 | byte[6] | SPD+6 | `0x95` | `0xB5` | `0xF5` | Package type (SPD_BYTE_PKG_TYPE) |
 | byte[12] | SPD+12 | `0x02` | `0x0A` | `0x49` | Configuration |
 
+The GUI also supports editing five SPD timing bytes per entry:
+
+| Byte | Offset | Purpose |
+|------|--------|---------|
+| byte[18] | SPD+18 | tCKmin (min clock cycle time) |
+| byte[24] | SPD+24 | tAAmin (min CAS latency) |
+| byte[26] | SPD+26 | tRCDmin (min RAS-to-CAS delay) |
+| byte[27] | SPD+27 | tRPABmin (min row precharge, all banks) |
+| byte[28] | SPD+28 | tRPPBmin (min row precharge, per bank) |
+
+**Important: SPD timing bytes describe chip capabilities, not actual speed.** The SPD data in the APCB tells the firmware what timing values the memory chip *supports* (minimums). The actual memory speed and frequency are controlled separately by AMD CBS/PBS settings -- UEFI runtime variables that can be configured through tools like [Smokeless_UMAF](https://github.com/DavidS95/Smokeless_UMAF). For example, all Steam Deck firmware ships with identical tCK=0x03 in the SPD despite LCD running at 5500 MT/s and OLED at 6400 MT/s. Editing SPD timing bytes is useful for describing your replacement RAM's capabilities to the firmware, but it will not change the speed your memory actually runs at.
+
 All SPD entries are patched by default, covering every memory manufacturer (Micron, Samsung, SK Hynix, etc.). Both the CLI (interactive and batch) and GUI provide per-entry control if you want to be selective.
 
 After patching, the APCB block checksum is recalculated to maintain validity.
@@ -500,7 +513,8 @@ The GUI (`sd_apcb_gui.py`) provides the same capabilities as the CLI with a grap
 - **File Selection** -- Browse for input BIOS file, auto-generates output filename
 - **Device Detection** -- Auto-detects device type and displays it
 - **Memory Target** -- Radio buttons for 16GB/32GB/64GB (device-appropriate options enabled)
-- **SPD Entry List** -- Scrollable list with per-entry checkboxes, capacity dropdowns, and editable module names
+- **SPD Entry List** -- Scrollable list with per-entry checkboxes, capacity dropdowns, editable module names, and SPD timing fields
+- **SPD Timing Editor** -- Global "SPD Timings" dropdown with speed presets (8000/5333/4000/3200 MT/s) plus per-entry raw hex fields for tCK, tAA, tRCD, tRPab, tRPpb. Dropdown and hex fields stay in sync bidirectionally. Note: these describe the chip's timing capabilities -- actual memory speed is set via CBS/PBS UEFI settings
 - **Screen Replacement** -- Dropdown selector: None, DeckHD 1200p, DeckSight OLED (enabled for Steam Deck LCD only)
 - **DMI Export/Import** -- Backup and restore device identity (serial, UUID) for brick recovery
 - **Select All** -- Toggle all SPD entry checkboxes on/off
@@ -525,6 +539,16 @@ The AMD Platform Configuration Block (APCB) contains memory training parameters 
 - 32-byte header with magic (`APCB`), sizes, and checksum
 - Content type marker: `MEMG` for memory (Steam Deck at offset 0x80; ROG Ally at 0xC0; Ally X at 0xC8), `TOKN` for tokens
 - For MEMG blocks: multiple SPD entries each starting with magic `23 11 13 0E` (LPDDR5) or `23 11 15 0E` (LPDDR5X)
+
+### SPD Timing vs Actual Speed
+
+AMD platforms control memory speed at two independent layers:
+
+1. **APCB/SPD layer** (what this tool modifies) -- The SPD timing bytes embedded in firmware describe the memory chip's timing *capabilities*: minimum clock cycle (tCK), CAS latency (tAA), etc. These are static values baked into the BIOS image. They tell the firmware what the chip can handle, not what speed to run at.
+
+2. **CBS/PBS layer** (not modified by this tool) -- The actual memory frequency is set by AMD CBS (Common BIOS Settings) and PBS (Promontory BIOS Settings) variables stored in UEFI NVRAM. These are runtime settings accessible through hidden BIOS menus (e.g. via [Smokeless_UMAF](https://github.com/DavidS95/Smokeless_UMAF)) under AMD CBS > UMC Common Options > DDR Options.
+
+This is why all Steam Deck firmware ships with identical SPD timing bytes (tCK=0x03, i.e. 5333 MT/s) despite LCD running at 5500 MT/s and OLED at 6400 MT/s -- the actual speed is set by CBS/PBS, not by the SPD data. The standard LPDDR5 speeds (5500, 6400 MT/s) cannot even be represented as integer MTB (Medium Time Base) values in the SPD byte format.
 
 ### Screen Patch Architecture
 

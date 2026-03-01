@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-APCB Memory Configuration Tool v1.8.0
+APCB Memory Configuration Tool v1.9.0
 ======================================
 Automated BIOS modification tool for handheld gaming device RAM upgrades.
 
@@ -73,7 +73,7 @@ class MemoryTarget(IntEnum):
 # Constants
 # ============================================================================
 
-TOOL_VERSION = "1.8.0"
+TOOL_VERSION = "1.9.0"
 
 # Steam Deck firmware filename prefixes for LCD vs OLED variant detection
 SD_LCD_PREFIX = 'F7A'                            # Jupiter (LCD) firmware files
