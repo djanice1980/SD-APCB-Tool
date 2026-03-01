@@ -2920,7 +2920,7 @@ Supported devices:
     modify_parser.add_argument('--sign', action='store_true',
                               help='Sign the output firmware (auto-enabled for .fd output)')
     modify_parser.add_argument('--signing-key', metavar='KEY_PEM',
-                              help='Path to RSA private key PEM file (from secureflash_esl.py). '
+                              help='Path to existing RSA private key PEM file. '
                                    'If omitted, generates a fresh key pair.')
 
     # DMI export command

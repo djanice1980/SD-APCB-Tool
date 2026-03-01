@@ -637,7 +637,7 @@ def main():
         print("  ASSESSMENT: VULNERABLE")
         print("  This device is vulnerable to CVE-2025-4275.")
         print("  Certificate injection via SecureFlashCertData is possible.")
-        print("  You can proceed with secureflash_esl.py to generate signing materials.")
+        print("  You can proceed with secureflash_flash.py to inject a certificate and flash.")
     elif is_patched:
         print("  ASSESSMENT: PATCHED")
         print("  This device appears to have VariablePolicy protection.")

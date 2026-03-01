@@ -51,22 +51,6 @@ Checks:
 - Firmware vendor/version info (detects Jupiter/LCD and Galileo/OLED)
 - h2offt presence
 
-### `secureflash_esl.py` — Key Pair + ESL Generator
-
-Generates RSA-2048 signing materials for certificate injection. Can run on any system with Python 3.8+. Not needed if you use `sd_apcb_tool.py` to sign (it generates key + ESL automatically).
-
-```bash
-python3 secureflash_esl.py [--output-dir DIR] [--cn NAME] [--days N]
-```
-
-Produces:
-- `signing_key.pem` — RSA-2048 private key
-- `signing_cert.pem` — Self-signed X.509 certificate (PEM)
-- `signing_cert.der` — Self-signed X.509 certificate (DER)
-- `signing_cert.esl` — EFI_SIGNATURE_LIST blob (ready for NVRAM injection)
-
-Uses the `cryptography` library if available, falls back to pure Python RSA.
-
 ## Typical Workflow
 
 ```
@@ -82,7 +66,7 @@ Steam Deck: sudo python3 secureflash_flash.py
 ## Requirements
 
 - Python 3.8+
-- `cryptography` library (optional, for secureflash_esl.py key generation speed)
+- `cryptography` library (optional, for faster key generation)
 - Root access on target device (for all on-device tools)
 - Linux with efivarfs (SteamOS)
 

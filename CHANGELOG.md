@@ -7,10 +7,9 @@ All notable changes to the APCB Memory Mod Tool.
 ### Added
 - **PE Authenticode signing restored** -- Full firmware signing support via CVE-2025-4275 (Hydroph0bia) certificate injection. When saving as `.fd`, the tool automatically signs the firmware with a self-signed RSA-2048 certificate and generates an EFI_SIGNATURE_LIST (ESL) blob for NVRAM injection. This enables flashing modified firmware via h2offt on Steam Deck without needing the Insyde QA.pfx private key.
 - **`--sign` CLI flag** -- Explicitly request firmware signing regardless of output file extension.
-- **`--signing-key` CLI option** -- Use an existing RSA private key PEM file (e.g. from `secureflash_esl.py`) instead of generating a fresh key pair each time.
+- **`--signing-key` CLI option** -- Use an existing RSA private key PEM file instead of generating a fresh key pair each time.
 - **Auto-sign for `.fd` output** -- When the output file has a `.fd` extension, signing is automatically enabled for PE firmware files. Default `.bin` output remains unsigned (SPI programmer path).
 - **`signing/secureflash_check.py`** -- NVRAM vulnerability scanner that checks whether a device is vulnerable to CVE-2025-4275 SecureFlash certificate injection. Detects Insyde H2O firmware via multiple signals (vendor string, h2offt presence, SecureFlash NVRAM variables, F7 version prefix). Recognizes both Steam Deck LCD (Jupiter) and OLED (Galileo) codenames.
-- **`signing/secureflash_esl.py`** -- Key pair and ESL generator that produces RSA-2048 signing materials (PEM key, DER cert, ESL blob) for certificate injection.
 - **Inline `build_esl()` function** -- EFI_SIGNATURE_LIST builder available in both CLI and GUI for generating NVRAM injection blobs alongside signed firmware.
 - **GUI signing integration** -- GUI automatically signs when saving as `.fd`, generates key + ESL files, and shows signing status in the log and success dialog with NVRAM injection instructions.
 - **`signing/secureflash_flash.py`** -- Guided flash utility for Steam Deck. Interactive step-by-step flow: auto-detects `.fd` and `.esl` files, injects certificate into NVRAM, flashes via h2offt. Supports `--revert` to remove injected certificate.
