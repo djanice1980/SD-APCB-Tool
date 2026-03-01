@@ -13,6 +13,7 @@ All notable changes to the APCB Memory Mod Tool.
 - **`signing/secureflash_esl.py`** -- Key pair and ESL generator that produces RSA-2048 signing materials (PEM key, DER cert, ESL blob) for certificate injection.
 - **Inline `build_esl()` function** -- EFI_SIGNATURE_LIST builder available in both CLI and GUI for generating NVRAM injection blobs alongside signed firmware.
 - **GUI signing integration** -- GUI automatically signs when saving as `.fd`, generates key + ESL files, and shows signing status in the log and success dialog with NVRAM injection instructions.
+- **`signing/secureflash_flash.py`** -- Guided flash utility for Steam Deck. Interactive step-by-step flow: auto-detects `.fd` and `.esl` files, injects certificate into NVRAM, flashes via h2offt. Supports `--revert` to remove injected certificate.
 
 ### Changed
 - Version bumped to 2.0.0 in all files (major feature: firmware signing)

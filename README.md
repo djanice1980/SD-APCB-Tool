@@ -474,41 +474,37 @@ The tool automatically generates three output files:
 
 ### Step 2: Transfer to Steam Deck
 
-Copy the `.fd` and `.esl` files to the Steam Deck (USB drive, scp, etc.). The `_key.pem` file stays on your computer.
+Copy three files to the Steam Deck (USB drive, scp, etc.):
+- `F7G0112_32GB.fd` — signed firmware
+- `F7G0112_32GB_cert.esl` — certificate for NVRAM injection
+- `signing/secureflash_flash.py` — guided flash utility
 
-### Step 3: Inject Certificate into NVRAM (on Steam Deck)
+The `_key.pem` file stays on your computer (for re-signing later).
 
-Write the certificate ESL to the SecureFlashCertData NVRAM variable:
+### Step 3: Flash (on Steam Deck)
 
-```bash
-sudo cp F7G0112_32GB_cert.esl \
-  /sys/firmware/efi/efivars/SecureFlashCertData-382af2bb-ffff-abcd-aaee-cce099338877
-```
-
-This makes h2offt trust firmware signed with your certificate.
-
-### Step 4: Flash with h2offt (on Steam Deck)
+Switch to Desktop Mode, open Konsole, navigate to the directory with your files, and run:
 
 ```bash
-sudo /usr/share/jupiter_bios_updater/h2offt F7G0112_32GB.fd
+sudo python3 secureflash_flash.py
 ```
 
-h2offt reads `SecureFlashCertData` from NVRAM, finds the injected certificate, verifies the firmware's Authenticode signature against it, and proceeds with the flash.
+The utility auto-detects the `.fd` and `.esl` files in the current directory and guides you through:
+1. Pre-flight checks (root, efivarfs, h2offt, device detection)
+2. Certificate injection into NVRAM (if not already done)
+3. Firmware flashing via h2offt (with confirmation prompts)
 
-### Step 5: Reboot
+h2offt automatically reboots the system on a successful flash. The Steam Deck boots with modified firmware.
 
-The Steam Deck reboots with modified firmware.
+### Cleanup (optional, after reboot)
 
-### Step 6: Cleanup (optional)
-
-Remove the injected certificate from NVRAM after a successful flash:
+The signing certificate remains in NVRAM after flashing. To remove it:
 
 ```bash
-sudo chattr -i /sys/firmware/efi/efivars/SecureFlashCertData-382af2bb-ffff-abcd-aaee-cce099338877
-sudo rm /sys/firmware/efi/efivars/SecureFlashCertData-382af2bb-ffff-abcd-aaee-cce099338877
+sudo python3 secureflash_flash.py --revert
 ```
 
-Or leave it in place — the certificate only means h2offt will accept firmware signed with your key, which is useful if you need to re-flash later.
+Or leave it — the certificate only means h2offt will accept firmware signed with your key, which is useful if you need to re-flash later.
 
 ### Re-signing with an existing key
 
@@ -520,11 +516,12 @@ python sd_apcb_tool.py modify new_bios.fd new_bios_mod.fd --target 32 --signing-
 
 Since the matching certificate is already in NVRAM, h2offt will accept the new firmware without repeating Steps 3-4.
 
-### Research tools
+### Signing tools
 
-The `signing/` directory contains standalone diagnostic tools:
-- `secureflash_check.py` — Checks if your device is vulnerable to CVE-2025-4275. Detects Insyde H2O firmware via multiple signals and recognizes both Steam Deck LCD (Jupiter) and OLED (Galileo).
-- `secureflash_esl.py` — Generates an RSA-2048 key pair + ESL blob independently (for advanced use or testing the NVRAM injection separately).
+The `signing/` directory contains standalone utilities (all run on Steam Deck):
+- `secureflash_flash.py` — **Guided flash utility.** Handles cert injection + h2offt flashing with interactive prompts. Also supports `--revert` to remove the injected cert.
+- `secureflash_check.py` — NVRAM vulnerability scanner. Checks if your device is vulnerable to CVE-2025-4275. Run this first.
+- `secureflash_esl.py` — Key pair + ESL generator (for advanced use; not needed if `sd_apcb_tool.py` handles signing).
 
 ### Important notes
 
@@ -633,9 +630,10 @@ The GUI (`sd_apcb_gui.py`) provides the same capabilities as the CLI with a grap
 ```
 sd_apcb_tool.py                 -- CLI tool (analysis, modification, signing, interactive editor)
 sd_apcb_gui.py                  -- GUI application (same engine, graphical interface)
+signing/secureflash_flash.py    -- Guided flash utility (cert injection + h2offt, runs on Steam Deck)
 signing/secureflash_check.py    -- NVRAM vulnerability scanner (CVE-2025-4275)
 signing/secureflash_esl.py      -- Key pair + ESL generator for certificate injection
-signing/README.md               -- Signing research tools documentation
+signing/README.md               -- Signing & flash tools documentation
 README.md                       -- This file
 CHANGELOG.md                    -- Version history
 ```
