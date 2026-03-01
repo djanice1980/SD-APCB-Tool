@@ -15,6 +15,8 @@ All notable changes to the APCB Memory Mod Tool.
 - **`signing/secureflash_flash.py`** -- Guided flash utility for Steam Deck. Interactive step-by-step flow: auto-detects `.fd` and `.esl` files, injects certificate into NVRAM, flashes via h2offt. Supports `--revert` to remove injected certificate.
 
 ### Changed
+- **Standardized signing filenames** -- Key and ESL files now use fixed names (`signing_key.pem`, `signing_cert.esl`) in the output directory, making the keypair reusable across firmware builds. If an existing key is found, the tool asks whether to reuse it.
+- **GUI save dialog** -- PE firmware files now default to `.fd` extension with "FD firmware (signed)" as the first file type option. Non-PE files continue defaulting to `.bin`.
 - Version bumped to 2.0.0 in all files (major feature: firmware signing)
 - `hashlib` and `datetime` imports restored (needed by signing code)
 - `cryptography` library is optional but recommended for signing (pure-Python RSA fallback available in key generation tools)

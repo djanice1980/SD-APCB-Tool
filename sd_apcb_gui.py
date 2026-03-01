@@ -1876,8 +1876,12 @@ class APCBToolGUI:
         elif primary_target == 32: suffix = '_32GB'
         elif primary_target == 16: suffix = '_stock'
         else: suffix = '_custom'
-        dn = f"{sp.stem}{suffix}.bin"  # Always output as .bin (SPI flash image)
-        ftypes = [("BIN files", "*.bin"), ("All files", "*.*")]
+        if _is_pe_firmware(self.loaded_data):
+            dn = f"{sp.stem}{suffix}.fd"
+            ftypes = [("FD firmware (signed)", "*.fd"), ("BIN files (SPI)", "*.bin"), ("All files", "*.*")]
+        else:
+            dn = f"{sp.stem}{suffix}.bin"
+            ftypes = [("BIN files", "*.bin"), ("All files", "*.*")]
         op = filedialog.asksaveasfilename(title="Save Modified BIOS As", initialfile=dn, initialdir=str(sp.parent),
             filetypes=ftypes)
         if not op: return
@@ -1941,14 +1945,30 @@ class APCBToolGUI:
             if op.lower().endswith('.fd') and _is_pe_firmware(self.loaded_data):
                 if _check_signing_available():
                     self._log(f"\n  Signing firmware for h2offt...", 'accent')
-                    signed_data, key_pem, cert_der = sign_firmware(od)
+                    out_dir = os.path.dirname(op) or '.'
+                    key_file = os.path.join(out_dir, 'signing_key.pem')
+                    esl_file = os.path.join(out_dir, 'signing_cert.esl')
+                    existing_key = None
+                    # Check for existing key in output directory
+                    if os.path.isfile(key_file):
+                        reuse = messagebox.askyesno("Reuse Signing Key",
+                            f"Found existing signing_key.pem in the output directory.\n\n"
+                            f"Reuse this key? (Same certificate stays valid in NVRAM)")
+                        if reuse:
+                            existing_key = key_file
+                            self._log(f"  Reusing existing signing key", 'dim')
+                    # Find cert alongside key if reusing
+                    cert_path = None
+                    if existing_key:
+                        cert_der_path = os.path.join(out_dir, 'signing_cert.der')
+                        if os.path.isfile(cert_der_path):
+                            cert_path = cert_der_path
+                    signed_data, key_pem, cert_der = sign_firmware(od, existing_key, cert_path)
                     od = signed_data
-                    base = os.path.splitext(op)[0]
-                    key_file = f"{base}_key.pem"
-                    esl_file = f"{base}_cert.esl"
-                    with open(key_file, 'wb') as f: f.write(key_pem)
-                    esl_blob = build_esl(cert_der)
-                    with open(esl_file, 'wb') as f: f.write(esl_blob)
+                    if not existing_key:
+                        with open(key_file, 'wb') as f: f.write(key_pem)
+                        esl_blob = build_esl(cert_der)
+                        with open(esl_file, 'wb') as f: f.write(esl_blob)
                     self._log(f"  Signed with PE Authenticode", 'success')
                     self._log(f"  Key:  {os.path.basename(key_file)}", 'dim')
                     self._log(f"  ESL:  {os.path.basename(esl_file)} (inject into NVRAM before flashing)", 'dim')
