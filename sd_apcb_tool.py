@@ -18,8 +18,7 @@ Core modification: patches LPDDR5/LPDDR5X SPD density bytes in APCB MEMG blocks
 
 Flashing:
   - SPI programmer (CH341A + SOIC8 clip): Writes raw .bin image directly to
-    the flash chip. Supported by all devices.
-  - .fd files: Use the manufacturer's update tool (e.g. h2offt for Steam Deck).
+    the flash chip. Modified output is always .bin format for SPI flashing.
 
 Supports:
   - Analysis mode: scans BIOS and reports all APCB blocks and SPD entries
@@ -2029,10 +2028,7 @@ def modify_bios(input_path: str, output_path: str, target_gb: int,
     
     if all_ok:
         print(f"\n  *** MODIFICATION SUCCESSFUL ***")
-        if _is_pe_firmware(bytes(data)):
-            print(f"  Flash this file using the manufacturer's update tool (e.g. h2offt).")
-        else:
-            print(f"  Output file is ready for SPI flash.")
+        print(f"  Flash via SPI programmer.")
         if device_profile:
             flash_instr = device_profile.get('flash_instructions', '')
             if flash_instr:
@@ -2505,10 +2501,7 @@ def _apply_changes(state: InteractiveState) -> bool:
 
     if all_ok:
         print(f"\n  {c.OK}{c.BOLD}*** MODIFICATION SUCCESSFUL ***{c.RESET}")
-        if _is_pe_firmware(bytes(data)):
-            print(f"  Flash using the manufacturer's update tool (e.g. h2offt).")
-        else:
-            print(f"  Ready for SPI flash.")
+        print(f"  Flash via SPI programmer.")
     else:
         print(f"\n  {c.ERR}{c.BOLD}*** VERIFICATION FAILED ***{c.RESET}")
         print(f"  {c.ERR}DO NOT flash this file!{c.RESET}")
