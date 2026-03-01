@@ -2,6 +2,17 @@
 
 All notable changes to the APCB Memory Mod Tool.
 
+## [1.9.0] - 2025-03-01
+
+### Added
+- **SPD timing editor (GUI)** -- Per-entry editing of SPD timing bytes (tCK, tAA, tRCD, tRPab, tRPpb) with speed preset dropdown (8000/5333/4000/3200 MT/s) and raw hex fields. Global "SPD Timings" dropdown syncs to all checked entries. Dropdown and hex fields stay in bidirectional sync (changing one updates the other). Note: SPD timing bytes describe the chip's timing capabilities; actual memory speed is controlled by CBS/PBS UEFI settings, not by SPD data.
+- **Steam Deck LCD/OLED variant detection** -- Firmware analysis distinguishes LCD (F7A) and OLED (F7G) variants, showing chip count info (LCD: 4 packages, OLED: 2 packages) in the GUI.
+- **Hex byte editing** -- Direct hex field editing for density bytes (byte[6], byte[12]) with bidirectional sync to the capacity dropdown.
+
+### Changed
+- Version bumped to 1.9.0 in all files
+- README updated with SPD timing documentation, CBS/PBS speed clarification, and new "SPD Timing vs Actual Speed" technical section
+
 ## [1.8.0] - 2025-02-22
 
 ### Removed

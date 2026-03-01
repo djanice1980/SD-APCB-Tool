@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-APCB Memory Mod Tool (GUI) v1.8.0
+APCB Memory Mod Tool (GUI) v1.9.0
 ===================================
 GUI for analyzing and modifying handheld device BIOS files
 to support 16GB/32GB/64GB memory configurations.
@@ -49,7 +49,7 @@ class MemoryTarget(IntEnum):
 
 
 APP_TITLE = "SD APCB Memory Mod Tool"
-APP_VERSION = "1.8.0"
+APP_VERSION = "1.9.0"
 
 # Steam Deck firmware filename prefixes for LCD vs OLED variant detection
 SD_LCD_PREFIX = 'F7A'     # Jupiter (LCD)
