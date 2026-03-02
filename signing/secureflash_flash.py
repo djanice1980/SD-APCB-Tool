@@ -41,10 +41,15 @@ SECUREFLASH_GUID = "382af2bb-ffff-abcd-aaee-cce099338877"
 
 # Variable names
 CERT_VAR_NAME = "SecureFlashCertData"
+MODE_VAR_NAME = "SecureFlashSetupMode"
 
 # Full efivarfs paths
 EFIVARFS_PATH = "/sys/firmware/efi/efivars"
 CERT_VAR_PATH = f"{EFIVARFS_PATH}/{CERT_VAR_NAME}-{SECUREFLASH_GUID}"
+MODE_VAR_PATH = f"{EFIVARFS_PATH}/{MODE_VAR_NAME}-{SECUREFLASH_GUID}"
+
+# UEFI variable attributes: NV|BS|RT (non-volatile, boot service, runtime access)
+NV_BS_RT_ATTRS = struct.pack('<I', 0x00000007)
 
 # h2offt known locations
 H2OFFT_PATHS = [
@@ -406,10 +411,11 @@ def get_nvram_cert_cn() -> str:
 
 
 def inject_certificate(esl_path: str):
-    """Write ESL file to SecureFlashCertData NVRAM variable."""
+    """Write ESL file to SecureFlashCertData and set SecureFlashSetupMode trigger."""
     with open(esl_path, 'rb') as f:
         blob = f.read()
 
+    # Write SecureFlashCertData
     try:
         with open(CERT_VAR_PATH, 'wb') as f:
             f.write(blob)
@@ -432,29 +438,71 @@ def inject_certificate(esl_path: str):
     attrs, data = _read_efivar(CERT_VAR_PATH)
     if attrs is None:
         _abort("Certificate injection failed — could not read back variable.")
-    _status("OK", "Certificate injected into NVRAM successfully.")
+    _status("OK", "SecureFlashCertData injected into NVRAM.")
+
+    # Set SecureFlashSetupMode trigger (required for SecurityStubDxe to use the cert)
+    mode_blob = NV_BS_RT_ATTRS + b'\x01'  # 4 bytes attrs + 1 byte trigger value
+    try:
+        with open(MODE_VAR_PATH, 'wb') as f:
+            f.write(mode_blob)
+    except OSError as e:
+        _status("WARN", f"Could not set SecureFlashSetupMode: {e}")
+        _status("INFO", "Certificate was injected but the trigger may be missing.")
+        return
+
+    # Verify trigger
+    attrs, data = _read_efivar(MODE_VAR_PATH)
+    if attrs is not None and len(data) >= 1 and data[0] == 1:
+        _status("OK", "SecureFlashSetupMode trigger set (value=1).")
+    else:
+        _status("WARN", "SecureFlashSetupMode write may not have persisted.")
 
 
-def remove_certificate() -> bool:
-    """Remove SecureFlashCertData from NVRAM. Returns True on success."""
-    if not os.path.exists(CERT_VAR_PATH):
-        _status("SKIP", "No SecureFlashCertData variable found in NVRAM.")
-        return True
+def _remove_efivar(path: str, name: str) -> bool:
+    """Remove a single efivar. Returns True on success."""
+    if not os.path.exists(path):
+        return True  # Already gone
 
     # Remove immutable flag (efivarfs sets this automatically)
     try:
-        subprocess.run(['chattr', '-i', CERT_VAR_PATH],
+        subprocess.run(['chattr', '-i', path],
                        capture_output=True, timeout=10)
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass  # chattr may not be available, try rm anyway
 
     try:
-        os.unlink(CERT_VAR_PATH)
+        os.unlink(path)
         return True
     except OSError as e:
-        _status("FAIL", f"Could not remove certificate: {e}")
-        _status("INFO", "Try manually: sudo chattr -i <path> && sudo rm <path>")
+        _status("FAIL", f"Could not remove {name}: {e}")
+        _status("INFO", f"Try manually: sudo chattr -i {path} && sudo rm {path}")
         return False
+
+
+def remove_certificate() -> bool:
+    """Remove SecureFlashCertData and SecureFlashSetupMode from NVRAM."""
+    has_cert = os.path.exists(CERT_VAR_PATH)
+    has_mode = os.path.exists(MODE_VAR_PATH)
+
+    if not has_cert and not has_mode:
+        _status("SKIP", "No SecureFlash variables found in NVRAM.")
+        return True
+
+    success = True
+
+    if has_cert:
+        if _remove_efivar(CERT_VAR_PATH, "SecureFlashCertData"):
+            _status("OK", "SecureFlashCertData removed.")
+        else:
+            success = False
+
+    if has_mode:
+        if _remove_efivar(MODE_VAR_PATH, "SecureFlashSetupMode"):
+            _status("OK", "SecureFlashSetupMode removed.")
+        else:
+            success = False
+
+    return success
 
 
 def replace_certificate(esl_path: str):
@@ -553,7 +601,20 @@ def main_flash(args):
         cert_status = check_existing_cert(esl_path)
 
         if cert_status == 'same':
-            _status("OK", "Certificate already in NVRAM and matches. Ready to flash.")
+            _status("OK", "Certificate already in NVRAM and matches.")
+            # Ensure SecureFlashSetupMode trigger is also set
+            mode_attrs, mode_data = _read_efivar(MODE_VAR_PATH)
+            if mode_attrs is None or len(mode_data) < 1 or mode_data[0] != 1:
+                _status("INFO", "SecureFlashSetupMode trigger not set — setting now.")
+                mode_blob = NV_BS_RT_ATTRS + b'\x01'
+                try:
+                    with open(MODE_VAR_PATH, 'wb') as f:
+                        f.write(mode_blob)
+                    _status("OK", "SecureFlashSetupMode trigger set (value=1).")
+                except OSError as e:
+                    _status("WARN", f"Could not set SecureFlashSetupMode: {e}")
+            else:
+                _status("OK", "SecureFlashSetupMode trigger is set. Ready to flash.")
         elif cert_status == 'different':
             nvram_cn = get_nvram_cert_cn() or '(unknown)'
             _status("!", f"A DIFFERENT certificate is in NVRAM (CN={nvram_cn})")
@@ -606,20 +667,30 @@ def main_revert(args):
 
     _step(1, "Check NVRAM Certificate")
 
-    attrs, data = _read_efivar(CERT_VAR_PATH)
-    if attrs is None:
-        _status("INFO", "No SecureFlashCertData variable found in NVRAM.")
+    has_cert = os.path.exists(CERT_VAR_PATH)
+    has_mode = os.path.exists(MODE_VAR_PATH)
+
+    if not has_cert and not has_mode:
+        _status("INFO", "No SecureFlash variables found in NVRAM.")
         _status("OK", "Nothing to remove — NVRAM is clean.")
         return
 
-    # Parse and show the cert
-    entries = _decode_esl(data)
-    if entries:
-        cn = entries[0].get('cn', '(unknown)')
-        _status("INFO", f"Found certificate in NVRAM: CN={cn}")
-        _status("INFO", f"Certificate size: {entries[0]['cert_size']:,} bytes")
-    else:
-        _status("INFO", "Found SecureFlashCertData variable but could not parse certificate.")
+    if has_cert:
+        attrs, data = _read_efivar(CERT_VAR_PATH)
+        entries = _decode_esl(data) if data else []
+        if entries:
+            cn = entries[0].get('cn', '(unknown)')
+            _status("INFO", f"Found SecureFlashCertData: CN={cn}")
+            _status("INFO", f"Certificate size: {entries[0]['cert_size']:,} bytes")
+        else:
+            _status("INFO", "Found SecureFlashCertData but could not parse certificate.")
+
+    if has_mode:
+        mode_attrs, mode_data = _read_efivar(MODE_VAR_PATH)
+        if mode_data and len(mode_data) >= 1:
+            _status("INFO", f"Found SecureFlashSetupMode: value={mode_data[0]}")
+        else:
+            _status("INFO", "Found SecureFlashSetupMode variable.")
 
     _step(2, "Remove Certificate")
 
@@ -633,13 +704,17 @@ def main_revert(args):
 
     if remove_certificate():
         # Verify removal
-        attrs2, _ = _read_efivar(CERT_VAR_PATH)
-        if attrs2 is None:
-            _status("OK", "Certificate removed from NVRAM successfully.")
+        cert_gone = not os.path.exists(CERT_VAR_PATH)
+        mode_gone = not os.path.exists(MODE_VAR_PATH)
+        if cert_gone and mode_gone:
+            _status("OK", "All SecureFlash variables removed from NVRAM.")
         else:
-            _status("!", "Variable still exists after removal attempt.")
+            if not cert_gone:
+                _status("!", "SecureFlashCertData still exists after removal attempt.")
+            if not mode_gone:
+                _status("!", "SecureFlashSetupMode still exists after removal attempt.")
     else:
-        _status("FAIL", "Could not remove certificate.")
+        _status("FAIL", "Could not remove SecureFlash variables.")
         sys.exit(1)
 
 
