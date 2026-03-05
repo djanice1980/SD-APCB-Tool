@@ -17,6 +17,7 @@ Patches the APCB (AMD Platform Configuration Block) SPD entries in firmware to r
 - **DMI Backup & Restore** -- Export/import device identity (serial, UUID) for brick recovery
 - **Cross-platform** -- Works on Windows, Linux, macOS, and Steam Deck itself
 - **SPD Timing Editor** -- Per-entry editing of SPD timing bytes (tCK, tAA, tRCD, tRPab, tRPpb) with speed presets and raw hex fields
+- **Firmware Signing** -- PE Authenticode signing for Steam Deck `.fd` files, enabling flashing via h2offt with self-signed certificates (requires `cryptography` library)
 - **GUI** -- Two-column layout with per-entry checkboxes, capacity dropdowns, SPD timing editor, screen patch selector, DMI tools, and dark theme
 
 ## Quick Start
@@ -58,6 +59,12 @@ python sd_apcb_tool.py modify RC71L.342 RC71L_32GB.342 --target 32
 # ROG Ally X: Modify for 64GB
 python sd_apcb_tool.py modify RC72LA.312 RC72LA_64GB.312 --target 64
 
+# Steam Deck: Modify for 32GB + sign for h2offt flashing
+python sd_apcb_tool.py modify my_bios.fd my_bios_32GB.fd --target 32
+
+# Steam Deck: Modify + sign with existing key pair
+python sd_apcb_tool.py modify my_bios.fd my_bios_32GB.fd --target 32 --signing-key signing_key.pem
+
 # Restore to stock
 python sd_apcb_tool.py modify modified.bin stock.bin --target 16
 ```
@@ -80,7 +87,7 @@ When you enter interactive mode, you'll see a summary of the loaded firmware:
 
 ```
   ========================================================================
-    APCB Memory Configuration Tool v1.9.0 -- Interactive Mode
+    APCB Memory Configuration Tool v2.0.0 -- Interactive Mode
   ========================================================================
 
   Device:  Steam Deck (auto-detected)
@@ -353,7 +360,8 @@ Stock `.fd` files ship with an empty `$DMI` store -- the tool writes your DMI da
 
 ## Requirements
 
-- **Python 3.8+** (standard library only, no additional packages needed)
+- **Python 3.8+** (standard library only for basic usage)
+- **`cryptography`** (optional, required for firmware signing: `pip install cryptography`)
 
 ### SteamOS Setup (Steam Deck)
 
@@ -405,15 +413,15 @@ After patching, the APCB block checksum is recalculated to maintain validity.
 
 Firmware typically contains two identical APCB MEMG blocks (primary + backup). Both are patched.
 
-### Why no h2offt signing?
+### h2offt signing via certificate injection
 
-Steam Deck firmware files (`.fd`) are PE executables with Authenticode signatures. The `h2offt` flash tool performs full cryptographic validation -- it verifies the RSA signature against Insyde's QA Certificate (CN="QA Certificate."), a pre-trusted key in h2offt's validation chain. Hardware testing confirmed that even single-byte changes to the firmware break validation without the QA private key (`QA.pfx`). Self-signed certificates are rejected regardless of structural correctness. DeckHD succeeds because they possess this key; it is not publicly available.
+Steam Deck firmware files (`.fd`) are PE executables with Authenticode signatures verified by the Insyde h2offt flash tool. As of v2.0.0, the tool supports signing via CVE-2025-4275 (Hydroph0bia), which allows injecting a custom signing certificate into the `SecureFlashCertData` NVRAM variable on unpatched devices. This enables flashing modified firmware via h2offt without needing Insyde's QA private key. See the [Firmware Signing](#firmware-signing-steam-deck) section for details. For patched devices, use the SPI programmer method.
 
 ## Flashing
 
 ### Steam Deck -- SPI programmer (CH341A)
 
-Steam Deck requires an SPI programmer to flash modified firmware (h2offt rejects unsigned modifications):
+For raw `.bin` SPI dumps, use an SPI programmer:
 
 ```bash
 # Modify the BIOS
@@ -423,16 +431,118 @@ python sd_apcb_tool.py modify dump.bin dump_32gb.bin --target 32
 flashrom -p ch341a_spi -w dump_32gb.bin
 ```
 
+### Steam Deck -- h2offt (signed .fd)
+
+When saving as `.fd`, the tool automatically signs the firmware for h2offt flashing. Requires `cryptography` library and NVRAM certificate injection on the target device. See the full [Firmware Signing](#firmware-signing-steam-deck) walkthrough for step-by-step instructions.
+
 ### ROG Ally / Ally X -- SPI programmer
 
-ROG Ally devices also require an SPI programmer (CH341A + SOIC8 clip) to flash modified firmware.
+ROG Ally devices require an SPI programmer (CH341A + SOIC8 clip) to flash modified firmware. Signing is not supported for ROG Ally devices.
+
+## Firmware Signing (Steam Deck)
+
+Steam Deck firmware (`.fd` files) uses PE Authenticode signing verified by the Insyde h2offt flash tool. The tool supports signing modified firmware via CVE-2025-4275 (Hydroph0bia), which allows injection of a custom signing certificate into the unprotected `SecureFlashCertData` NVRAM variable.
+
+### Prerequisites
+
+- `cryptography` Python library (`pip install cryptography`)
+- Root access on Steam Deck (Desktop Mode, Konsole)
+- Device must be vulnerable to CVE-2025-4275 (unpatched Insyde H2O firmware)
+
+### Step 0: Check Vulnerability (one-time, on Steam Deck)
+
+Run the diagnostic script on the Steam Deck to confirm it is vulnerable:
+
+```bash
+sudo python3 signing/secureflash_check.py
+```
+
+Look for `VULNERABLE` in the summary. If it says `NOT VULNERABLE`, the firmware has been patched — use the SPI programmer method instead.
+
+### Step 1: Modify + Sign (on any computer)
+
+Save the output as `.fd` to auto-enable signing:
+
+```bash
+python sd_apcb_tool.py modify F7G0112_sign.fd F7G0112_32GB.fd --target 32
+```
+
+The tool automatically generates three output files:
+- `F7G0112_32GB.fd` — signed firmware (PE Authenticode + _IFLASH flags updated)
+- `signing_key.pem` — RSA-2048 private key (keep this for re-signing later)
+- `signing_cert.esl` — certificate in EFI_SIGNATURE_LIST format for NVRAM injection
+
+If `signing_key.pem` already exists in the output directory, you'll be asked whether to reuse it. Reusing the same key means the certificate already in NVRAM stays valid — no need to re-inject.
+
+### Step 2: Transfer to Steam Deck
+
+Copy three files to the Steam Deck (USB drive, scp, etc.):
+- `F7G0112_32GB.fd` — signed firmware
+- `signing_cert.esl` — certificate for NVRAM injection
+- `signing/secureflash_flash.py` — guided flash utility
+
+The `signing_key.pem` stays on your computer (for re-signing later).
+
+### Step 3: Flash (on Steam Deck)
+
+Switch to Desktop Mode, open Konsole, navigate to the directory with your files, and run:
+
+```bash
+sudo python3 secureflash_flash.py
+```
+
+The utility auto-detects the `.fd` and `.esl` files in the current directory and guides you through:
+1. Pre-flight checks (root, efivarfs, h2offt, device detection)
+2. Certificate injection into NVRAM (if not already done)
+3. Firmware flashing via h2offt (with confirmation prompts)
+
+h2offt automatically reboots the system on a successful flash. The Steam Deck boots with modified firmware.
+
+### Cleanup (optional, after reboot)
+
+The signing certificate remains in NVRAM after flashing. To remove it:
+
+```bash
+sudo python3 secureflash_flash.py --revert
+```
+
+Or leave it — the certificate only means h2offt will accept firmware signed with your key, which is useful if you need to re-flash later.
+
+### Re-signing with an existing key
+
+If you kept `signing_key.pem`, you can re-sign without re-injecting the certificate. The tool auto-detects it in the output directory and asks to reuse:
+
+```bash
+python sd_apcb_tool.py modify new_bios.fd new_bios_mod.fd --target 32
+# → "Found existing signing_key.pem. Reuse this key? [Y/n]"
+```
+
+Or specify the key explicitly:
+
+```bash
+python sd_apcb_tool.py modify new_bios.fd new_bios_mod.fd --target 32 --signing-key /path/to/signing_key.pem
+```
+
+Since the matching certificate is already in NVRAM, h2offt will accept the new firmware without repeating the certificate injection step.
+
+### Signing tools
+
+The `signing/` directory contains standalone utilities (all run on Steam Deck):
+- `secureflash_flash.py` — **Guided flash utility.** Handles cert injection + h2offt flashing with interactive prompts. Also supports `--revert` to remove the injected cert.
+- `secureflash_check.py` — NVRAM vulnerability scanner. Checks if your device is vulnerable to CVE-2025-4275. Run this first.
+
+### Important notes
+
+- If your device has been patched against CVE-2025-4275 (Insyde INSYDE-SA-2025002), the NVRAM write in Step 3 will fail. Use the SPI programmer method instead.
+- The `.bin` output path (SPI programmer) does not require signing and works on all devices regardless of patch status.
+- The signing process is experimental. The NVRAM vulnerability and signing code have been validated individually, but full end-to-end h2offt flashing should be tested on your device before relying on this method.
 
 ## Supported Devices & Firmware
 
 | Device | Firmware | RAM Targets | Screen Patches | Flash Method | Status |
 |--------|----------|-------------|----------------|--------------|--------|
-| Steam Deck LCD | F7A0110, F7A0113, F7A0131 | 16/32GB | DeckHD, DeckSight | SPI programmer | Tested |
-| Steam Deck OLED | F7G0005, F7G0112 | 16/32GB | -- | SPI programmer | Tested |
+| Steam Deck LCD | F7A0110, F7A0113, F7A0131 | 16/32GB | DeckHD, DeckSight | SPI / h2offt (signed) | Tested |
+| Steam Deck OLED | F7G0005, F7G0112 | 16/32GB | -- | SPI / h2offt (signed) | Tested |
 | ROG Ally | RC71L series | 16/32/64GB | -- | SPI programmer | Tested |
 | ROG Ally X | RC72LA series | 16/32/64GB | -- | SPI programmer | Tested |
 
@@ -481,6 +591,8 @@ Commands:
   --magic              Modify APCB magic byte (cosmetic, not required)
   --all-entries        Modify all SPD entries (this is now the default)
   --entry N            Modify only specific entry index (0-based, repeatable)
+  --sign               Sign the output firmware (auto-enabled for .fd output)
+  --signing-key PEM    Path to RSA private key PEM file (generates fresh key if omitted)
 ```
 
 ### DMI Export Options
@@ -524,10 +636,13 @@ The GUI (`sd_apcb_gui.py`) provides the same capabilities as the CLI with a grap
 ## Project Structure
 
 ```
-sd_apcb_tool.py    -- CLI tool (analysis, modification, interactive editor)
-sd_apcb_gui.py     -- GUI application (same engine, graphical interface)
-README.md          -- This file
-CHANGELOG.md       -- Version history
+sd_apcb_tool.py                 -- CLI tool (analysis, modification, signing, interactive editor)
+sd_apcb_gui.py                  -- GUI application (same engine, graphical interface)
+signing/secureflash_flash.py    -- Guided flash utility (cert injection + h2offt, runs on Steam Deck)
+signing/secureflash_check.py    -- NVRAM vulnerability scanner (CVE-2025-4275)
+signing/README.md               -- Signing & flash tools documentation
+README.md                       -- This file
+CHANGELOG.md                    -- Version history
 ```
 
 ## Technical Details

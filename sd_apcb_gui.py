@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-APCB Memory Mod Tool (GUI) v1.9.0
+APCB Memory Mod Tool (GUI) v2.0.0
 ===================================
 GUI for analyzing and modifying handheld device BIOS files
 to support 16GB/32GB/64GB memory configurations.
@@ -17,7 +17,7 @@ Requirements:
 Usage: python sd_apcb_gui.py
 """
 
-import os, sys, struct
+import os, sys, struct, hashlib, datetime
 from dataclasses import dataclass, field
 from enum import Enum, IntEnum
 from typing import List, Optional, Tuple, Dict
@@ -49,7 +49,7 @@ class MemoryTarget(IntEnum):
 
 
 APP_TITLE = "SD APCB Memory Mod Tool"
-APP_VERSION = "1.9.0"
+APP_VERSION = "2.0.0"
 
 # Steam Deck firmware filename prefixes for LCD vs OLED variant detection
 SD_LCD_PREFIX = 'F7A'     # Jupiter (LCD)
@@ -82,6 +82,29 @@ MEMORY_CONFIGS = {
     32: {'name': '32GB', 'byte6': 0xB5, 'byte12': 0x0A},
     64: {'name': '64GB', 'byte6': 0xF5, 'byte12': 0x49},
 }
+# Speed profiles — maps MT/s rate to tCK byte value
+# Formula: MT/s = 2000 / (tCK_byte * MTB_ns), where MTB_ns = 0.125
+SPEED_PROFILES = {
+    8000: {'name': '8000 MT/s', 'tCK': 0x02},
+    5333: {'name': '5333 MT/s', 'tCK': 0x03},
+    4000: {'name': '4000 MT/s', 'tCK': 0x04},
+    3200: {'name': '3200 MT/s', 'tCK': 0x05},
+}
+
+def speed_from_tck(tck_byte: int) -> str:
+    """Convert tCK byte to speed dropdown label, or 'Custom'."""
+    for mts, prof in SPEED_PROFILES.items():
+        if prof['tCK'] == tck_byte:
+            return prof['name']
+    return 'Custom'
+
+def tck_from_speed(speed_str: str) -> Optional[int]:
+    """Convert speed label to tCK byte, or None for Custom."""
+    for mts, prof in SPEED_PROFILES.items():
+        if prof['name'] == speed_str:
+            return prof['tCK']
+    return None
+
 MODULE_DENSITY_MAP = {
     'MT62F512M32D2DR': '16GB', 'MT62F768M32D2DR': '24GB',
     'MT62F1G64D4BS': '32GB', 'MT62F1G64D4AH': '32GB', 'MT62F1G32D4DR': '32GB',
@@ -99,13 +122,13 @@ MANUFACTURER_IDS = {0x2C: 'Micron', 0xCE: 'Samsung', 0xAD: 'SK Hynix', 0x01: 'Sa
 # Known module name prefixes — used for prefix dropdown in GUI editor
 # Format: (prefix, display_label) — dropdown shows label, value uses prefix only
 MODULE_NAME_PREFIXES = [
-    ('MT6', 'MT6 - Micron LPDDR5/5X'),
-    ('K3K', 'K3K - Samsung LPDDR5'),
-    ('K3L', 'K3L - Samsung LPDDR5X'),
-    ('H58', 'H58 - SK Hynix LPDDR5/5X'),
-    ('H9H', 'H9H - SK Hynix LPDDR5/5X'),
-    ('SEC', 'SEC - Samsung (alt)'),
-    ('SAM', 'SAM - Samsung (alt)'),
+    ('MT6', 'MT6 - Micron'),
+    ('K3K', 'K3K - Samsung'),
+    ('K3L', 'K3L - Samsung'),
+    ('H58', 'H58 - SK Hynix'),
+    ('H9H', 'H9H - SK Hynix'),
+    ('SEC', 'SEC - Samsung'),
+    ('SAM', 'SAM - Samsung'),
 ]
 MODULE_PREFIX_LABELS = [label for _, label in MODULE_NAME_PREFIXES]
 MODULE_PREFIX_MAP = {label: prefix for prefix, label in MODULE_NAME_PREFIXES}
@@ -230,6 +253,7 @@ def _decode_spd_fields(spd: bytes) -> dict:
         'col_bits': (b5 & 0x07) + 9,
         'bank_groups': {0: 1, 1: 2, 2: 4}.get((b4 >> 4) & 0x03, 0),
         'banks_per_group': {0: 4, 1: 8, 2: 16}.get((b4 >> 6) & 0x03, 0),
+        'tCK_byte': spd[SPD_BYTE_TCKMIN],
         'tAA_ns': round(spd[SPD_BYTE_TAAMIN] * SPD_MTB_PS / 1000, 2),
         'tRCD_ns': round(spd[SPD_BYTE_TRCDMIN] * SPD_MTB_PS / 1000, 2),
         'tRPAB_ns': round(spd[SPD_BYTE_TRPABMIN] * SPD_MTB_PS / 1000, 2),
@@ -246,6 +270,7 @@ class SPDEntry:
     die_density: str = ''; die_count: int = 0; ranks: int = 0; dev_width: str = ''
     bus_width: int = 0; row_bits: int = 0; col_bits: int = 0
     bank_groups: int = 0; banks_per_group: int = 0
+    tCK_byte: int = 0
     tAA_ns: float = 0.0; tRCD_ns: float = 0.0; tRPAB_ns: float = 0.0; tRPPB_ns: float = 0.0
 
 @dataclass
@@ -402,6 +427,8 @@ def modify_bios_data(data: bytearray, entry_modifications: List[Dict], modify_ma
             'new_name': str|None - new module name or None to keep current
             'custom_byte6': int|None - custom byte6 value (when target_gb is None)
             'custom_byte12': int|None - custom byte12 value (when target_gb is None)
+            'timing': dict|None - optional timing byte overrides with keys:
+                'tCK', 'tAA', 'tRCD', 'tRPab', 'tRPpb' (int values)
         modify_magic: bool - modify APCB magic byte
     Returns:
         list of (offset, old_byte, new_byte) tuples
@@ -436,6 +463,19 @@ def modify_bios_data(data: bytearray, entry_modifications: List[Dict], modify_ma
                     off = e.module_name_offset + i
                     if data[off] != nb:
                         mods.append((off, data[off], nb)); data[off] = nb
+            # Write timing bytes if modified
+            timing = mod.get('timing')
+            if timing:
+                for spd_off, key in [
+                    (SPD_BYTE_TCKMIN, 'tCK'), (SPD_BYTE_TAAMIN, 'tAA'),
+                    (SPD_BYTE_TRCDMIN, 'tRCD'), (SPD_BYTE_TRPABMIN, 'tRPab'),
+                    (SPD_BYTE_TRPPBMIN, 'tRPpb')
+                ]:
+                    off = e.offset_in_file + spd_off
+                    new_val = timing[key]
+                    if data[off] != new_val:
+                        mods.append((off, data[off], new_val))
+                        data[off] = new_val
         if modify_magic:
             nb = 0x51 if first_target == 32 else 0x41
             if data[block.offset] != nb: mods.append((block.offset, data[block.offset], nb)); data[block.offset] = nb
@@ -500,7 +540,481 @@ def patch_screen(data: bytearray, screen_key: str) -> List[tuple]:
         pos = idx + 1
     return patches
 
-# (PE Authenticode signing code was removed in v1.8.0 — requires Insyde QA.pfx)
+# ── PE Authenticode Signing (restored in v2.0.0 — CVE-2025-4275 SecureFlash injection) ──
+
+def _check_signing_available():
+    """Check if the cryptography library is available for signing."""
+    try:
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa, padding
+        from cryptography.x509 import CertificateBuilder, Name, NameAttribute, NameOID
+        from cryptography import x509
+        return True
+    except ImportError:
+        return False
+
+
+# --- DER Encoding Helpers ---
+
+def _der_length(length):
+    """Encode a DER length field."""
+    if length < 0x80:
+        return bytes([length])
+    elif length < 0x100:
+        return bytes([0x81, length])
+    elif length < 0x10000:
+        return bytes([0x82, (length >> 8) & 0xFF, length & 0xFF])
+    elif length < 0x1000000:
+        return bytes([0x83, (length >> 16) & 0xFF, (length >> 8) & 0xFF, length & 0xFF])
+    else:
+        return bytes([0x84, (length >> 24) & 0xFF, (length >> 16) & 0xFF,
+                      (length >> 8) & 0xFF, length & 0xFF])
+
+def _der_tag(tag, content):
+    return bytes([tag]) + _der_length(len(content)) + content
+
+def _der_sequence(content):
+    return _der_tag(0x30, content)
+
+def _der_set(content):
+    return _der_tag(0x31, content)
+
+def _der_oid(oid_str):
+    """Encode a dotted OID string to DER."""
+    parts = [int(x) for x in oid_str.split('.')]
+    encoded = bytes([40 * parts[0] + parts[1]])
+    for val in parts[2:]:
+        if val < 0x80:
+            encoded += bytes([val])
+        elif val < 0x4000:
+            encoded += bytes([(val >> 7) | 0x80, val & 0x7F])
+        elif val < 0x200000:
+            encoded += bytes([(val >> 14) | 0x80, ((val >> 7) & 0x7F) | 0x80, val & 0x7F])
+        else:
+            encoded += bytes([(val >> 21) | 0x80, ((val >> 14) & 0x7F) | 0x80,
+                            ((val >> 7) & 0x7F) | 0x80, val & 0x7F])
+    return _der_tag(0x06, encoded)
+
+def _der_integer(value):
+    if isinstance(value, int):
+        if value == 0:
+            return _der_tag(0x02, b'\x00')
+        result = []
+        v = value
+        while v > 0:
+            result.insert(0, v & 0xFF)
+            v >>= 8
+        if result[0] & 0x80:
+            result.insert(0, 0)
+        return _der_tag(0x02, bytes(result))
+    return _der_tag(0x02, value)
+
+def _der_octet_string(data):
+    return _der_tag(0x04, data)
+
+def _der_null():
+    return bytes([0x05, 0x00])
+
+def _der_context(tag_num, content, constructed=True):
+    tag = (0xA0 if constructed else 0x80) | tag_num
+    return _der_tag(tag, content)
+
+def _der_utctime(dt):
+    return _der_tag(0x17, dt.strftime('%y%m%d%H%M%SZ').encode('ascii'))
+
+
+# --- Authenticode OIDs ---
+
+_OID_PKCS7_SIGNED_DATA = '1.2.840.113549.1.7.2'
+_OID_SPC_INDIRECT_DATA = '1.3.6.1.4.1.311.2.1.4'
+_OID_SPC_PE_IMAGE_DATA = '1.3.6.1.4.1.311.2.1.15'
+_OID_SPC_SP_OPUS_INFO  = '1.3.6.1.4.1.311.2.1.12'
+_OID_SHA256            = '2.16.840.1.101.3.4.2.1'
+_OID_RSA_ENCRYPTION    = '1.2.840.113549.1.1.1'
+_OID_CONTENT_TYPE      = '1.2.840.113549.1.9.3'
+_OID_MESSAGE_DIGEST    = '1.2.840.113549.1.9.4'
+
+
+# --- EFI_SIGNATURE_LIST Builder (for NVRAM injection) ---
+
+# EFI_CERT_X509_GUID = {a5c059a1-94e4-4aa7-87b5-ab155c2bf072}
+_EFI_CERT_X509_GUID = bytes([
+    0xa1, 0x59, 0xc0, 0xa5, 0xe4, 0x94, 0xa7, 0x4a,
+    0x87, 0xb5, 0xab, 0x15, 0x5c, 0x2b, 0xf0, 0x72
+])
+_SD_APCB_OWNER_GUID = bytes([
+    0x50, 0x41, 0x44, 0x53, 0x42, 0x43, 0x4f, 0x54,
+    0x4f, 0x4c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01
+])
+
+def build_esl(cert_der: bytes) -> bytes:
+    """Build an EFI_SIGNATURE_LIST blob for NVRAM injection.
+
+    Wraps a DER-encoded X.509 certificate in EFI_SIGNATURE_LIST format
+    with efivarfs attribute prefix, ready to write to:
+      /sys/firmware/efi/efivars/SecureFlashCertData-382af2bb-ffff-abcd-aaee-cce099338877
+    """
+    sig_size = 16 + len(cert_der)
+    list_size = 28 + sig_size
+    esl = bytearray()
+    esl.extend(_EFI_CERT_X509_GUID)
+    esl.extend(struct.pack('<I', list_size))
+    esl.extend(struct.pack('<I', 0))            # SignatureHeaderSize
+    esl.extend(struct.pack('<I', sig_size))
+    esl.extend(_SD_APCB_OWNER_GUID)
+    esl.extend(cert_der)
+    # Prepend efivarfs attributes (NV|BS|RT = 0x07)
+    return struct.pack('<I', 0x00000007) + bytes(esl)
+
+
+def _compute_pe_checksum(data):
+    """Compute PE checksum (same algorithm as Windows MapFileAndCheckSum)."""
+    pe_offset = struct.unpack_from('<I', data, 0x3C)[0]
+    checksum_offset = pe_offset + 4 + 20 + 64
+
+    checksum = 0
+    remainder = len(data) % 4
+    for i in range(0, len(data) - remainder, 4):
+        if i == checksum_offset:
+            continue
+        val = struct.unpack_from('<I', data, i)[0]
+        checksum = (checksum & 0xFFFFFFFF) + val + (checksum >> 32)
+        checksum = (checksum & 0xFFFF) + (checksum >> 16)
+
+    if remainder:
+        val = int.from_bytes(data[-(remainder):] + b'\x00' * (4 - remainder), 'little')
+        checksum = (checksum & 0xFFFFFFFF) + val + (checksum >> 32)
+        checksum = (checksum & 0xFFFF) + (checksum >> 16)
+
+    checksum = (checksum & 0xFFFF) + (checksum >> 16)
+    return (checksum + len(data)) & 0xFFFFFFFF
+
+
+def _compute_authenticode_hash(data):
+    """Compute the Authenticode PE hash per Microsoft's specification."""
+    pe_offset = struct.unpack_from('<I', data, 0x3C)[0]
+    coff_start = pe_offset + 4
+    num_sections = struct.unpack_from('<H', data, coff_start + 2)[0]
+    opt_header_size = struct.unpack_from('<H', data, coff_start + 16)[0]
+
+    opt_start = coff_start + 20
+    magic = struct.unpack_from('<H', data, opt_start)[0]
+    checksum_offset = opt_start + 64
+    dd_start = opt_start + (112 if magic == 0x20B else 96)
+    secdir_offset = dd_start + 32
+
+    size_of_headers = struct.unpack_from('<I', data, opt_start + 60)[0]
+    section_table_offset = opt_start + opt_header_size
+
+    h = hashlib.sha256()
+    h.update(data[:checksum_offset])
+    h.update(data[checksum_offset + 4:secdir_offset])
+    h.update(data[secdir_offset + 8:size_of_headers])
+
+    sections = []
+    for i in range(num_sections):
+        sec_off = section_table_offset + i * 40
+        raw_size = struct.unpack_from('<I', data, sec_off + 16)[0]
+        raw_ptr = struct.unpack_from('<I', data, sec_off + 20)[0]
+        if raw_size > 0:
+            sections.append((raw_ptr, raw_size))
+    sections.sort(key=lambda s: s[0])
+
+    sum_of_bytes_hashed = size_of_headers
+    for ptr, size in sections:
+        h.update(data[ptr:ptr + size])
+        end = ptr + size
+        if end > sum_of_bytes_hashed:
+            sum_of_bytes_hashed = end
+
+    file_end = len(data)
+    if sum_of_bytes_hashed < file_end:
+        h.update(data[sum_of_bytes_hashed:file_end])
+
+    return h.digest()
+
+
+# --- Insyde _IFLASH Structure Helpers ---
+
+_IFLASH_BIOSCER_MAGIC = b'_IFLASH_BIOSCER'
+_IFLASH_BIOSCR2_MAGIC = b'_IFLASH_BIOSCR2'
+_IFLASH_FLAGS_OFFSET = 0x0F
+_IFLASH_DRV_FLAGS2_OFFSET = 0x13
+_IFLASH_BIOSCER_HASH_OFFSET = 0x18
+_IFLASH_BIOSCR2_CERT_OFFSET = 0x1F
+
+
+def _find_iflash_structures(data):
+    """Find _IFLASH_BIOSCER and _IFLASH_BIOSCR2 in firmware."""
+    bioscer = data.find(_IFLASH_BIOSCER_MAGIC)
+    bioscr2 = data.find(_IFLASH_BIOSCR2_MAGIC)
+    if bioscer >= 0 and bioscr2 >= 0:
+        return bioscer, bioscr2
+    return None, None
+
+
+# DeckHD-proven flag transformations for h2offt QA mode.
+_IFLASH_FLAG_MAP = {
+    b'_IFLASH_DRV_IMG': lambda f: f | 0x08,
+    b'_IFLASH_BIOSIMG': lambda f: 0x08 if f == 0x20 else f,
+    b'_IFLASH_INI_IMG': lambda f: 0x68,
+    b'_IFLASH_BIOSCER': lambda f: 0x08,
+    b'_IFLASH_BIOSCR2': lambda f: 0x08,
+}
+
+
+def _update_iflash_flags(data):
+    """Update all _IFLASH structure flags for h2offt QA/self-signed mode."""
+    pos = 0
+    updated = []
+    while pos < len(data):
+        idx = data.find(b'_IFLASH_', pos)
+        if idx < 0:
+            break
+        for magic, transform in _IFLASH_FLAG_MAP.items():
+            if data[idx:idx + len(magic)] == magic:
+                old_flag = data[idx + _IFLASH_FLAGS_OFFSET]
+                new_flag = transform(old_flag)
+                if old_flag != new_flag:
+                    data[idx + _IFLASH_FLAGS_OFFSET] = new_flag
+                    updated.append((idx, magic.decode(), old_flag, new_flag))
+                if magic == b'_IFLASH_DRV_IMG':
+                    data[idx + _IFLASH_DRV_FLAGS2_OFFSET] = new_flag
+                break
+        pos = idx + 1
+    return updated
+
+
+def _build_spc_indirect_data(pe_hash):
+    """Build SPC_INDIRECT_DATA_CONTENT for Authenticode."""
+    spc_flags = _der_tag(0x03, bytes([0x00]))
+    spc_link = _der_context(0, b'', constructed=False)
+    spc_file = _der_context(2, spc_link)
+    spc_pe_data = _der_sequence(spc_flags + _der_context(0, spc_file))
+    spc_attr = _der_sequence(_der_oid(_OID_SPC_PE_IMAGE_DATA) + spc_pe_data)
+    digest_algo = _der_sequence(_der_oid(_OID_SHA256) + _der_null())
+    digest_info = _der_sequence(digest_algo + _der_octet_string(pe_hash))
+    inner_content = spc_attr + digest_info
+    return _der_sequence(inner_content), inner_content
+
+
+def _build_auth_attrs(spc_inner_content):
+    """Build authenticated attributes for PKCS#7 signer info."""
+    attr_opus = _der_sequence(
+        _der_oid(_OID_SPC_SP_OPUS_INFO) +
+        _der_set(_der_sequence(b'')))
+    attr_ct = _der_sequence(
+        _der_oid(_OID_CONTENT_TYPE) + _der_set(_der_oid(_OID_SPC_INDIRECT_DATA)))
+    content_hash = hashlib.sha256(spc_inner_content).digest()
+    attr_md = _der_sequence(
+        _der_oid(_OID_MESSAGE_DIGEST) + _der_set(_der_octet_string(content_hash)))
+    attrs = sorted([attr_opus, attr_ct, attr_md], key=lambda x: x)
+    return b''.join(attrs)
+
+
+def _build_pkcs7(pe_hash, cert_der, private_key):
+    """Build complete PKCS#7 SignedData for Authenticode."""
+    from cryptography.hazmat.primitives import hashes as _hashes
+    from cryptography.hazmat.primitives.asymmetric import padding as _padding
+    from cryptography import x509 as _x509
+
+    cert = _x509.load_der_x509_certificate(cert_der)
+    serial = cert.serial_number
+    issuer_der = cert.issuer.public_bytes()
+
+    spc_content, spc_inner = _build_spc_indirect_data(pe_hash)
+    content_info = _der_sequence(
+        _der_oid(_OID_SPC_INDIRECT_DATA) + _der_context(0, spc_content))
+    sha256_algo = _der_sequence(_der_oid(_OID_SHA256) + _der_null())
+    digest_algos = _der_set(sha256_algo)
+    certificates = _der_context(0, cert_der)
+
+    auth_attrs_content = _build_auth_attrs(spc_inner)
+    attrs_for_signing = _der_set(auth_attrs_content)
+    signature = private_key.sign(attrs_for_signing, _padding.PKCS1v15(), _hashes.SHA256())
+
+    issuer_and_serial = _der_sequence(issuer_der + _der_integer(serial))
+    rsa_algo = _der_sequence(_der_oid(_OID_RSA_ENCRYPTION) + _der_null())
+
+    signer_info = _der_sequence(
+        _der_integer(1) + issuer_and_serial + sha256_algo +
+        _der_context(0, auth_attrs_content) + rsa_algo +
+        _der_octet_string(signature))
+
+    signed_data = _der_sequence(
+        _der_integer(1) + digest_algos + content_info + certificates + _der_set(signer_info))
+
+    return _der_sequence(
+        _der_oid(_OID_PKCS7_SIGNED_DATA) + _der_context(0, signed_data))
+
+
+def _build_win_certificate(pkcs7_blob):
+    """Build a WIN_CERTIFICATE structure (8-byte aligned) from a PKCS#7 blob."""
+    wc_len = (8 + len(pkcs7_blob) + 7) & ~7
+    win_cert = struct.pack('<IHH', wc_len, 0x0200, 0x0002) + pkcs7_blob
+    win_cert += b'\x00' * (wc_len - len(win_cert))
+    return win_cert
+
+
+def sign_firmware(data_in: bytes, key_path: str = None, cert_path: str = None) -> tuple:
+    """
+    Sign a PE firmware file for h2offt flashing via CVE-2025-4275.
+
+    Uses certificate injection into SecureFlashCertData NVRAM variable to
+    establish trust. Signs with user-provided key pair, or generates a fresh
+    RSA-2048 key pair if none provided.
+
+    Args:
+        data_in: Input file bytes (PE format firmware)
+        key_path: Path to RSA private key PEM file (optional)
+        cert_path: Path to X.509 certificate DER file (optional)
+
+    Returns:
+        Tuple of (signed_data, key_pem_bytes, cert_der_bytes)
+    """
+    from cryptography.hazmat.primitives import hashes as _hashes
+    from cryptography.hazmat.primitives.asymmetric import rsa as _rsa
+    from cryptography.hazmat.primitives.asymmetric import padding as _padding
+    from cryptography.x509 import CertificateBuilder, Name, NameAttribute, NameOID
+    from cryptography import x509 as _x509
+    from cryptography.hazmat.primitives.serialization import Encoding, load_pem_private_key
+    from cryptography.hazmat.primitives import serialization
+
+    data = bytearray(data_in)
+
+    if data[:2] != b'MZ':
+        raise ValueError("Not a valid PE file (no MZ header)")
+    pe_offset = struct.unpack_from('<I', data, 0x3C)[0]
+    if data[pe_offset:pe_offset+4] != b'PE\x00\x00':
+        raise ValueError("Invalid PE signature")
+
+    opt_start = pe_offset + 4 + 20
+    magic = struct.unpack_from('<H', data, opt_start)[0]
+    checksum_offset = opt_start + 64
+    dd_start = opt_start + (112 if magic == 0x20B else 96)
+    secdir_offset = dd_start + 32
+
+    # Step 1: Strip existing PE Authenticode signature
+    old_va = struct.unpack_from('<I', data, secdir_offset)[0]
+    if old_va > 0 and old_va < len(data):
+        data = data[:old_va]
+
+    # Load or generate key pair + certificate
+    if key_path and cert_path:
+        with open(key_path, 'rb') as f:
+            key_pem = f.read()
+        key = load_pem_private_key(key_pem, password=None)
+        with open(cert_path, 'rb') as f:
+            cert_der = f.read()
+    elif key_path:
+        with open(key_path, 'rb') as f:
+            key_pem = f.read()
+        key = load_pem_private_key(key_pem, password=None)
+        # Try to find cert alongside key
+        base = os.path.splitext(key_path)[0]
+        for ext in ('.der', '_cert.der', '.cert.der'):
+            cp = base + ext
+            if os.path.isfile(cp):
+                with open(cp, 'rb') as f:
+                    cert_der = f.read()
+                break
+        else:
+            now = datetime.datetime.now(datetime.timezone.utc)
+            subject = issuer = Name([NameAttribute(NameOID.COMMON_NAME, "SD APCB Tool")])
+            cert = (CertificateBuilder()
+                .subject_name(subject).issuer_name(issuer)
+                .public_key(key.public_key())
+                .serial_number(_x509.random_serial_number())
+                .not_valid_before(now)
+                .not_valid_after(now + datetime.timedelta(days=3650))
+                .sign(key, _hashes.SHA256()))
+            cert_der = cert.public_bytes(Encoding.DER)
+    else:
+        key = _rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        key_pem = key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption()
+        )
+        now = datetime.datetime.now(datetime.timezone.utc)
+        subject = issuer = Name([NameAttribute(NameOID.COMMON_NAME, "SD APCB Tool")])
+        cert = (CertificateBuilder()
+            .subject_name(subject).issuer_name(issuer)
+            .public_key(key.public_key())
+            .serial_number(_x509.random_serial_number())
+            .not_valid_before(now)
+            .not_valid_after(now + datetime.timedelta(days=3650))
+            .sign(key, _hashes.SHA256()))
+        cert_der = cert.public_bytes(Encoding.DER)
+
+    # Step 2: Handle Insyde _IFLASH internal integrity structures
+    bioscer_off, bioscr2_off = _find_iflash_structures(bytes(data))
+
+    if bioscer_off is not None and bioscr2_off is not None:
+        _update_iflash_flags(data)
+
+        bioscr2_cert_off = bioscr2_off + _IFLASH_BIOSCR2_CERT_OFFSET
+        old_bioscr2_slot = len(data) - bioscr2_cert_off
+
+        bioscr2_body = bytearray(data)
+        struct.pack_into('<I', bioscr2_body, secdir_offset, 0)
+        struct.pack_into('<I', bioscr2_body, secdir_offset + 4, 0)
+        struct.pack_into('<I', bioscr2_body, checksum_offset, 0)
+        bioscr2_hash = _compute_authenticode_hash(bytes(bioscr2_body))
+        bioscr2_pkcs7 = _build_pkcs7(bioscr2_hash, cert_der, key)
+        bioscr2_wc = _build_win_certificate(bioscr2_pkcs7)
+
+        delta = len(bioscr2_wc) - old_bioscr2_slot
+        old_slot_end = bioscr2_cert_off + old_bioscr2_slot
+
+        if delta > 0:
+            data[bioscr2_cert_off:old_slot_end] = bioscr2_wc[:old_bioscr2_slot]
+            data[old_slot_end:old_slot_end] = bioscr2_wc[old_bioscr2_slot:]
+        elif delta < 0:
+            data[bioscr2_cert_off:bioscr2_cert_off + len(bioscr2_wc)] = bioscr2_wc
+            del data[bioscr2_cert_off + len(bioscr2_wc):old_slot_end]
+        else:
+            data[bioscr2_cert_off:old_slot_end] = bioscr2_wc
+
+        if delta != 0:
+            soi_offset = opt_start + 56
+            old_soi = struct.unpack_from('<I', data, soi_offset)[0]
+            struct.pack_into('<I', data, soi_offset, old_soi + delta)
+
+    # Step 3: Clear header fields for PE hash computation
+    struct.pack_into('<I', data, secdir_offset, 0)
+    struct.pack_into('<I', data, secdir_offset + 4, 0)
+    struct.pack_into('<I', data, checksum_offset, 0)
+
+    # Step 4: Compute PE Authenticode hash
+    pe_hash = _compute_authenticode_hash(bytes(data))
+
+    # Step 5: Build PE PKCS#7 SignedData
+    pkcs7 = _build_pkcs7(pe_hash, cert_der, key)
+
+    # Step 6: Build and append WIN_CERTIFICATE
+    win_cert = _build_win_certificate(pkcs7)
+    cert_offset = len(data)
+    struct.pack_into('<I', data, secdir_offset, cert_offset)
+    struct.pack_into('<I', data, secdir_offset + 4, len(win_cert))
+    data.extend(win_cert)
+
+    # Step 7: Compute and write PE checksum
+    checksum = _compute_pe_checksum(bytes(data))
+    struct.pack_into('<I', data, checksum_offset, checksum)
+
+    # Self-check
+    verify_data = bytearray(data[:cert_offset])
+    struct.pack_into('<I', verify_data, secdir_offset, 0)
+    struct.pack_into('<I', verify_data, secdir_offset + 4, 0)
+    struct.pack_into('<I', verify_data, checksum_offset, 0)
+    verify_hash = _compute_authenticode_hash(bytes(verify_data))
+    if verify_hash != pe_hash:
+        raise RuntimeError(
+            "Signing self-check FAILED: Authenticode hash mismatch. "
+            f"Expected {pe_hash.hex()}, got {verify_hash.hex()}")
+
+    return bytes(data), key_pem, cert_der
 
 # ── DMI / SMBIOS (AMI DmiEdit $DMI Store) ──
 AMI_DMI_MAGIC = b'$DMI'
@@ -622,7 +1136,7 @@ C_BTN='#3d59a1'; C_BTH='#5177c9'
 
 class APCBToolGUI:
     def __init__(self, root):
-        self.root = root; root.title(APP_TITLE); root.geometry("820x720"); root.minsize(700,600); root.configure(bg=C_BG)
+        self.root = root; root.title(APP_TITLE); root.configure(bg=C_BG)
         self.loaded_file = None; self.loaded_data = None; self.blocks = []; self.current_config = ""
         self.detected_device = 'unknown'; self.device_profile = None; self.sd_variant = SteamDeckVariant.UNKNOWN
         # Fix combobox popup list colors (must be before any Combobox creation)
@@ -704,7 +1218,7 @@ class APCBToolGUI:
         self.lbl_cf = ttk.Label(r2, text="", style='Status.TLabel'); self.lbl_cf.pack(side='right')
         # Target configuration
         ttk.Label(left, text="Target Configuration", style='Section.TLabel').pack(anchor='w', pady=(4,0))
-        ttk.Label(left, text="Sets density for all checked entries below", style='Subtitle.TLabel').pack(anchor='w', pady=(0,4))
+        ttk.Label(left, text="Sets density and SPD timings for all checked entries below", style='Subtitle.TLabel').pack(anchor='w', pady=(0,4))
         tc = tk.Frame(left, bg=C_BGL, padx=16, pady=12, highlightbackground=C_BDR, highlightthickness=1); tc.pack(fill='x', pady=(0,10))
         self.target_var = tk.IntVar(value=32)
         self.target_radios = {}
@@ -724,6 +1238,16 @@ class APCBToolGUI:
             state='disabled', width=20, font=('Segoe UI', 9))
         self.screen_combo.pack(side='left', padx=(8,0))
         tk.Label(df, text="(Steam Deck LCD only)", bg=C_BGL, fg=C_FGD, font=('Segoe UI', 9)).pack(side='left', padx=(8,0))
+        # Speed setting
+        spf = tk.Frame(tc, bg=C_BGL); spf.pack(fill='x', pady=(4,0))
+        tk.Label(spf, text="SPD Timings:", bg=C_BGL, fg=C_FG, font=('Segoe UI', 10)).pack(side='left')
+        speed_options = [SPEED_PROFILES[k]['name'] for k in sorted(SPEED_PROFILES.keys(), reverse=True)]
+        speed_options.append('Custom')
+        self.speed_var = tk.StringVar(value='5333 MT/s')
+        self.speed_combo = ttk.Combobox(spf, textvariable=self.speed_var, values=speed_options,
+            state='disabled', width=14, font=('Segoe UI', 9))
+        self.speed_combo.pack(side='left', padx=(8,0))
+        tk.Label(spf, text="(SPD timing capability \u2014 actual speed set via CBS/PBS)", bg=C_BGL, fg=C_FGD, font=('Segoe UI', 9)).pack(side='left', padx=(8,0))
         # SPD entry section label
         ttk.Label(left, text="SPD Entries to Modify", style='Section.TLabel').pack(anchor='w', pady=(4,4))
         # Button row — pack BEFORE canvas so buttons always visible at bottom
@@ -753,6 +1277,8 @@ class APCBToolGUI:
         self.select_all_var = tk.BooleanVar(value=True)
         # Wire global target radio to sync per-entry dropdowns
         self.target_var.trace_add('write', self._sync_target_to_entries)
+        # Wire global SPD timings combo to sync per-entry dropdowns
+        self.speed_var.trace_add('write', self._sync_speed_to_entries)
         # RIGHT COLUMN — log output
         right = ttk.Frame(paned); paned.add(right, weight=1)
         lh = ttk.Frame(right); lh.pack(fill='x', pady=(8,4))
@@ -760,14 +1286,21 @@ class APCBToolGUI:
         ttk.Button(lh, text="Copy Log", command=self._copy_log).pack(side='right', padx=(4,0))
         ttk.Button(lh, text="Clear Log", command=self._log_clear).pack(side='right')
         lf = tk.Frame(right, bg=C_BDR, padx=1, pady=1); lf.pack(fill='both', expand=True)
-        self.log = scrolledtext.ScrolledText(lf, wrap='word', font=('Consolas',9), bg=C_BGE, fg=C_FG, insertbackground=C_FG,
+        self.log = scrolledtext.ScrolledText(lf, wrap='none', font=('Consolas',9), bg=C_BGE, fg=C_FG, insertbackground=C_FG,
             selectbackground=C_ACC, selectforeground=C_BG, relief='flat', borderwidth=0, padx=8, pady=8, state='disabled')
         self.log.pack(fill='both', expand=True)
+        # Horizontal scrollbar for log (wrap=none)
+        log_hscroll = ttk.Scrollbar(lf, orient='horizontal', command=self.log.xview)
+        log_hscroll.pack(side='bottom', fill='x')
+        self.log.configure(xscrollcommand=log_hscroll.set)
         for t,c in [('info',C_FG),('success',C_GRN),('warning',C_ORG),('error',C_RED),('accent',C_ACC),('cyan',C_CYN),('dim',C_FGD)]:
             self.log.tag_configure(t, foreground=c)
         self.log.tag_configure('header', foreground=C_FGB, font=('Consolas',9,'bold'))
         # Set initial sash position after layout
-        self.root.after(50, lambda: paned.sashpos(0, 500))
+        def _set_sash():
+            pw = paned.winfo_width()
+            paned.sashpos(0, int(pw * 0.40))  # Left 40%, Log 60%
+        self.root.after(100, _set_sash)
 
     def _log(self, text, tag='info'):
         self.log.configure(state='normal'); self.log.insert('end', text+'\n', tag); self.log.see('end'); self.log.configure(state='disabled')
@@ -793,12 +1326,50 @@ class APCBToolGUI:
         sa_frame = tk.Frame(self.entry_inner, bg=C_BGL); sa_frame.pack(fill='x', padx=8, pady=(6,2))
         self.select_all_var.set(False)
         ttk.Checkbutton(sa_frame, text="Select All", variable=self.select_all_var, command=self._toggle_all).pack(side='left')
-        # Column headers (spacer accounts for checkbox width)
+        # Column headers — same font size (9) and widget types as rows for pixel-perfect alignment
         hdr = tk.Frame(self.entry_inner, bg=C_BGL); hdr.pack(fill='x', padx=8, pady=(4,2))
-        tk.Label(hdr, text='', bg=C_BGL, width=3).pack(side='left')
-        for txt, w in [('#', 4), ('Type', 8), ('Manufacturer Prefix', 25), ('Module Suffix', 18),
-                       ('Capacity', 8), ('Byte6', 6), ('Byte12', 6), ('Current', 14)]:
-            tk.Label(hdr, text=txt, bg=C_BGL, fg=C_FGD, font=('Consolas', 8), anchor='w', width=w).pack(side='left', padx=1)
+        _hdr_font = ('Consolas', 9)  # Must match row font size
+        _hdr_kw = dict(bg=C_BGL, fg=C_FGD, font=_hdr_font, anchor='w')
+        # Checkbox placeholder — real checkbox, same width as row checkboxes
+        _hcb = ttk.Checkbutton(hdr, text=''); _hcb.pack(side='left')
+        _hcb.state(['disabled'])
+        tk.Label(hdr, text='#', width=3, **_hdr_kw).pack(side='left')
+        tk.Label(hdr, text='Type', width=7, **_hdr_kw).pack(side='left')
+        # Combobox header — same width as row prefix combo
+        _hp = ttk.Combobox(hdr, values=['Mfr Prefix'], state='disabled', width=14, font=_hdr_font)
+        _hp.set('Mfr Prefix'); _hp.pack(side='left', padx=(2,0))
+        # Entry header — same width as row suffix entry
+        _hs = tk.Entry(hdr, font=_hdr_font, width=14, bg=C_BGL, fg=C_FGD, relief='flat',
+            borderwidth=1, highlightbackground=C_BDR, highlightthickness=1, state='disabled',
+            disabledbackground=C_BGL, disabledforeground=C_FGD)
+        _hs.pack(side='left', padx=(0,2))
+        _hs.configure(state='normal'); _hs.insert(0, 'Module Suffix'); _hs.configure(state='disabled')
+        # Density combo header — same width as row density combo
+        _hd = ttk.Combobox(hdr, values=['Cap'], state='disabled', width=5, font=_hdr_font)
+        _hd.set('Cap'); _hd.pack(side='left', padx=(0,2))
+        # Byte6/Byte12 entry headers — same width as row hex entries
+        for hdr_text in ['b6', 'b12']:
+            _he = tk.Entry(hdr, font=_hdr_font, width=4, bg=C_BGL, fg=C_FGD, relief='flat',
+                borderwidth=1, highlightbackground=C_BDR, highlightthickness=1, state='disabled',
+                disabledbackground=C_BGL, disabledforeground=C_FGD)
+            _he.pack(side='left', padx=(0,1))
+            _he.configure(state='normal'); _he.insert(0, hdr_text); _he.configure(state='disabled')
+        tk.Label(hdr, text='Current', **_hdr_kw).pack(side='left')
+        # Timing column headers (second line)
+        thdr = tk.Frame(self.entry_inner, bg=C_BGL); thdr.pack(fill='x', padx=8)
+        # Indent to align past checkbox + index
+        _thcb = ttk.Checkbutton(thdr, text=''); _thcb.pack(side='left'); _thcb.state(['disabled'])
+        tk.Label(thdr, text='', width=3, **_hdr_kw).pack(side='left')
+        # SPD Rate combo header — same width as row speed combo
+        _hsp = ttk.Combobox(thdr, values=['SPD Rate'], state='disabled', width=12, font=_hdr_font)
+        _hsp.set('SPD Rate'); _hsp.pack(side='left', padx=(2,2))
+        # Timing byte headers
+        for lbl in ['tCK', 'tAA', 'tRCD', 'tRPab', 'tRPpb']:
+            _ht = tk.Entry(thdr, font=_hdr_font, width=5, bg=C_BGL, fg=C_FGD, relief='flat',
+                borderwidth=1, highlightbackground=C_BDR, highlightthickness=1, state='disabled',
+                disabledbackground=C_BGL, disabledforeground=C_FGD)
+            _ht.pack(side='left', padx=(0,1))
+            _ht.configure(state='normal'); _ht.insert(0, lbl); _ht.configure(state='disabled')
         # Separator
         tk.Frame(self.entry_inner, bg=C_BDR, height=1).pack(fill='x', padx=8, pady=2)
         # Individual entry rows
@@ -824,20 +1395,20 @@ class APCBToolGUI:
             cb = ttk.Checkbutton(ef, variable=enabled_var)
             cb.pack(side='left')
             # Index
-            tk.Label(ef, text=f"[{i+1}]", bg=C_BGL, fg=C_FG, font=('Consolas', 9), width=4, anchor='w').pack(side='left')
+            tk.Label(ef, text=f"[{i+1}]", bg=C_BGL, fg=C_FG, font=('Consolas', 9), width=3, anchor='w').pack(side='left')
             # Type
-            tk.Label(ef, text=e.mem_type, bg=C_BGL, fg=C_FGD, font=('Consolas', 9), width=8, anchor='w').pack(side='left')
+            tk.Label(ef, text=e.mem_type, bg=C_BGL, fg=C_FGD, font=('Consolas', 9), width=7, anchor='w').pack(side='left')
             # Manufacturer prefix dropdown (shows descriptive labels, maps to 3-char prefix)
             has_name = e.module_name_offset >= 0
             prefix_combo = ttk.Combobox(ef, textvariable=prefix_var, values=MODULE_PREFIX_LABELS,
-                state='disabled', width=24, font=('Consolas', 9))
+                state='disabled', width=14, font=('Consolas', 9))
             prefix_combo.pack(side='left', padx=(2,0))
             # Module name suffix entry (constrained)
             field_len = e.module_name_field_len if e.module_name_field_len > 0 else 20
-            suffix_entry = tk.Entry(ef, textvariable=suffix_var, font=('Consolas', 9), width=18,
+            suffix_entry = tk.Entry(ef, textvariable=suffix_var, font=('Consolas', 9), width=14,
                 bg=C_BGE, fg=C_FG, insertbackground=C_FG, relief='flat', borderwidth=1,
                 highlightbackground=C_BDR, highlightthickness=1, state='disabled')
-            suffix_entry.pack(side='left', padx=(0,4))
+            suffix_entry.pack(side='left', padx=(0,2))
             # Validate suffix: printable ASCII only, length constrained by field_len minus prefix (3 chars)
             def _validate_suffix(new_val, fl=field_len, pv=prefix_var):
                 # Prefix is always 3 chars regardless of display label
@@ -851,19 +1422,19 @@ class APCBToolGUI:
                 suffix_var.set('(no name field)')
             # Density combobox
             density_combo = ttk.Combobox(ef, textvariable=density_var, values=density_options,
-                state='disabled', width=6, font=('Consolas', 9))
-            density_combo.pack(side='left', padx=(0,4))
+                state='disabled', width=5, font=('Consolas', 9))
+            density_combo.pack(side='left', padx=(0,2))
             # Hex byte6/byte12 entry fields for manual editing
             byte6_var = tk.StringVar(value=f"0x{e.byte6:02X}")
             byte12_var = tk.StringVar(value=f"0x{e.byte12:02X}")
-            byte6_entry = tk.Entry(ef, textvariable=byte6_var, font=('Consolas', 9), width=5,
+            byte6_entry = tk.Entry(ef, textvariable=byte6_var, font=('Consolas', 9), width=4,
                 bg=C_BGE, fg=C_FG, insertbackground=C_FG, relief='flat', borderwidth=1,
                 highlightbackground=C_BDR, highlightthickness=1, state='disabled')
-            byte6_entry.pack(side='left', padx=(0,2))
-            byte12_entry = tk.Entry(ef, textvariable=byte12_var, font=('Consolas', 9), width=5,
+            byte6_entry.pack(side='left', padx=(0,1))
+            byte12_entry = tk.Entry(ef, textvariable=byte12_var, font=('Consolas', 9), width=4,
                 bg=C_BGE, fg=C_FG, insertbackground=C_FG, relief='flat', borderwidth=1,
                 highlightbackground=C_BDR, highlightthickness=1, state='disabled')
-            byte12_entry.pack(side='left', padx=(0,4))
+            byte12_entry.pack(side='left', padx=(0,1))
             # Hex validation: 0x prefix + up to 2 hex digits, max 4 chars
             def _validate_hex(new_val):
                 if new_val == '': return True
@@ -909,6 +1480,50 @@ class APCBToolGUI:
             else:
                 cap_info = density_from_bytes(e.byte6, e.byte12)
             tk.Label(ef, text=cap_info, bg=C_BGL, fg=C_FGD, font=('Consolas', 8), anchor='w').pack(side='left')
+            # --- Timing row (second line per entry) ---
+            tf = tk.Frame(self.entry_inner, bg=C_BGL); tf.pack(fill='x', padx=8, pady=(0,2))
+            # Indent past checkbox + index (matching header alignment)
+            _tcb = ttk.Checkbutton(tf, text=''); _tcb.pack(side='left'); _tcb.state(['disabled'])
+            tk.Label(tf, text='', bg=C_BGL, width=3, font=('Consolas', 9)).pack(side='left')
+            # Speed dropdown per entry
+            current_speed = speed_from_tck(e.tCK_byte)
+            speed_options_entry = [SPEED_PROFILES[k]['name'] for k in sorted(SPEED_PROFILES.keys(), reverse=True)] + ['Custom']
+            speed_var = tk.StringVar(value=current_speed)
+            speed_combo = ttk.Combobox(tf, textvariable=speed_var, values=speed_options_entry,
+                state='disabled', width=12, font=('Consolas', 9))
+            speed_combo.pack(side='left', padx=(2,2))
+            # Timing hex fields: tCK, tAA, tRCD, tRPab, tRPpb
+            tCK_var = tk.StringVar(value=f"0x{e.tCK_byte:02X}")
+            tAA_var = tk.StringVar(value=f"0x{e.spd_bytes[SPD_BYTE_TAAMIN]:02X}" if len(e.spd_bytes) > SPD_BYTE_TAAMIN else "0x00")
+            tRCD_var = tk.StringVar(value=f"0x{e.spd_bytes[SPD_BYTE_TRCDMIN]:02X}" if len(e.spd_bytes) > SPD_BYTE_TRCDMIN else "0x00")
+            tRPab_var = tk.StringVar(value=f"0x{e.spd_bytes[SPD_BYTE_TRPABMIN]:02X}" if len(e.spd_bytes) > SPD_BYTE_TRPABMIN else "0x00")
+            tRPpb_var = tk.StringVar(value=f"0x{e.spd_bytes[SPD_BYTE_TRPPBMIN]:02X}" if len(e.spd_bytes) > SPD_BYTE_TRPPBMIN else "0x00")
+            timing_vars = [tCK_var, tAA_var, tRCD_var, tRPab_var, tRPpb_var]
+            timing_widgets = []
+            for tv in timing_vars:
+                tw = tk.Entry(tf, textvariable=tv, font=('Consolas', 9), width=5,
+                    bg=C_BGE, fg=C_FG, insertbackground=C_FG, relief='flat', borderwidth=1,
+                    highlightbackground=C_BDR, highlightthickness=1, state='disabled')
+                tw.pack(side='left', padx=(0,1))
+                tw.configure(validate='key', validatecommand=hex_vcmd)
+                timing_widgets.append(tw)
+            # Bidirectional sync: speed dropdown → tCK hex field
+            def _on_speed_changed(*args, sv=speed_var, tv=tCK_var):
+                val = sv.get()
+                tck = tck_from_speed(val)
+                if tck is not None:
+                    tv.set(f"0x{tck:02X}")
+            speed_var.trace_add('write', _on_speed_changed)
+            # Bidirectional sync: tCK hex field → speed dropdown
+            def _on_tck_changed(*args, sv=speed_var, tv=tCK_var):
+                try:
+                    tck = int(tv.get(), 16)
+                except (ValueError, TypeError):
+                    return
+                label = speed_from_tck(tck)
+                if sv.get() != label:
+                    sv.set(label)
+            tCK_var.trace_add('write', _on_tck_changed)
             # Store row data
             row = {
                 'index': i,
@@ -929,13 +1544,29 @@ class APCBToolGUI:
                 'original_density': current_density,
                 'max_name_len': field_len,
                 'has_name_field': has_name,
+                # SPD timing fields
+                'speed_var': speed_var,
+                'tCK_var': tCK_var,
+                'tAA_var': tAA_var,
+                'tRCD_var': tRCD_var,
+                'tRPab_var': tRPab_var,
+                'tRPpb_var': tRPpb_var,
+                'speed_widget': speed_combo,
+                'timing_widgets': timing_widgets,
+                'timing_frame': tf,
+                'original_tCK': e.tCK_byte,
+                'original_tAA': e.spd_bytes[SPD_BYTE_TAAMIN] if len(e.spd_bytes) > SPD_BYTE_TAAMIN else 0,
+                'original_tRCD': e.spd_bytes[SPD_BYTE_TRCDMIN] if len(e.spd_bytes) > SPD_BYTE_TRCDMIN else 0,
+                'original_tRPab': e.spd_bytes[SPD_BYTE_TRPABMIN] if len(e.spd_bytes) > SPD_BYTE_TRPABMIN else 0,
+                'original_tRPpb': e.spd_bytes[SPD_BYTE_TRPPBMIN] if len(e.spd_bytes) > SPD_BYTE_TRPPBMIN else 0,
             }
             self.entry_rows.append(row)
-            # Bind checkbox toggle to enable/disable widgets and sync density from global target
+            # Bind checkbox toggle to enable/disable widgets and sync density/timings from global
             cb.configure(command=lambda v=enabled_var, pw=prefix_combo, sw=suffix_entry,
                          cw=density_combo, b6w=byte6_entry, b12w=byte12_entry,
-                         hn=has_name, dv=density_var:
-                         self._on_entry_toggle(v, pw, sw, cw, b6w, b12w, hn, dv))
+                         hn=has_name, dv=density_var,
+                         scw=speed_combo, tws=timing_widgets, spv=speed_var:
+                         self._on_entry_toggle(v, pw, sw, cw, b6w, b12w, hn, dv, scw, tws, spv))
         # Bind mousewheel to all child widgets for scrolling
         self._bind_mousewheel_recursive(self.entry_inner)
 
@@ -952,8 +1583,10 @@ class APCBToolGUI:
     def _on_entry_toggle(self, var: 'tk.BooleanVar', pw: 'tk.Widget',
                          sw: 'tk.Widget', cw: 'tk.Widget',
                          b6w: 'tk.Widget', b12w: 'tk.Widget',
-                         has_name: bool, density_var: 'tk.StringVar') -> None:
-        """Handle per-entry checkbox toggle: enable/disable widgets and sync density."""
+                         has_name: bool, density_var: 'tk.StringVar',
+                         scw: 'tk.Widget' = None, tws: list = None,
+                         spv: 'tk.StringVar' = None) -> None:
+        """Handle per-entry checkbox toggle: enable/disable widgets and sync density/timings."""
         if var.get():
             if has_name:
                 pw.configure(state='readonly')
@@ -962,17 +1595,29 @@ class APCBToolGUI:
             b6w.configure(state='normal', fg=C_FG, insertbackground=C_FG)
             b12w.configure(state='normal', fg=C_FG, insertbackground=C_FG)
             density_var.set(f"{self.target_var.get()}GB")
+            # Enable SPD timing widgets
+            if scw: scw.configure(state='readonly')
+            if tws:
+                for tw in tws:
+                    tw.configure(state='normal', fg=C_FG, insertbackground=C_FG)
+            if spv: spv.set(self.speed_var.get())
         else:
             pw.configure(state='disabled')
             sw.configure(state='disabled', fg=C_FG, insertbackground=C_FG)
             cw.configure(state='disabled')
             b6w.configure(state='disabled')
             b12w.configure(state='disabled')
+            # Disable SPD timing widgets
+            if scw: scw.configure(state='disabled')
+            if tws:
+                for tw in tws:
+                    tw.configure(state='disabled')
 
     def _toggle_all(self):
         """Toggle all entry checkboxes and enable/disable widgets."""
         val = self.select_all_var.get()
         density_str = f"{self.target_var.get()}GB"
+        speed_str = self.speed_var.get()
         for row in self.entry_rows:
             row['enabled_var'].set(val)
             if val:
@@ -983,12 +1628,26 @@ class APCBToolGUI:
                 row['byte6_widget'].configure(state='normal', fg=C_FG, insertbackground=C_FG)
                 row['byte12_widget'].configure(state='normal', fg=C_FG, insertbackground=C_FG)
                 row['density_var'].set(density_str)
+                # Enable SPD timing widgets
+                if 'speed_widget' in row:
+                    row['speed_widget'].configure(state='readonly')
+                if 'timing_widgets' in row:
+                    for tw in row['timing_widgets']:
+                        tw.configure(state='normal', fg=C_FG, insertbackground=C_FG)
+                if 'speed_var' in row:
+                    row['speed_var'].set(speed_str)
             else:
                 row['prefix_widget'].configure(state='disabled')
                 row['suffix_widget'].configure(state='disabled', fg=C_FG, insertbackground=C_FG)
                 row['combo_widget'].configure(state='disabled')
                 row['byte6_widget'].configure(state='disabled')
                 row['byte12_widget'].configure(state='disabled')
+                # Disable SPD timing widgets
+                if 'speed_widget' in row:
+                    row['speed_widget'].configure(state='disabled')
+                if 'timing_widgets' in row:
+                    for tw in row['timing_widgets']:
+                        tw.configure(state='disabled')
 
     def _sync_target_to_entries(self, *args):
         """When global target changes, update all checked entries' density dropdowns and hex fields."""
@@ -998,6 +1657,14 @@ class APCBToolGUI:
             if row['enabled_var'].get():
                 row['density_var'].set(density_str)
                 # Hex fields are auto-updated by the density_var trace callback
+
+    def _sync_speed_to_entries(self, *args):
+        """When global SPD timings dropdown changes, update all checked entries."""
+        speed = self.speed_var.get()
+        for row in self.entry_rows:
+            if row['enabled_var'].get() and 'speed_var' in row:
+                row['speed_var'].set(speed)
+                # tCK hex field is auto-updated by the speed_var trace callback
 
     def _on_variant_changed(self, event=None):
         """Handle user changing the Steam Deck variant dropdown."""
@@ -1076,6 +1743,8 @@ class APCBToolGUI:
         else:
             self.screen_var.set('None')
             self.screen_combo.configure(state='disabled')
+        # Enable SPD timings dropdown on file load
+        self.speed_combo.configure(state='readonly')
         self._log(f"Format: {'PE firmware (.fd)' if data[:2]==b'MZ' else 'Raw SPI dump'}", 'dim')
         self._log("Scanning...", 'dim')
         self.blocks = find_apcb_blocks(data)
@@ -1164,13 +1833,36 @@ class APCBToolGUI:
                     custom_b6 = int(row['byte6_var'].get(), 16)
                     custom_b12 = int(row['byte12_var'].get(), 16)
                 except (ValueError, TypeError):
-                    messagebox.showerror("Invalid Hex", f"Entry [{row['index']+1}] has invalid hex values."); return
-                entry_mods.append({'index': row['index'], 'target_gb': None,
-                                   'custom_byte6': custom_b6, 'custom_byte12': custom_b12,
-                                   'new_name': name_to_write})
+                    messagebox.showerror("Invalid Hex", f"Entry [{row['index']+1}] has invalid density hex values."); return
+                mod = {'index': row['index'], 'target_gb': None,
+                       'custom_byte6': custom_b6, 'custom_byte12': custom_b12,
+                       'new_name': name_to_write}
             else:
                 target_gb = int(density_val.replace('GB', ''))
-                entry_mods.append({'index': row['index'], 'target_gb': target_gb, 'new_name': name_to_write})
+                mod = {'index': row['index'], 'target_gb': target_gb, 'new_name': name_to_write}
+            # Collect timing byte modifications if any changed from original
+            if 'tCK_var' in row:
+                try:
+                    timing_tCK = int(row['tCK_var'].get(), 16)
+                    timing_tAA = int(row['tAA_var'].get(), 16)
+                    timing_tRCD = int(row['tRCD_var'].get(), 16)
+                    timing_tRPab = int(row['tRPab_var'].get(), 16)
+                    timing_tRPpb = int(row['tRPpb_var'].get(), 16)
+                except (ValueError, TypeError):
+                    messagebox.showerror("Invalid Hex", f"Entry [{row['index']+1}] has invalid timing hex values."); return
+                timing_changed = (
+                    timing_tCK != row['original_tCK'] or
+                    timing_tAA != row['original_tAA'] or
+                    timing_tRCD != row['original_tRCD'] or
+                    timing_tRPab != row['original_tRPab'] or
+                    timing_tRPpb != row['original_tRPpb']
+                )
+                if timing_changed:
+                    mod['timing'] = {
+                        'tCK': timing_tCK, 'tAA': timing_tAA,
+                        'tRCD': timing_tRCD, 'tRPab': timing_tRPab, 'tRPpb': timing_tRPpb
+                    }
+            entry_mods.append(mod)
         if not entry_mods:
             messagebox.showwarning("No Entries Selected", "Select at least one SPD entry to modify."); return
         # Determine output filename from most common target
@@ -1179,17 +1871,17 @@ class APCBToolGUI:
             primary_target = max(set(targets), key=targets.count)
         else:
             primary_target = None
-        sp = Path(self.loaded_file); ext = sp.suffix or '.bin'
+        sp = Path(self.loaded_file)
         if primary_target == 64: suffix = '_64GB'
         elif primary_target == 32: suffix = '_32GB'
         elif primary_target == 16: suffix = '_stock'
         else: suffix = '_custom'
-        dn = f"{sp.stem}{suffix}{ext}"
-        # Order filetypes so the input file's extension appears first
-        if ext.lower() in ('.fd', '.rom'):
-            ftypes = [("BIOS Files", f"*{ext}"), ("BIN files", "*.bin"), ("All files", "*.*")]
+        if _is_pe_firmware(self.loaded_data):
+            dn = f"{sp.stem}{suffix}.fd"
+            ftypes = [("FD firmware (signed)", "*.fd"), ("BIN files (SPI)", "*.bin"), ("All files", "*.*")]
         else:
-            ftypes = [("BIN files", "*.bin"), ("BIOS Files", "*.fd *.rom"), ("All files", "*.*")]
+            dn = f"{sp.stem}{suffix}.bin"
+            ftypes = [("BIN files", "*.bin"), ("All files", "*.*")]
         op = filedialog.asksaveasfilename(title="Save Modified BIOS As", initialfile=dn, initialdir=str(sp.parent),
             filetypes=ftypes)
         if not op: return
@@ -1207,9 +1899,19 @@ class APCBToolGUI:
         self._log(f"  Entries: {len(entry_mods)} selected", 'accent')
         for mod in entry_mods:
             name_note = f" → '{mod['new_name']}'" if mod['new_name'] else ''
-            self._log(f"    [{mod['index']+1}] → {mod['target_gb']}GB{name_note}", 'dim')
+            density_note = f"{mod['target_gb']}GB" if mod.get('target_gb') else 'Custom'
+            timing_note = ''
+            if mod.get('timing'):
+                t = mod['timing']
+                tck_ns = t['tCK'] * SPD_MTB_PS / 1000
+                mts = int(2000 / tck_ns) if tck_ns > 0 else 0
+                timing_note = f" | SPD tCK: {mts} MT/s (0x{t['tCK']:02X})"
+            self._log(f"    [{mod['index']+1}] → {density_note}{name_note}{timing_note}", 'dim')
         if _is_pe_firmware(self.loaded_data):
-            self._log(f"  Output: Flash via manufacturer tool (e.g. h2offt)", 'dim')
+            if op.lower().endswith('.fd'):
+                self._log(f"  Output: PE firmware (.fd) — will be signed for h2offt", 'dim')
+            else:
+                self._log(f"  Output: Flash via manufacturer tool (e.g. h2offt)", 'dim')
         else:
             self._log(f"  Output: SPI flash ready", 'dim')
         # Resolve screen selection to profile key
@@ -1238,6 +1940,42 @@ class APCBToolGUI:
             self._log(f"\n  Byte changes: {len(mods)}", 'success')
             for off,old,new in mods: self._log(f"    0x{off:08X}: 0x{old:02X} → 0x{new:02X}", 'dim')
             od = bytes(data)
+            # Sign if saving as .fd and input was PE firmware
+            signing_info = None
+            if op.lower().endswith('.fd') and _is_pe_firmware(self.loaded_data):
+                if _check_signing_available():
+                    self._log(f"\n  Signing firmware for h2offt...", 'accent')
+                    out_dir = os.path.dirname(op) or '.'
+                    key_file = os.path.join(out_dir, 'signing_key.pem')
+                    esl_file = os.path.join(out_dir, 'signing_cert.esl')
+                    existing_key = None
+                    # Check for existing key in output directory
+                    if os.path.isfile(key_file):
+                        reuse = messagebox.askyesno("Reuse Signing Key",
+                            f"Found existing signing_key.pem in the output directory.\n\n"
+                            f"Reuse this key? (Same certificate stays valid in NVRAM)")
+                        if reuse:
+                            existing_key = key_file
+                            self._log(f"  Reusing existing signing key", 'dim')
+                    # Find cert alongside key if reusing
+                    cert_path = None
+                    if existing_key:
+                        cert_der_path = os.path.join(out_dir, 'signing_cert.der')
+                        if os.path.isfile(cert_der_path):
+                            cert_path = cert_der_path
+                    signed_data, key_pem, cert_der = sign_firmware(od, existing_key, cert_path)
+                    od = signed_data
+                    if not existing_key:
+                        with open(key_file, 'wb') as f: f.write(key_pem)
+                        esl_blob = build_esl(cert_der)
+                        with open(esl_file, 'wb') as f: f.write(esl_blob)
+                    self._log(f"  Signed with PE Authenticode", 'success')
+                    self._log(f"  Key:  {os.path.basename(key_file)}", 'dim')
+                    self._log(f"  ESL:  {os.path.basename(esl_file)} (inject into NVRAM before flashing)", 'dim')
+                    signing_info = {'key': key_file, 'esl': esl_file}
+                else:
+                    self._log(f"\n  WARNING: cryptography library not available, saving unsigned", 'warning')
+                    self._log(f"  Install with: pip install cryptography", 'dim')
             with open(op,'wb') as f: f.write(od)
             self._log(f"\n  Verifying...", 'dim')
             vb = find_apcb_blocks(open(op,'rb').read()); ok = True
@@ -1262,11 +2000,23 @@ class APCBToolGUI:
                 self._log(f"\n  ✓ MODIFICATION SUCCESSFUL", 'success')
                 dev_name = self.device_profile['name'] if self.device_profile else 'device'
                 is_pe = _is_pe_firmware(self.loaded_data)
-                flash_msg = "Flash via manufacturer tool (e.g. h2offt)." if is_pe else "Ready for SPI flash."
-                self._log(f"  {flash_msg}", 'success')
+                if signing_info:
+                    flash_msg = "Signed for h2offt. Inject cert ESL into NVRAM before flashing."
+                    self._log(f"  {flash_msg}", 'success')
+                elif is_pe:
+                    flash_msg = "Flash via manufacturer tool (e.g. h2offt)."
+                    self._log(f"  {flash_msg}", 'success')
+                else:
+                    flash_msg = "Ready for SPI flash."
+                    self._log(f"  {flash_msg}", 'success')
                 msg = f"Modified {len(entry_mods)} entries ({target_summary})!\n\nDevice: {dev_name}\n{op}\n\n{len(mods)} bytes changed."
                 if screen_key: msg += f"\n{SCREEN_PROFILES[screen_key]['name']} screen patch applied."
-                msg += f"\n\n{flash_msg}"
+                if signing_info:
+                    msg += f"\nSigned with self-signed certificate."
+                    msg += f"\nESL: {os.path.basename(signing_info['esl'])}"
+                    msg += f"\n\n{flash_msg}"
+                else:
+                    msg += f"\n\n{flash_msg}"
                 messagebox.showinfo("Success", msg)
             else:
                 self._log(f"\n  ✗ VERIFICATION FAILED", 'error'); messagebox.showerror("Failed","DO NOT flash this file.")
@@ -1347,9 +2097,18 @@ class APCBToolGUI:
             messagebox.showerror("DMI Import Error", str(e))
 
 def main() -> None:
-    root = tk.Tk(); root.update_idletasks()
-    w,h = 1100,720; root.geometry(f"{w}x{h}+{(root.winfo_screenwidth()//2)-(w//2)}+{(root.winfo_screenheight()//2)-(h//2)}")
-    root.minsize(900, 550)
+    root = tk.Tk()
+    root.update_idletasks()
+    # Get screen size in Tk's coordinate system
+    sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+    # Tk reports DPI-scaled values (e.g. 2560x1440 for 4K at 150%)
+    # Target: ~60% physical screen width, ~80% physical height
+    w = int(sw * 0.55)
+    h = int(sh * 0.75)
+    x = int(sw * 0.01)
+    y = max(10, (sh - h) // 2 - 30)
+    root.geometry(f"{w}x{h}+{x}+{y}")
+    root.minsize(700, 500)
     APCBToolGUI(root); root.mainloop()
 
 if __name__ == '__main__':
